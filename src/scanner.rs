@@ -56,11 +56,9 @@ impl BlockReason {
 /// Context the scanner gets alongside the payload bytes.
 #[derive(Debug)]
 pub struct ScanRequest {
-    /// The URL the tool originally requested. Used as the filename hint and
-    /// in log messages.
+    /// The URL the tool originally requested. Used as the filename hint to
+    /// cleave (which keys off extension) and as a log field.
     pub url: String,
-    /// Response Content-Type, if the upstream provided one.
-    pub content_type: Option<String>,
     /// Full payload body. The scanner takes ownership so cleave can avoid one
     /// full-size memcpy on hot paths.
     pub body: Vec<u8>,
@@ -84,15 +82,22 @@ impl Scanner for AllowAll {
     }
 }
 
-/// Policy for how `suspicious` (model-flagged but below the hostile threshold)
-/// payloads should be handled.
+/// Policy for how non-benign verdicts are handled when forwarding through the
+/// proxy.
+///
+/// Hood always *scans* and always *logs* what it sees — this policy controls
+/// only whether the body is then forwarded to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SuspiciousPolicy {
-    /// Block. Default — fail-closed.
+pub enum ScanPolicy {
+    /// Block hostile **and** suspicious. Default — fail-closed.
     #[default]
-    Block,
-    /// Forward, but emit a warning to the operator.
-    Warn,
+    Strict,
+    /// Block hostile only; let suspicious through with a WARN log.
+    AllowSuspicious,
+    /// Forward everything regardless of verdict. Every non-benign scan still
+    /// emits a WARN log line; nothing is hidden, the policy just defers the
+    /// blocking decision to the operator reading the logs.
+    Bypass,
 }
 
 /// In-process litmus scanner.
@@ -108,13 +113,13 @@ pub struct LitmusScanner {
 
 struct Inner {
     analyzer: Analyzer,
-    suspicious: SuspiciousPolicy,
+    policy: ScanPolicy,
 }
 
 impl std::fmt::Debug for LitmusScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LitmusScanner")
-            .field("suspicious", &self.inner.suspicious)
+            .field("policy", &self.inner.policy)
             .field("model_dir", &self.inner.analyzer.model_dir())
             .finish()
     }
@@ -126,7 +131,7 @@ impl LitmusScanner {
     /// `model_dir` is the same directory passed to `litmus scan --model-dir`;
     /// when `None`, the litmus models_repo resolver is used (auto-clone on
     /// first call).
-    pub fn load(model_dir: Option<PathBuf>, suspicious: SuspiciousPolicy) -> Result<Self> {
+    pub fn load(model_dir: Option<PathBuf>, policy: ScanPolicy) -> Result<Self> {
         let model_dir = match model_dir {
             Some(d) => d,
             None => litmus::models_repo::model_dir()
@@ -134,37 +139,33 @@ impl LitmusScanner {
         };
         let analyzer = Analyzer::load(model_dir).context("load litmus analyzer")?;
         Ok(Self {
-            inner: Arc::new(Inner {
-                analyzer,
-                suspicious,
-            }),
+            inner: Arc::new(Inner { analyzer, policy }),
         })
     }
 
-    fn verdict_for(&self, result: &ScanResult, url: &str) -> Verdict {
-        match result.classification {
-            Classification::Benign => Verdict::Allow,
-            Classification::Hostile => Verdict::Block(BlockReason::Hostile),
-            Classification::Suspicious => match self.inner.suspicious {
-                SuspiciousPolicy::Block => Verdict::Block(BlockReason::Suspicious),
-                SuspiciousPolicy::Warn => {
-                    tracing::warn!(
-                        url,
-                        probability = result.probability,
-                        "forwarding suspicious payload (SuspiciousPolicy::Warn)",
-                    );
-                    Verdict::Allow
-                }
-            },
-            // litmus marks Classification non_exhaustive so new verdicts (e.g.
-            // "unknown") can land without breaking downstream code. Treat any
-            // future variant as a fail-closed scan error until we update.
-            other => Verdict::Block(BlockReason::ScanError(format!(
-                "unknown classification: {other:?}",
-            ))),
-        }
+    fn verdict_for(&self, result: &ScanResult) -> Verdict {
+        verdict_from(result.classification, self.inner.policy)
     }
 }
+
+/// Apply [`ScanPolicy`] to a classification. Pulled out of [`LitmusScanner`]
+/// so the decision matrix is testable without loading a real model.
+fn verdict_from(classification: Classification, policy: ScanPolicy) -> Verdict {
+    match (classification, policy) {
+        // Allow paths: bypass active, model benign, or suspicious-but-policy-allows.
+        (_, ScanPolicy::Bypass)
+        | (Classification::Benign, _)
+        | (Classification::Suspicious, ScanPolicy::AllowSuspicious) => Verdict::Allow,
+        (Classification::Hostile, _) => Verdict::Block(BlockReason::Hostile),
+        (Classification::Suspicious, _) => Verdict::Block(BlockReason::Suspicious),
+        // litmus marks Classification non_exhaustive — fail-closed on new
+        // variants we don't recognize (bypass already handled above).
+        (other, _) => Verdict::Block(BlockReason::ScanError(format!(
+            "unknown classification: {other:?}",
+        ))),
+    }
+}
+
 
 #[async_trait::async_trait]
 impl Scanner for LitmusScanner {
@@ -181,13 +182,33 @@ impl Scanner for LitmusScanner {
 
         match result {
             Ok(r) => {
-                tracing::debug!(
-                    url = req.url,
-                    classification = ?r.classification,
-                    probability = r.probability,
-                    "scan complete",
-                );
-                Ok(self.verdict_for(&r, &req.url))
+                let verdict = self.verdict_for(&r);
+                if !matches!(r.classification, Classification::Benign) {
+                    let disposition = match &verdict {
+                        Verdict::Allow => crate::output::Disposition::Forwarded,
+                        Verdict::Block(_) => crate::output::Disposition::Blocked,
+                    };
+                    let traits = r.top_traits(3);
+                    let n_reasons = r.reasons.len().min(3);
+                    let reasons_slice = r.reasons.get(..n_reasons).unwrap_or(&[]);
+                    crate::output::emit(&crate::output::Panel {
+                        classification: r.classification,
+                        original: r.original_classification,
+                        disposition,
+                        policy: self.inner.policy,
+                        probability: r.probability,
+                        url: &req.url,
+                        traits: &traits,
+                        reasons: reasons_slice,
+                    });
+                } else {
+                    tracing::debug!(
+                        url = req.url,
+                        probability = r.probability,
+                        "scan clean",
+                    );
+                }
+                Ok(verdict)
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -209,7 +230,6 @@ mod tests {
         let v = s
             .scan(ScanRequest {
                 url: "http://x".into(),
-                content_type: None,
                 body: b"hi".to_vec(),
             })
             .await
@@ -226,4 +246,54 @@ mod tests {
             "scan-error"
         );
     }
+
+    // ----- verdict matrix --------------------------------------------------
+
+    #[test]
+    fn strict_policy_blocks_hostile_and_suspicious_allows_benign() {
+        assert_eq!(
+            verdict_from(Classification::Benign, ScanPolicy::Strict),
+            Verdict::Allow,
+        );
+        assert_eq!(
+            verdict_from(Classification::Suspicious, ScanPolicy::Strict),
+            Verdict::Block(BlockReason::Suspicious),
+        );
+        assert_eq!(
+            verdict_from(Classification::Hostile, ScanPolicy::Strict),
+            Verdict::Block(BlockReason::Hostile),
+        );
+    }
+
+    #[test]
+    fn allow_suspicious_policy_blocks_only_hostile() {
+        assert_eq!(
+            verdict_from(Classification::Benign, ScanPolicy::AllowSuspicious),
+            Verdict::Allow,
+        );
+        assert_eq!(
+            verdict_from(Classification::Suspicious, ScanPolicy::AllowSuspicious),
+            Verdict::Allow,
+        );
+        assert_eq!(
+            verdict_from(Classification::Hostile, ScanPolicy::AllowSuspicious),
+            Verdict::Block(BlockReason::Hostile),
+        );
+    }
+
+    #[test]
+    fn bypass_policy_allows_everything() {
+        for c in [
+            Classification::Benign,
+            Classification::Suspicious,
+            Classification::Hostile,
+        ] {
+            assert_eq!(
+                verdict_from(c, ScanPolicy::Bypass),
+                Verdict::Allow,
+                "bypass must allow {c:?}",
+            );
+        }
+    }
+
 }

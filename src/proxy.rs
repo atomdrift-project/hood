@@ -42,9 +42,20 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::ca::{Ca, CaResolver};
 use crate::scanner::{BlockReason, ScanRequest, Scanner, Verdict};
 
-/// Default upper bound on response body size accepted for scanning, in bytes.
-/// Larger responses are rejected with 413.
-pub const DEFAULT_MAX_BODY_BYTES: u64 = 256 * 1024 * 1024;
+/// Upper bound on response body size accepted for scanning. Larger responses
+/// are aborted before being forwarded. Tunable via the `HOOD_MAX_BODY_MB`
+/// env var; the default is generous enough for npm tarballs and binary
+/// installers, low enough that a single response can't OOM the host.
+const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+/// Resolve the body cap from the environment, falling back to the default.
+fn max_body_bytes_from_env() -> u64 {
+    std::env::var("HOOD_MAX_BODY_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(MAX_BODY_BYTES_DEFAULT)
+}
 
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
 const HOP_BY_HOP: &[&str] = &[
@@ -59,10 +70,6 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-authorization",
 ];
 
-/// Headers that carry credentials. Their *names* are fine to log but values
-/// must be redacted.
-const SENSITIVE: &[&str] = &["authorization", "cookie", "set-cookie", "proxy-authorization"];
-
 /// Configuration for a new proxy instance.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -75,7 +82,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_body_bytes: max_body_bytes_from_env(),
             // 127.0.0.1:0 → kernel-assigned ephemeral port.
             bind: ([127, 0, 0, 1], 0).into(),
         }
@@ -359,11 +366,6 @@ impl Proxy {
 
         // Buffer body subject to the cap, then scan.
         let (parts, body) = response.into_parts();
-        let content_type = parts
-            .headers
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
         let bytes = collect_body_capped(body, self.inner.config.max_body_bytes).await?;
         let body_len = bytes.len();
 
@@ -373,7 +375,6 @@ impl Proxy {
             .scanner
             .scan(ScanRequest {
                 url: scan_url.clone(),
-                content_type: content_type.clone(),
                 body: bytes.to_vec(),
             })
             .await
@@ -571,13 +572,6 @@ fn blocked_response(url: &str, reason: &BlockReason) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| error_response(StatusCode::FORBIDDEN, "blocked"))
 }
 
-#[allow(dead_code)] // referenced by future logging hooks
-fn header_is_sensitive(name: &HeaderName) -> bool {
-    SENSITIVE
-        .iter()
-        .any(|s| name.as_str().eq_ignore_ascii_case(s))
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -613,14 +607,4 @@ mod tests {
         assert!(!is_hop_by_hop(&HeaderName::from_static("content-type")));
     }
 
-    #[test]
-    fn sensitive_detection() {
-        assert!(header_is_sensitive(&HeaderName::from_static(
-            "authorization"
-        )));
-        assert!(header_is_sensitive(&HeaderName::from_static("cookie")));
-        assert!(!header_is_sensitive(&HeaderName::from_static(
-            "content-type"
-        )));
-    }
 }

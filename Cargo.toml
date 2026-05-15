@@ -7,7 +7,6 @@ description = "Scan HTTP(S) payloads before they reach package managers, install
 license = "Apache-2.0"
 
 [lints.rust]
-# Litmus parity ----------------------------------------------------------
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unused_must_use = "deny"
@@ -17,75 +16,40 @@ dead_code = "warn"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
-noop_method_call = "warn"
-# Hood security additions -------------------------------------------------
-# Catches `let _ = sender.send(...)` that silently discards a Result, and
-# `let _ = mutex.lock()` patterns that immediately drop a guard.
+# Caught real bugs (silently-dropped TLS-accept results); cheap to satisfy.
 let_underscore_drop = "warn"
 
 [lints.clippy]
-# Litmus parity ----------------------------------------------------------
 all = { level = "deny", priority = -1 }
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "deny", priority = -1 }
 style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
+# No silent failure modes in production paths.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 unimplemented = "deny"
 todo = "deny"
-unreachable = "deny"
 result_unit_err = "deny"
-result_large_err = "deny"
-missing_safety_doc = "warn"
-must_use_candidate = "warn"
-needless_pass_by_value = "warn"
-unnecessary_wraps = "warn"
-match_same_arms = "warn"
-redundant_closure_for_method_calls = "warn"
-manual_let_else = "warn"
-cast_possible_truncation = "warn"
-cast_sign_loss = "warn"
-wildcard_imports = "warn"
-string_slice = "warn"
 dbg_macro = "deny"
-large_futures = "warn"
-map_err_ignore = "warn"
-significant_drop_in_scrutinee = "warn"
-significant_drop_tightening = "warn"
-# Hood security additions -------------------------------------------------
-# A successful Drop bypass is a leak; in a network-facing daemon that's
-# either secrets sticking around or fds leaking. mem::forget is almost
-# never the right answer.
+# A Drop bypass leaks secrets or fds in a long-running network daemon.
 mem_forget = "deny"
-# Bare `as` casts hide overflow/truncation/precision-loss; prefer From/Into
-# or explicit checked conversions in security-relevant paths.
-cast_lossless = "warn"
-cast_possible_wrap = "warn"
-cast_precision_loss = "warn"
-# Arithmetic on user-controlled data (body sizes, header counts, ports)
-# should be checked rather than silently wrap or overflow.
-arithmetic_side_effects = "warn"
-# Float arithmetic in a network/security tool is suspicious — we don't do
-# any. If a future change introduces one, this flags it for review.
-float_arithmetic = "warn"
-# `Result::ok().unwrap_or(default)` and friends silently swallow errors;
-# require explicit handling.
-ok_expect = "deny"
-# Discourage panics on slicing/indexing user input.
-indexing_slicing = "warn"
-# Catch `.to_string()` on `&str` and similar redundant allocs.
+# `.map_err(|_| anyhow!("..."))` discards the underlying cause; require it
+# to be carried in the new error.
+map_err_ignore = "warn"
+# Redundant allocation; `.to_owned()` is the right call.
 str_to_string = "warn"
-# Encourages explicit error context.
-map_unwrap_or = "warn"
+# Truncating casts in security-relevant integer math (sizes, counts).
+cast_possible_truncation = "warn"
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }

@@ -1849,6 +1849,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "dirs",
  "http-body-util",
  "hyper",
  "hyper-util",

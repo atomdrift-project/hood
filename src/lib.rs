@@ -11,6 +11,8 @@
 //! lives in [`tools`].
 
 pub mod ca;
+pub mod install;
+pub mod output;
 pub mod proxy;
 pub mod scanner;
 pub mod tools;

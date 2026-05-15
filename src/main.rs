@@ -8,11 +8,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hood::proxy::{Config, Proxy, DEFAULT_MAX_BODY_BYTES};
-use hood::scanner::{AllowAll, LitmusScanner, Scanner, SuspiciousPolicy};
-use hood::tools::{prepare_child_env, rewrite_args, run_child, Tool};
-
-const MIB: u64 = 1024 * 1024;
+use hood::proxy::{Config, Proxy};
+use hood::scanner::{AllowAll, LitmusScanner, ScanPolicy, Scanner};
+use hood::tools::{dispatch, prepare_child_env, run_child, run_passthrough, Dispatch, Tool};
 
 #[derive(Parser, Debug)]
 #[command(name = "hood")]
@@ -22,18 +20,6 @@ struct Cli {
     /// Override litmus model directory (default: auto-resolve via litmus models repo).
     #[arg(long, global = true)]
     model_dir: Option<PathBuf>,
-
-    /// Disable scanning entirely; act as a transparent proxy. For debugging only.
-    #[arg(long, global = true)]
-    no_scan: bool,
-
-    /// Forward suspicious payloads (with a warning) instead of blocking.
-    #[arg(long, global = true)]
-    allow_suspicious: bool,
-
-    /// Maximum response body size buffered for scanning, in megabytes.
-    #[arg(long, global = true, default_value_t = DEFAULT_MAX_BODY_BYTES / MIB)]
-    max_body_mb: u64,
 
     /// Verbose logging (debug level for hood; info for everything else).
     #[arg(short, long, global = true)]
@@ -49,33 +35,69 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run `curl` with proxy + CA trust env vars set.
+    /// Run `curl` through the proxy.
     Curl {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    /// Run `wget` with proxy + CA trust env vars set.
+    /// Run `wget` through the proxy.
     Wget {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    /// Run `npm` (install/add/ci get `--ignore-scripts` by default).
+    /// Run `npm`. install/i/add/ci/update get `--ignore-scripts` by default;
+    /// `test`/`run` and friends pass straight through.
     Npm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    /// Run `pnpm` (same trust model as npm).
+    /// Run `pnpm` (same intercept set as npm).
     Pnpm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    /// Run `pip` with proxy + `PIP_CERT` set.
+    /// Run `yarn` (same intercept set as npm).
+    Yarn {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `bun`.
+    Bun {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `pip`. install/download/wheel are intercepted; everything else passes through.
     Pip {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
-    /// Run `go` with proxy + `SSL_CERT_FILE` + macOS fallback-roots `GODEBUG`.
+    /// Run `pipx`.
+    Pipx {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `uv` (Astral's pip replacement).
+    Uv {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `poetry`.
+    Poetry {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `go`. `get`/`install`/`mod` are intercepted; `run`/`test`/`build`/`vet` pass through.
     Go {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `cargo`. `install`/`add`/`update`/`fetch` are intercepted; `build`/`test`/`run` pass through.
+    Cargo {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `brew`. `install`/`upgrade`/`reinstall`/`fetch`/`tap`/`bundle` are intercepted.
+    Brew {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
@@ -85,10 +107,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, num_args = 1..)]
         argv: Vec<OsString>,
     },
+    /// Install PATH shims for supported tools and wire them into your shell.
+    Install {
+        /// Re-run setup even if shims already exist.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove hood shims and shell-rc entries.
+    Uninstall,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli_with_argv0_dispatch();
     init_logging(cli.verbose);
 
     // Install the ring crypto provider for rustls. Without this rustls panics
@@ -120,52 +150,143 @@ fn main() -> ExitCode {
     }
 }
 
+/// Busybox-style entrypoint: if `argv[0]`'s basename matches one of hood's
+/// known tool shims (installed via `hood install`), translate the invocation
+/// into the corresponding `hood <tool> <args>` form before clap parses it.
+///
+/// Falls back to the normal CLI when `argv[0]` is `hood` (the canonical name)
+/// or anything unrecognized.
+fn parse_cli_with_argv0_dispatch() -> Cli {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    Cli::parse_from(rewrite_argv_for_shim(argv))
+}
+
+/// Pure-function half of [`parse_cli_with_argv0_dispatch`]: takes the raw argv
+/// and, if `argv[0]`'s basename is a recognized tool shim, prepends `hood`
+/// and the canonical tool name. Otherwise the argv is returned unchanged.
+fn rewrite_argv_for_shim(argv: Vec<OsString>) -> Vec<OsString> {
+    let Some(argv0) = argv.first() else {
+        return argv;
+    };
+    let basename = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let Some(tool) = hood::install::tool_from_argv0(basename) else {
+        return argv;
+    };
+    let mut synth: Vec<OsString> = Vec::with_capacity(argv.len().saturating_add(1));
+    synth.push(OsString::from("hood"));
+    synth.push(OsString::from(tool.name()));
+    synth.extend(argv.into_iter().skip(1));
+    synth
+}
+
 async fn run(cli: Cli) -> Result<i32> {
-    let suspicious = if cli.allow_suspicious {
-        SuspiciousPolicy::Warn
-    } else {
-        SuspiciousPolicy::Block
+    // Install/uninstall don't touch the proxy or scanner.
+    match cli.command {
+        Command::Install { force } => return hood::install::install(force),
+        Command::Uninstall => return hood::install::uninstall(),
+        _ => {}
+    }
+
+    let (tool, argv, bin_override) = command_to_tool(cli.command);
+    let shim_dir = hood::install::shim_dir().ok();
+
+    // Pass-through: skip proxy startup entirely for `npm test`, `cargo build`,
+    // `go run`, etc. Hot path; no model load, no listener, no env injection.
+    let args = match dispatch(tool, argv, cli.enable_scripts) {
+        Dispatch::Passthrough(args) => {
+            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref())
+                .await;
+        }
+        Dispatch::Intercept(args) => args,
     };
 
-    let scanner: Arc<dyn Scanner> = if cli.no_scan {
-        tracing::warn!("--no-scan: payloads will be forwarded without inspection");
-        Arc::new(AllowAll)
-    } else {
-        Arc::new(
-            LitmusScanner::load(cli.model_dir.clone(), suspicious)
-                .context("load litmus scanner")?,
-        )
-    };
-
-    let proxy_cfg = Config {
-        max_body_bytes: cli.max_body_mb.saturating_mul(MIB),
-        ..Config::default()
-    };
-    let proxy = Proxy::new(scanner, proxy_cfg).context("build proxy")?;
+    let policy = resolve_policy();
+    let scanner = build_scanner(cli.model_dir.clone(), policy)?;
+    let proxy = Proxy::new(scanner, Config::default()).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let handle = proxy.spawn().await.context("start proxy")?;
     tracing::debug!(addr = %handle.addr, "hood proxy listening");
 
     let (env, _ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
+    let exit_code = run_child(
+        tool,
+        bin_override.as_deref(),
+        args,
+        &env,
+        shim_dir.as_deref(),
+    )
+    .await?;
+    handle.stop().await;
+    Ok(exit_code)
+}
 
-    let (tool, argv, bin_override): (Tool, Vec<OsString>, Option<PathBuf>) = match cli.command {
+/// Unpack a `Command` into the tool, args, and (for `Exec`) the explicit
+/// binary path the caller supplied.
+fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
+    match cmd {
         Command::Curl { args } => (Tool::Curl, args, None),
         Command::Wget { args } => (Tool::Wget, args, None),
         Command::Npm { args } => (Tool::Npm, args, None),
         Command::Pnpm { args } => (Tool::Pnpm, args, None),
+        Command::Yarn { args } => (Tool::Yarn, args, None),
+        Command::Bun { args } => (Tool::Bun, args, None),
         Command::Pip { args } => (Tool::Pip, args, None),
+        Command::Pipx { args } => (Tool::Pipx, args, None),
+        Command::Uv { args } => (Tool::Uv, args, None),
+        Command::Poetry { args } => (Tool::Poetry, args, None),
         Command::Go { args } => (Tool::Go, args, None),
+        Command::Cargo { args } => (Tool::Cargo, args, None),
+        Command::Brew { args } => (Tool::Brew, args, None),
         Command::Exec { mut argv } => {
-            // argv[0] is the binary, the rest are its args.
             let bin = PathBuf::from(argv.remove(0));
             (Tool::Exec, argv, Some(bin))
         }
-    };
-    let argv = rewrite_args(tool, argv, cli.enable_scripts);
+        Command::Install { .. } | Command::Uninstall => {
+            // `run` matches these arms and returns before reaching this
+            // function. Reaching this branch means a future refactor broke
+            // that contract; panic is the right failure mode for a
+            // violated invariant.
+            unreachable!("install/uninstall must be handled before command_to_tool")
+        }
+    }
+}
 
-    let exit_code = run_child(tool, bin_override.as_deref(), argv, &env).await?;
-    handle.stop().await;
-    Ok(exit_code)
+/// Map the `HOOD_BYPASS` env var to a policy:
+///
+/// - unset or `0` → `Strict` (block hostile and suspicious)
+/// - `1` → `AllowSuspicious` (block only hostile)
+/// - `2` → `Bypass` (forward everything; only log)
+///
+/// Any other value falls back to `Strict` with a WARN so typos don't silently
+/// downgrade protection.
+fn resolve_policy() -> ScanPolicy {
+    match std::env::var("HOOD_BYPASS").ok().as_deref() {
+        None | Some("") | Some("0") => ScanPolicy::Strict,
+        Some("1") => ScanPolicy::AllowSuspicious,
+        Some("2") => ScanPolicy::Bypass,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "HOOD_BYPASS set to unrecognized value; defaulting to strict",
+            );
+            ScanPolicy::Strict
+        }
+    }
+}
+
+/// Build the live scanner. `HOOD_NO_SCAN=1` is a debug-only escape hatch
+/// (loud WARN, transparent forwarding) deliberately kept off the CLI surface.
+fn build_scanner(model_dir: Option<PathBuf>, policy: ScanPolicy) -> Result<Arc<dyn Scanner>> {
+    if std::env::var_os("HOOD_NO_SCAN").is_some_and(|v| !v.is_empty()) {
+        tracing::warn!("HOOD_NO_SCAN set — payloads forwarded without inspection");
+        return Ok(Arc::new(AllowAll));
+    }
+    Ok(Arc::new(
+        LitmusScanner::load(model_dir, policy).context("load litmus scanner")?,
+    ))
 }
 
 fn init_logging(verbose: bool) {
@@ -236,5 +357,77 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn install_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hood", "install"]).unwrap();
+        assert!(matches!(cli.command, Command::Install { force: false }));
+        let cli = Cli::try_parse_from(["hood", "install", "--force"]).unwrap();
+        assert!(matches!(cli.command, Command::Install { force: true }));
+    }
+
+    #[test]
+    fn uninstall_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hood", "uninstall"]).unwrap();
+        assert!(matches!(cli.command, Command::Uninstall));
+    }
+
+    // ----- argv[0] busybox dispatch ---------------------------------------
+
+    fn os_vec(strs: &[&str]) -> Vec<OsString> {
+        strs.iter().map(|s| OsString::from(*s)).collect()
+    }
+
+    #[test]
+    fn rewrite_argv_passthrough_when_argv0_is_hood() {
+        let argv = os_vec(&["hood", "curl", "https://x"]);
+        assert_eq!(rewrite_argv_for_shim(argv.clone()), argv);
+    }
+
+    #[test]
+    fn rewrite_argv_prepends_hood_and_tool_when_shimmed() {
+        let argv = os_vec(&["/Users/t/.hood/bin/npm", "install", "lodash"]);
+        let out = rewrite_argv_for_shim(argv);
+        assert_eq!(out, os_vec(&["hood", "npm", "install", "lodash"]));
+    }
+
+    #[test]
+    fn rewrite_argv_works_for_every_shimmable_tool() {
+        for tool in hood::tools::Tool::SHIMMABLE {
+            let argv = vec![OsString::from(tool.name()), OsString::from("--help")];
+            let out = rewrite_argv_for_shim(argv);
+            let expected = vec![
+                OsString::from("hood"),
+                OsString::from(tool.name()),
+                OsString::from("--help"),
+            ];
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn rewrite_argv_leaves_unknown_argv0_alone() {
+        let argv = os_vec(&["rsync", "-a", "src", "dst"]);
+        assert_eq!(rewrite_argv_for_shim(argv.clone()), argv);
+    }
+
+    #[test]
+    fn rewrite_argv_handles_empty_input() {
+        assert_eq!(rewrite_argv_for_shim(Vec::new()), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn rewrite_argv_strips_path_components() {
+        let argv = os_vec(&["./bin/cargo", "install", "ripgrep"]);
+        let out = rewrite_argv_for_shim(argv);
+        assert_eq!(out, os_vec(&["hood", "cargo", "install", "ripgrep"]));
+    }
+
+    #[test]
+    fn rewrite_argv_strips_exe_suffix() {
+        let argv = os_vec(&["npm.exe", "install"]);
+        let out = rewrite_argv_for_shim(argv);
+        assert_eq!(out, os_vec(&["hood", "npm", "install"]));
     }
 }

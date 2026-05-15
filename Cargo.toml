@@ -1,0 +1,119 @@
+[package]
+name = "hood"
+version = "0.1.0"
+edition = "2021"
+authors = ["The Atomdrift Project"]
+description = "Scan HTTP(S) payloads before they reach package managers, installers, and curl|sh scripts"
+license = "Apache-2.0"
+
+[lints.rust]
+# Litmus parity ----------------------------------------------------------
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+unused_imports = "deny"
+unused_mut = "deny"
+dead_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+noop_method_call = "warn"
+# Hood security additions -------------------------------------------------
+# Catches `let _ = sender.send(...)` that silently discards a Result, and
+# `let _ = mutex.lock()` patterns that immediately drop a guard.
+let_underscore_drop = "warn"
+
+[lints.clippy]
+# Litmus parity ----------------------------------------------------------
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+result_unit_err = "deny"
+result_large_err = "deny"
+missing_safety_doc = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+unnecessary_wraps = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+wildcard_imports = "warn"
+string_slice = "warn"
+dbg_macro = "deny"
+large_futures = "warn"
+map_err_ignore = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+# Hood security additions -------------------------------------------------
+# A successful Drop bypass is a leak; in a network-facing daemon that's
+# either secrets sticking around or fds leaking. mem::forget is almost
+# never the right answer.
+mem_forget = "deny"
+# Bare `as` casts hide overflow/truncation/precision-loss; prefer From/Into
+# or explicit checked conversions in security-relevant paths.
+cast_lossless = "warn"
+cast_possible_wrap = "warn"
+cast_precision_loss = "warn"
+# Arithmetic on user-controlled data (body sizes, header counts, ports)
+# should be checked rather than silently wrap or overflow.
+arithmetic_side_effects = "warn"
+# Float arithmetic in a network/security tool is suspicious — we don't do
+# any. If a future change introduces one, this flags it for review.
+float_arithmetic = "warn"
+# `Result::ok().unwrap_or(default)` and friends silently swallow errors;
+# require explicit handling.
+ok_expect = "deny"
+# Discourage panics on slicing/indexing user input.
+indexing_slicing = "warn"
+# Catch `.to_string()` on `&str` and similar redundant allocs.
+str_to_string = "warn"
+# Encourages explicit error context.
+map_unwrap_or = "warn"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
+litmus = { path = "../litmus" }
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
+url = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+tokio = { version = "1", features = ["test-util", "macros"] }
+
+[[bin]]
+name = "hood"
+path = "src/main.rs"
+
+[lib]
+name = "hood"
+path = "src/lib.rs"
+
+[profile.release]
+strip = "debuginfo"
+lto = "thin"

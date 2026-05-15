@@ -82,21 +82,28 @@ impl Scanner for AllowAll {
     }
 }
 
-/// Policy for how non-benign verdicts are handled when forwarding through the
-/// proxy.
+/// Policy for how non-benign verdicts and scan errors are handled when
+/// forwarding through the proxy.
 ///
-/// Hood always *scans* and always *logs* what it sees — this policy controls
-/// only whether the body is then forwarded to the caller.
+/// Hood always *scans* and always *emits a panel* for non-allow paths — this
+/// policy controls only whether the body is then forwarded to the caller.
+///
+/// The four levels form a strict ladder: each higher tier passes everything
+/// the previous tier did, plus one more class of payload. The order tracks
+/// trust: scan errors are "we couldn't tell," suspicious is "the model
+/// thinks something is off," hostile is "we're confident this is bad."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScanPolicy {
-    /// Block hostile **and** suspicious. Default — fail-closed.
+    /// Block everything non-benign, including scan errors. Default.
     #[default]
     Strict,
-    /// Block hostile only; let suspicious through with a WARN log.
+    /// Forward when the scanner errors out (e.g. trait load failure, malformed
+    /// payload). Block hostile and suspicious classifications.
+    AllowErrors,
+    /// Forward errors and suspicious; block hostile only.
     AllowSuspicious,
-    /// Forward everything regardless of verdict. Every non-benign scan still
-    /// emits a WARN log line; nothing is hidden, the policy just defers the
-    /// blocking decision to the operator reading the logs.
+    /// Forward everything. Hood still logs every non-benign payload, but the
+    /// blocking decision is deferred to whoever reads the panel.
     Bypass,
 }
 
@@ -114,6 +121,7 @@ pub struct LitmusScanner {
 struct Inner {
     analyzer: Analyzer,
     policy: ScanPolicy,
+    invocation: String,
 }
 
 impl std::fmt::Debug for LitmusScanner {
@@ -131,7 +139,15 @@ impl LitmusScanner {
     /// `model_dir` is the same directory passed to `litmus scan --model-dir`;
     /// when `None`, the litmus models_repo resolver is used (auto-clone on
     /// first call).
-    pub fn load(model_dir: Option<PathBuf>, policy: ScanPolicy) -> Result<Self> {
+    ///
+    /// `invocation` is the shell-quoted command the user ran (e.g.
+    /// `"curl -fsSL https://x"`), surfaced in the bypass hint of the
+    /// stderr panel so they can copy/paste a working command.
+    pub fn load(
+        model_dir: Option<PathBuf>,
+        policy: ScanPolicy,
+        invocation: String,
+    ) -> Result<Self> {
         let model_dir = match model_dir {
             Some(d) => d,
             None => litmus::models_repo::model_dir()
@@ -139,7 +155,11 @@ impl LitmusScanner {
         };
         let analyzer = Analyzer::load(model_dir).context("load litmus analyzer")?;
         Ok(Self {
-            inner: Arc::new(Inner { analyzer, policy }),
+            inner: Arc::new(Inner {
+                analyzer,
+                policy,
+                invocation,
+            }),
         })
     }
 
@@ -150,12 +170,18 @@ impl LitmusScanner {
 
 /// Apply [`ScanPolicy`] to a classification. Pulled out of [`LitmusScanner`]
 /// so the decision matrix is testable without loading a real model.
+///
+/// Scan errors (the analyzer-returned-Err branch) are handled separately by
+/// `policy_allows_error`; this function only sees successful classifications.
 fn verdict_from(classification: Classification, policy: ScanPolicy) -> Verdict {
     match (classification, policy) {
-        // Allow paths: bypass active, model benign, or suspicious-but-policy-allows.
-        (_, ScanPolicy::Bypass)
-        | (Classification::Benign, _)
-        | (Classification::Suspicious, ScanPolicy::AllowSuspicious) => Verdict::Allow,
+        // Bypass forwards every classification.
+        (_, ScanPolicy::Bypass) => Verdict::Allow,
+        // Benign is always allowed.
+        (Classification::Benign, _) => Verdict::Allow,
+        // Suspicious: allowed by AllowSuspicious (and Bypass, handled above).
+        (Classification::Suspicious, ScanPolicy::AllowSuspicious) => Verdict::Allow,
+        // Block paths.
         (Classification::Hostile, _) => Verdict::Block(BlockReason::Hostile),
         (Classification::Suspicious, _) => Verdict::Block(BlockReason::Suspicious),
         // litmus marks Classification non_exhaustive — fail-closed on new
@@ -164,6 +190,14 @@ fn verdict_from(classification: Classification, policy: ScanPolicy) -> Verdict {
             "unknown classification: {other:?}",
         ))),
     }
+}
+
+/// True when the active policy lets a scan-error payload through.
+const fn policy_allows_error(policy: ScanPolicy) -> bool {
+    matches!(
+        policy,
+        ScanPolicy::AllowErrors | ScanPolicy::AllowSuspicious | ScanPolicy::Bypass,
+    )
 }
 
 
@@ -200,6 +234,7 @@ impl Scanner for LitmusScanner {
                         url: &req.url,
                         traits: &traits,
                         reasons: reasons_slice,
+                        invocation: &self.inner.invocation,
                     });
                 } else {
                     tracing::debug!(
@@ -212,8 +247,25 @@ impl Scanner for LitmusScanner {
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                tracing::warn!(url = req.url, error = %msg, "scan failed; fail-closed");
-                Ok(Verdict::Block(BlockReason::ScanError(msg)))
+                let policy = self.inner.policy;
+                let allowed = policy_allows_error(policy);
+                let disposition = if allowed {
+                    crate::output::Disposition::Forwarded
+                } else {
+                    crate::output::Disposition::Blocked
+                };
+                crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
+                    url: &req.url,
+                    error: &msg,
+                    policy,
+                    disposition,
+                    invocation: &self.inner.invocation,
+                });
+                if allowed {
+                    Ok(Verdict::Allow)
+                } else {
+                    Ok(Verdict::Block(BlockReason::ScanError(msg)))
+                }
             }
         }
     }
@@ -250,7 +302,7 @@ mod tests {
     // ----- verdict matrix --------------------------------------------------
 
     #[test]
-    fn strict_policy_blocks_hostile_and_suspicious_allows_benign() {
+    fn strict_policy_blocks_everything_non_benign() {
         assert_eq!(
             verdict_from(Classification::Benign, ScanPolicy::Strict),
             Verdict::Allow,
@@ -266,7 +318,26 @@ mod tests {
     }
 
     #[test]
-    fn allow_suspicious_policy_blocks_only_hostile() {
+    fn allow_errors_blocks_suspicious_and_hostile() {
+        // AllowErrors changes nothing about classification verdicts — it only
+        // affects what happens when the scanner *itself* errors out. So the
+        // matrix for AllowErrors matches Strict at this layer.
+        assert_eq!(
+            verdict_from(Classification::Benign, ScanPolicy::AllowErrors),
+            Verdict::Allow,
+        );
+        assert_eq!(
+            verdict_from(Classification::Suspicious, ScanPolicy::AllowErrors),
+            Verdict::Block(BlockReason::Suspicious),
+        );
+        assert_eq!(
+            verdict_from(Classification::Hostile, ScanPolicy::AllowErrors),
+            Verdict::Block(BlockReason::Hostile),
+        );
+    }
+
+    #[test]
+    fn allow_suspicious_blocks_only_hostile() {
         assert_eq!(
             verdict_from(Classification::Benign, ScanPolicy::AllowSuspicious),
             Verdict::Allow,
@@ -282,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_policy_allows_everything() {
+    fn bypass_allows_everything() {
         for c in [
             Classification::Benign,
             Classification::Suspicious,
@@ -294,6 +365,14 @@ mod tests {
                 "bypass must allow {c:?}",
             );
         }
+    }
+
+    #[test]
+    fn policy_allows_error_ladder() {
+        assert!(!policy_allows_error(ScanPolicy::Strict));
+        assert!(policy_allows_error(ScanPolicy::AllowErrors));
+        assert!(policy_allows_error(ScanPolicy::AllowSuspicious));
+        assert!(policy_allows_error(ScanPolicy::Bypass));
     }
 
 }

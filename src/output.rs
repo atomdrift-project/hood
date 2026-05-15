@@ -95,6 +95,10 @@ pub struct Panel<'a> {
     pub traits: &'a [TopFinding],
     /// Top SHAP-ranked reasons.
     pub reasons: &'a [Reason],
+    /// Shell-quoted reproducer for the bypass hint, e.g.
+    /// `"curl -fsSL https://example.com/install.sh"`. When empty, the
+    /// hint falls back to a descriptive form (used in unit tests).
+    pub invocation: &'a str,
 }
 
 /// Render the panel to stderr. Falls back to a single structured WARN line
@@ -156,15 +160,11 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
     if !p.traits.is_empty() {
         writeln!(w)?;
         writeln!(w, "  {}", fg(c.dim, "evidence"))?;
+        // The list is already sorted strongest-first; the position carries the
+        // ranking signal, so the per-trait score/criticality numbers would
+        // just be noise.
         for t in p.traits {
-            let score = score_value(t);
-            writeln!(
-                w,
-                "    {}  {}  {}",
-                fg(c.dim, &format!("{}×{:.2}", t.crit, t.conf)),
-                fg(verdict_color, &format!("{score:>5.2}")),
-                fg(c.text, &t.id),
-            )?;
+            writeln!(w, "    {}", fg(c.text, &t.id))?;
         }
     }
 
@@ -186,45 +186,46 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
 }
 
 fn write_bypass_hint<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Result<()> {
+    let inv = p.invocation;
     match (p.disposition, p.classification, p.policy) {
-        // Already forwarded — tell the operator what's already active.
-        (Disposition::Forwarded, _, ScanPolicy::Bypass) => writeln!(
+        // Already forwarded — show what's active.
+        (Disposition::Forwarded, _, policy) => writeln!(
             w,
             "  {}  {}",
             fg(c.dim, "active:"),
-            fg(c.accent, "HOOD_BYPASS=2"),
+            fg(c.accent, policy_tag(policy)),
         ),
-        (Disposition::Forwarded, _, ScanPolicy::AllowSuspicious) => writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "active:"),
-            fg(c.accent, "HOOD_BYPASS=1"),
-        ),
-        // Blocked: tell the user the minimum knob that would let it through.
+        // Blocked suspicious: minimum knob is =2; =3 also works.
         (Disposition::Blocked, Classification::Suspicious, _) => {
-            writeln!(
-                w,
-                "  {}  {}  {}",
-                fg(c.dim, "to allow:"),
-                fg(c.accent, "HOOD_BYPASS=1"),
-                fg(c.dim, "(allow suspicious)"),
-            )?;
-            writeln!(
-                w,
-                "  {}  {}  {}",
-                fg(c.dim, "         "),
-                fg(c.accent, "HOOD_BYPASS=2"),
-                fg(c.dim, "(allow suspicious + hostile)"),
-            )
+            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=2", inv)
         }
-        (Disposition::Blocked, Classification::Hostile, _) => writeln!(
-            w,
-            "  {}  {}  {}",
-            fg(c.dim, "to allow:"),
-            fg(c.accent, "HOOD_BYPASS=2"),
-            fg(c.dim, "(allow suspicious + hostile — proceed with care)"),
-        ),
+        // Blocked hostile: only HOOD_BYPASS=3 would let it through.
+        (Disposition::Blocked, Classification::Hostile, _) => {
+            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=3", inv)
+        }
         _ => Ok(()),
+    }
+}
+
+/// Render one "label: HOOD_BYPASS=N <command>" line. If no command was
+/// supplied (e.g. unit tests), fall back to a descriptive parenthetical.
+fn write_command_hint<W: Write>(
+    w: &mut W,
+    c: &Palette,
+    label: &str,
+    env: &str,
+    invocation: &str,
+) -> std::io::Result<()> {
+    if invocation.is_empty() {
+        writeln!(w, "  {}  {}", fg(c.dim, label), fg(c.accent, env))
+    } else {
+        writeln!(
+            w,
+            "  {}  {} {}",
+            fg(c.dim, label),
+            fg(c.accent, env),
+            fg(c.text, invocation),
+        )
     }
 }
 
@@ -253,10 +254,159 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
     )
 }
 
+/// Context for a scan-error panel: the scanner couldn't reach a verdict on
+/// *this specific payload* (trait load failed, cleave crashed, etc.). Separate
+/// from `Panel` because we have no classification, no probability, no traits.
+#[derive(Debug)]
+pub struct ScanErrorPanel<'a> {
+    /// URL the tool was about to fetch.
+    pub url: &'a str,
+    /// One-line summary of the underlying error.
+    pub error: &'a str,
+    /// Effective policy. Drives whether the panel is BLOCKED or FORWARDED
+    /// and which `HOOD_BYPASS` level is suggested.
+    pub policy: ScanPolicy,
+    /// Whether the body was withheld or forwarded under the active policy.
+    pub disposition: Disposition,
+    /// Shell-quoted reproducer for the bypass hint.
+    pub invocation: &'a str,
+}
+
+/// Render a scan-error panel to stderr — one payload, one verdict (or lack
+/// of one), single visual unit. Same TTY-vs-pipe split as [`emit`].
+pub fn emit_scan_error(p: &ScanErrorPanel<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    if stderr.is_terminal() {
+        let theme = litmus::output::detect_theme();
+        drop(write_scan_error_pretty(
+            &mut stderr,
+            p,
+            Palette::for_theme(theme),
+        ));
+    } else {
+        drop(writeln!(
+            stderr,
+            "hood scan-error url={} policy={} disposition={} error={}",
+            p.url,
+            policy_tag(p.policy),
+            match p.disposition {
+                Disposition::Blocked => "block",
+                Disposition::Forwarded => "forward",
+            },
+            p.error,
+        ));
+    }
+}
+
+fn write_scan_error_pretty<W: Write>(
+    w: &mut W,
+    p: &ScanErrorPanel<'_>,
+    c: Palette,
+) -> std::io::Result<()> {
+    let (header, header_color) = match p.disposition {
+        Disposition::Blocked => ("BLOCKED", c.suspicious),
+        Disposition::Forwarded => ("FORWARDED", c.suspicious),
+    };
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {} {} {}",
+        fg(c.dim, "──"),
+        fg_bold(header_color, header),
+        fg(c.chrome, &"─".repeat(62)),
+    )?;
+    writeln!(w, "  {}  {}", fg(c.dim, "scan-error"), fg_bold(c.text, p.url))?;
+    writeln!(w)?;
+    writeln!(w, "  {}  {}", fg(c.dim, "reason:"), fg(c.text, p.error))?;
+    writeln!(w)?;
+    match p.disposition {
+        Disposition::Forwarded => writeln!(
+            w,
+            "  {}  {}",
+            fg(c.dim, "active:"),
+            fg(c.accent, policy_tag(p.policy)),
+        )?,
+        Disposition::Blocked => {
+            // Suggest the minimum tier that would have allowed this — =1.
+            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=1", p.invocation)?;
+        }
+    }
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
+    writeln!(w)
+}
+
+/// Failsafe panel: scanning was bypassed because the proxy couldn't start.
+/// Only emitted when `HOOD_BYPASS` is set; under strict policy a startup
+/// failure aborts the run before this is ever called.
+pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
+    let mut stderr = std::io::stderr().lock();
+    if stderr.is_terminal() {
+        let theme = litmus::output::detect_theme();
+        drop(write_failsafe_pretty(
+            &mut stderr,
+            invocation,
+            policy,
+            reason,
+            Palette::for_theme(theme),
+        ));
+    } else {
+        drop(writeln!(
+            stderr,
+            "hood unscanned policy={} reason={} invocation={}",
+            policy_tag(policy),
+            reason,
+            invocation,
+        ));
+    }
+}
+
+fn write_failsafe_pretty<W: Write>(
+    w: &mut W,
+    invocation: &str,
+    policy: ScanPolicy,
+    reason: &str,
+    c: Palette,
+) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {} {} {}",
+        fg(c.dim, "──"),
+        fg_bold(c.suspicious, "UNSCANNED"),
+        fg(c.chrome, &"─".repeat(62)),
+    )?;
+    writeln!(
+        w,
+        "  {} {}",
+        fg(c.dim, "proxy unavailable:"),
+        fg(c.text, reason),
+    )?;
+    if !invocation.is_empty() {
+        writeln!(w, "  {} {}", fg(c.dim, "running:"), fg(c.text, invocation))?;
+    }
+    writeln!(
+        w,
+        "  {} {}",
+        fg(c.accent, policy_tag(policy)),
+        fg(c.dim, "active — passing through without inspection"),
+    )?;
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
+    writeln!(w)
+}
+
+const fn policy_tag(p: ScanPolicy) -> &'static str {
+    match p {
+        ScanPolicy::Strict => "HOOD_BYPASS=0",
+        ScanPolicy::AllowErrors => "HOOD_BYPASS=1",
+        ScanPolicy::AllowSuspicious => "HOOD_BYPASS=2",
+        ScanPolicy::Bypass => "HOOD_BYPASS=3",
+    }
+}
+
 fn format_traits_inline(traits: &[TopFinding]) -> String {
     traits
         .iter()
-        .map(|t| format!("{} ({:.2})", t.id, score_value(t)))
+        .map(|t| t.id.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -290,11 +440,6 @@ fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
         s.push_str(&fg(dim, "▱"));
     }
     s
-}
-
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn score_value(t: &TopFinding) -> f32 {
-    (t.crit as f32) * t.conf
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -349,6 +494,7 @@ mod tests {
             url: "https://example.com/foo.sh",
             traits,
             reasons,
+            invocation: "",
         }
     }
 
@@ -384,6 +530,7 @@ mod tests {
             url: "https://x",
             traits: &[],
             reasons: &[],
+            invocation: "",
         };
         let mut buf = Vec::new();
         write_plain(&mut buf, &p).unwrap();
@@ -392,7 +539,97 @@ mod tests {
     }
 
     #[test]
-    fn pretty_output_suggests_bypass_1_for_suspicious_block() {
+    fn pretty_hint_uses_command_when_provided_for_hostile() {
+        let p = Panel {
+            classification: Classification::Hostile,
+            original: None,
+            disposition: Disposition::Blocked,
+            policy: ScanPolicy::Strict,
+            probability: 0.9,
+            url: "https://x/install.sh",
+            traits: &[],
+            reasons: &[],
+            invocation: "curl -fsSL https://x/install.sh",
+        };
+        let mut buf = Vec::new();
+        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("HOOD_BYPASS=3 curl -fsSL https://x/install.sh"));
+    }
+
+    #[test]
+    fn pretty_hint_for_suspicious_uses_command_with_level_2() {
+        let p = Panel {
+            classification: Classification::Suspicious,
+            original: None,
+            disposition: Disposition::Blocked,
+            policy: ScanPolicy::Strict,
+            probability: 0.6,
+            url: "https://x/install.sh",
+            traits: &[],
+            reasons: &[],
+            invocation: "curl -fsSL https://x/install.sh",
+        };
+        let mut buf = Vec::new();
+        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("HOOD_BYPASS=2 curl -fsSL https://x/install.sh"));
+    }
+
+    #[test]
+    fn failsafe_pretty_mentions_policy_and_reason() {
+        let mut buf = Vec::new();
+        write_failsafe_pretty(
+            &mut buf,
+            "curl -O https://example.com",
+            ScanPolicy::Bypass,
+            "load litmus model: not found",
+            Palette::dark(),
+        )
+        .unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("UNSCANNED"));
+        assert!(s.contains("HOOD_BYPASS=3"));
+        assert!(s.contains("load litmus model: not found"));
+        assert!(s.contains("curl -O https://example.com"));
+    }
+
+    #[test]
+    fn scan_error_pretty_suggests_hood_bypass_1() {
+        let p = ScanErrorPanel {
+            url: "https://x/install.sh",
+            error: "trait load failed: ...",
+            policy: ScanPolicy::Strict,
+            disposition: Disposition::Blocked,
+            invocation: "curl -fsSL https://x/install.sh",
+        };
+        let mut buf = Vec::new();
+        write_scan_error_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("BLOCKED"));
+        assert!(s.contains("scan-error"));
+        assert!(s.contains("HOOD_BYPASS=1 curl -fsSL https://x/install.sh"));
+    }
+
+    #[test]
+    fn scan_error_pretty_shows_active_when_forwarded() {
+        let p = ScanErrorPanel {
+            url: "https://x/install.sh",
+            error: "trait load failed: ...",
+            policy: ScanPolicy::AllowErrors,
+            disposition: Disposition::Forwarded,
+            invocation: "curl -fsSL https://x/install.sh",
+        };
+        let mut buf = Vec::new();
+        write_scan_error_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("FORWARDED"));
+        assert!(s.contains("active:"));
+        assert!(s.contains("HOOD_BYPASS=1"));
+    }
+
+    #[test]
+    fn pretty_output_suggests_bypass_2_for_suspicious_block() {
         let p = panel(
             &[],
             &[],
@@ -403,12 +640,13 @@ mod tests {
         let mut buf = Vec::new();
         write_pretty(&mut buf, &p, Palette::dark()).unwrap();
         let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=1"));
         assert!(s.contains("HOOD_BYPASS=2"));
+        // Suspicious blocks don't suggest =1 (wouldn't help; that's for errors).
+        assert!(!s.contains("HOOD_BYPASS=1"));
     }
 
     #[test]
-    fn pretty_output_suggests_bypass_2_for_hostile_block() {
+    fn pretty_output_suggests_bypass_3_for_hostile_block() {
         let p = panel(
             &[],
             &[],
@@ -419,9 +657,9 @@ mod tests {
         let mut buf = Vec::new();
         write_pretty(&mut buf, &p, Palette::dark()).unwrap();
         let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=2"));
-        // Hostile blocks don't suggest HOOD_BYPASS=1 (wouldn't be enough).
+        assert!(s.contains("HOOD_BYPASS=3"));
         assert!(!s.contains("HOOD_BYPASS=1"));
+        assert!(!s.contains("HOOD_BYPASS=2"));
     }
 
     #[test]
@@ -437,7 +675,7 @@ mod tests {
         write_pretty(&mut buf, &p, Palette::dark()).unwrap();
         let s = strip_ansi(&String::from_utf8(buf).unwrap());
         assert!(s.contains("active:"));
-        assert!(s.contains("HOOD_BYPASS=2"));
+        assert!(s.contains("HOOD_BYPASS=3"));
         assert!(s.contains("FORWARDED"));
     }
 

@@ -382,7 +382,7 @@ impl Proxy {
 
         match verdict {
             Verdict::Allow => {
-                tracing::info!(
+                tracing::debug!(
                     url = %scan_url,
                     status = parts.status.as_u16(),
                     bytes = body_len,

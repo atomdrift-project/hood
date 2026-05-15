@@ -2,7 +2,7 @@
 //! scans every downloaded payload before it reaches the tool.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -192,6 +192,7 @@ async fn run(cli: Cli) -> Result<i32> {
 
     let (tool, argv, bin_override) = command_to_tool(cli.command);
     let shim_dir = hood::install::shim_dir().ok();
+    let invocation = format_invocation(tool, &argv, bin_override.as_deref());
 
     // Pass-through: skip proxy startup entirely for `npm test`, `cargo build`,
     // `go run`, etc. Hot path; no model load, no listener, no env injection.
@@ -204,23 +205,105 @@ async fn run(cli: Cli) -> Result<i32> {
     };
 
     let policy = resolve_policy();
-    let scanner = build_scanner(cli.model_dir.clone(), policy)?;
-    let proxy = Proxy::new(scanner, Config::default()).context("build proxy")?;
-    let ca_pem = proxy.ca_pem().to_owned();
-    let handle = proxy.spawn().await.context("start proxy")?;
-    tracing::debug!(addr = %handle.addr, "hood proxy listening");
 
-    let (env, _ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
+    // Setup the full scan/proxy pipeline. Under bypass we tolerate startup
+    // failure — the user has explicitly opted into reduced enforcement, so a
+    // missing model or unavailable port shouldn't break their workflow.
+    let setup_result =
+        setup_proxy(cli.model_dir.clone(), policy, invocation.clone()).await;
+    let proxy_setup = match setup_result {
+        Ok(setup) => setup,
+        Err(e) if !matches!(policy, ScanPolicy::Strict) => {
+            hood::output::emit_failsafe(&invocation, policy, &format!("{e:#}"));
+            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref())
+                .await;
+        }
+        Err(e) => return Err(e),
+    };
+
     let exit_code = run_child(
         tool,
         bin_override.as_deref(),
         args,
-        &env,
+        &proxy_setup.env,
         shim_dir.as_deref(),
     )
     .await?;
-    handle.stop().await;
+    proxy_setup.handle.stop().await;
+    drop(proxy_setup.ca_tempdir);
     Ok(exit_code)
+}
+
+/// Everything `run` needs once the proxy is up. `ca_tempdir` must outlive the
+/// child process — drop it after the child exits to remove the CA PEM file.
+struct ProxySetup {
+    handle: hood::proxy::Handle,
+    env: hood::tools::ChildEnv,
+    ca_tempdir: tempfile::TempDir,
+}
+
+/// Build the scanner, construct the proxy, spawn it, and prepare the child
+/// env. Returns one struct holding everything the run loop needs.
+async fn setup_proxy(
+    model_dir: Option<PathBuf>,
+    policy: ScanPolicy,
+    invocation: String,
+) -> Result<ProxySetup> {
+    let scanner = build_scanner(model_dir, policy, invocation)?;
+    let proxy = Proxy::new(scanner, Config::default()).context("build proxy")?;
+    let ca_pem = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await.context("start proxy")?;
+    tracing::debug!(addr = %handle.addr, "hood proxy listening");
+    let (env, ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
+    Ok(ProxySetup {
+        handle,
+        env,
+        ca_tempdir,
+    })
+}
+
+/// Build a single-line shell command that reproduces what the user typed.
+/// Used inside the bypass hint so the user can copy/paste a working command.
+fn format_invocation(tool: Tool, args: &[OsString], bin_override: Option<&Path>) -> String {
+    let head: String = match (tool, bin_override) {
+        (Tool::Exec, Some(bin)) => sh_quote(&bin.display().to_string()),
+        _ => tool.name().to_owned(),
+    };
+    if args.is_empty() {
+        return head;
+    }
+    let mut out = head;
+    for a in args {
+        out.push(' ');
+        out.push_str(&sh_quote(&a.to_string_lossy()));
+    }
+    out
+}
+
+/// Minimal POSIX-shell quoter: wrap in single quotes when the value contains
+/// anything outside `[A-Za-z0-9_./:@%+,=-]`. Embedded single quotes are
+/// escaped as `'\''`.
+fn sh_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_owned();
+    }
+    let safe = s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"_./:@%+,=-".contains(&b));
+    if safe {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Unpack a `Command` into the tool, args, and (for `Exec`) the explicit
@@ -254,19 +337,23 @@ fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
     }
 }
 
-/// Map the `HOOD_BYPASS` env var to a policy:
+/// Map the `HOOD_BYPASS` env var to a policy. The ladder is strict — each
+/// higher level passes everything the previous one did, plus one more class
+/// of payload:
 ///
-/// - unset or `0` → `Strict` (block hostile and suspicious)
-/// - `1` → `AllowSuspicious` (block only hostile)
-/// - `2` → `Bypass` (forward everything; only log)
+/// - unset or `0` → `Strict` (block scan errors, suspicious, hostile)
+/// - `1` → `AllowErrors` (forward on scanner failure; still block verdicts)
+/// - `2` → `AllowSuspicious` (forward errors + suspicious; block hostile)
+/// - `3` → `Bypass` (forward everything)
 ///
 /// Any other value falls back to `Strict` with a WARN so typos don't silently
 /// downgrade protection.
 fn resolve_policy() -> ScanPolicy {
     match std::env::var("HOOD_BYPASS").ok().as_deref() {
         None | Some("") | Some("0") => ScanPolicy::Strict,
-        Some("1") => ScanPolicy::AllowSuspicious,
-        Some("2") => ScanPolicy::Bypass,
+        Some("1") => ScanPolicy::AllowErrors,
+        Some("2") => ScanPolicy::AllowSuspicious,
+        Some("3") => ScanPolicy::Bypass,
         Some(other) => {
             tracing::warn!(
                 value = other,
@@ -279,13 +366,17 @@ fn resolve_policy() -> ScanPolicy {
 
 /// Build the live scanner. `HOOD_NO_SCAN=1` is a debug-only escape hatch
 /// (loud WARN, transparent forwarding) deliberately kept off the CLI surface.
-fn build_scanner(model_dir: Option<PathBuf>, policy: ScanPolicy) -> Result<Arc<dyn Scanner>> {
+fn build_scanner(
+    model_dir: Option<PathBuf>,
+    policy: ScanPolicy,
+    invocation: String,
+) -> Result<Arc<dyn Scanner>> {
     if std::env::var_os("HOOD_NO_SCAN").is_some_and(|v| !v.is_empty()) {
         tracing::warn!("HOOD_NO_SCAN set — payloads forwarded without inspection");
         return Ok(Arc::new(AllowAll));
     }
     Ok(Arc::new(
-        LitmusScanner::load(model_dir, policy).context("load litmus scanner")?,
+        LitmusScanner::load(model_dir, policy, invocation).context("load litmus scanner")?,
     ))
 }
 
@@ -429,5 +520,48 @@ mod tests {
         let argv = os_vec(&["npm.exe", "install"]);
         let out = rewrite_argv_for_shim(argv);
         assert_eq!(out, os_vec(&["hood", "npm", "install"]));
+    }
+
+    // ----- invocation rendering -------------------------------------------
+
+    #[test]
+    fn format_invocation_uses_tool_name_for_named_tools() {
+        let argv = os_vec(&["-fsSL", "https://example.com"]);
+        let s = format_invocation(hood::tools::Tool::Curl, &argv, None);
+        assert_eq!(s, "curl -fsSL https://example.com");
+    }
+
+    #[test]
+    fn format_invocation_uses_explicit_binary_for_exec() {
+        let argv = os_vec(&["./bootstrap.sh"]);
+        let s = format_invocation(
+            hood::tools::Tool::Exec,
+            &argv,
+            Some(std::path::Path::new("/usr/local/bin/bash")),
+        );
+        assert!(s.starts_with("/usr/local/bin/bash"));
+        assert!(s.contains("./bootstrap.sh"));
+    }
+
+    #[test]
+    fn format_invocation_quotes_args_with_spaces() {
+        let argv = vec![OsString::from("install"), OsString::from("name with space")];
+        let s = format_invocation(hood::tools::Tool::Npm, &argv, None);
+        assert_eq!(s, "npm install 'name with space'");
+    }
+
+    #[test]
+    fn sh_quote_leaves_safe_input_alone() {
+        assert_eq!(sh_quote("install"), "install");
+        assert_eq!(sh_quote("/usr/local/bin/foo"), "/usr/local/bin/foo");
+        assert_eq!(sh_quote("v1.2.3-rc.4"), "v1.2.3-rc.4");
+    }
+
+    #[test]
+    fn sh_quote_escapes_special_input() {
+        assert_eq!(sh_quote("with space"), "'with space'");
+        assert_eq!(sh_quote("a$b"), "'a$b'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_quote(""), "''");
     }
 }

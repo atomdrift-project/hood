@@ -118,7 +118,7 @@ pub fn tool_from_argv0(argv0: &str) -> Option<Tool> {
 pub fn install(force: bool) -> Result<i32> {
     let layout = layout_default()?;
     let hood_bin = hood_binary_path()?;
-    let report = install_at(&layout, &hood_bin, force)?;
+    let report = install_at(&layout, &hood_bin, force, std::env::consts::OS)?;
     print_install_report(&layout, &hood_bin, &report);
     Ok(0)
 }
@@ -137,25 +137,41 @@ pub struct InstallReport {
 
 /// Install hood shims using an explicit [`Layout`] and hood binary path. The
 /// public [`install`] is a thin wrapper that derives the layout from the user's
-/// real home. Tests should use this entry point.
+/// real home and passes [`std::env::consts::OS`]. Tests should use this entry
+/// point.
+///
+/// `os` gates which tools are candidates: a tool is shimmed when it is present
+/// on `PATH` (it demonstrably exists), or reported as skipped when it is absent
+/// but [plausible][`Tool::plausible_on`] for `os`. Tools that are both absent
+/// and implausible for the platform (pacman on macOS) are ignored outright, so
+/// the report stays relevant to the machine it ran on.
 ///
 /// # Errors
 /// Filesystem errors creating the shim directory, symlinking, or writing
 /// shell rc files.
-pub fn install_at(layout: &Layout, hood_bin: &Path, force: bool) -> Result<InstallReport> {
+pub fn install_at(
+    layout: &Layout,
+    hood_bin: &Path,
+    force: bool,
+    os: &str,
+) -> Result<InstallReport> {
     fs::create_dir_all(&layout.shim_dir)
         .with_context(|| format!("create shim dir {}", layout.shim_dir.display()))?;
 
     let mut report = InstallReport::default();
     for tool in Tool::SHIMMABLE {
         let name = tool.name();
-        if !is_tool_present(name, &layout.shim_dir) {
+        if is_tool_present(name, &layout.shim_dir) {
+            // Present on PATH — it exists here, so shim it whatever the platform.
+            install_link(&layout.shim_dir, name, hood_bin, force)
+                .with_context(|| format!("install shim for {name}"))?;
+            report.installed.push(name);
+        } else if tool.plausible_on(os) {
+            // Absent but appropriate for this OS — surface it so the user knows
+            // hood will cover it once the tool is installed.
             report.skipped.push(name);
-            continue;
         }
-        install_link(&layout.shim_dir, name, hood_bin, force)
-            .with_context(|| format!("install shim for {name}"))?;
-        report.installed.push(name);
+        // Absent and implausible for this OS: not a candidate; leave it unlisted.
     }
 
     for rc in detect_shell_rcs_at(&layout.home) {
@@ -680,7 +696,7 @@ mod tests {
         fs::write(home.join(".zshrc"), "echo hi\n").unwrap();
         let layout = Layout::at_home(&home);
 
-        let report = install_at(&layout, &hood, false).unwrap();
+        let report = install_at(&layout, &hood, false, "linux").unwrap();
         assert!(report.installed.contains(&"cargo"));
         assert!(report.skipped.contains(&"npm")); // not on staged PATH
         assert!(report.touched_files.iter().any(|p| p.ends_with(".zshrc")));
@@ -695,6 +711,69 @@ mod tests {
         let zshrc = fs::read_to_string(home.join(".zshrc")).unwrap();
         assert!(zshrc.contains(MARK_BEGIN));
         assert!(zshrc.contains(layout.shim_dir.to_str().unwrap()));
+
+        drop(path_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_omits_platform_inappropriate_tools() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty PATH: nothing is present, so the skipped list is purely the set
+        // of tools plausible for the OS we pass.
+        let path_guard = EnvGuard::set("PATH", std::ffi::OsStr::new(""));
+        let hood = fake_hood_binary(tmp.path());
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let layout = Layout::at_home(&home);
+
+        // On macOS, Linux/BSD system managers are not candidates at all.
+        let mac = install_at(&layout, &hood, false, "macos").unwrap();
+        for absent in ["pacman", "yay", "makepkg", "dnf", "rpm", "apk", "pkg"] {
+            assert!(
+                !mac.skipped.contains(&absent),
+                "{absent} must not be listed on macOS",
+            );
+        }
+        assert!(mac.skipped.contains(&"brew"), "brew is a macOS candidate");
+        assert!(mac.skipped.contains(&"npm"), "npm is cross-platform");
+
+        // On Linux the Arch/RPM/Alpine managers are candidates; FreeBSD's pkg
+        // is not.
+        let linux = install_at(&layout, &hood, false, "linux").unwrap();
+        for present in ["pacman", "dnf", "rpm", "apk", "brew"] {
+            assert!(
+                linux.skipped.contains(&present),
+                "{present} should be a Linux candidate",
+            );
+        }
+        assert!(!linux.skipped.contains(&"pkg"), "pkg is BSD-only");
+
+        drop(path_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_shims_present_tool_even_when_implausible() {
+        // "if they exist" wins over platform plausibility: a binary actually on
+        // PATH gets shimmed regardless of the OS gate.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fake_tool_binary(&bin, "pacman");
+
+        let path_guard = EnvGuard::set("PATH", bin.as_os_str());
+        let hood = fake_hood_binary(tmp.path());
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let layout = Layout::at_home(&home);
+
+        // pacman is implausible on macOS, but it's present, so it's installed.
+        let report = install_at(&layout, &hood, false, "macos").unwrap();
+        assert!(report.installed.contains(&"pacman"));
+        assert!(!report.skipped.contains(&"pacman"));
 
         drop(path_guard);
     }
@@ -719,8 +798,8 @@ mod tests {
         let layout = Layout::at_home(&home);
 
         // Install twice — second call should be idempotent.
-        install_at(&layout, &hood, false).unwrap();
-        install_at(&layout, &hood, false).unwrap();
+        install_at(&layout, &hood, false, "linux").unwrap();
+        install_at(&layout, &hood, false, "linux").unwrap();
         let after_install = fs::read_to_string(&zshrc).unwrap();
         assert_eq!(after_install.matches(MARK_BEGIN).count(), 1);
         assert!(layout.shim_dir.join("go").exists());
@@ -751,7 +830,7 @@ mod tests {
         fs::create_dir_all(&fish_dir).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at(&layout, &hood, false).unwrap();
+        install_at(&layout, &hood, false, "linux").unwrap();
         let fish_cfg = fish_dir.join("config.fish");
         let content = fs::read_to_string(&fish_cfg).unwrap();
         assert!(content.contains("fish_add_path"));
@@ -781,11 +860,11 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at(&layout, &hood1, false).unwrap();
+        install_at(&layout, &hood1, false, "linux").unwrap();
         let target1 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target1, hood1);
 
-        install_at(&layout, &hood2, true).unwrap();
+        install_at(&layout, &hood2, true, "linux").unwrap();
         let target2 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target2, hood2);
 

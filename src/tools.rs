@@ -149,6 +149,39 @@ impl Tool {
         }
     }
 
+    /// Whether this tool could plausibly exist on the given OS — matched against
+    /// [`std::env::consts::OS`] (`"macos"`, `"linux"`, `"freebsd"`, `"windows"`, …).
+    ///
+    /// This is a coarse OS-family gate, not a distro check: it removes tools that
+    /// cannot belong on the platform at all (pacman on macOS, `pkg` on Linux) so
+    /// the installer neither advertises them nor shims a stray same-named binary.
+    /// Distro-level nuance — Arch's pacman vs Fedora's dnf, both "linux" — is left
+    /// to the PATH probe, which only ever finds the one that's actually installed.
+    #[must_use]
+    pub fn plausible_on(self, os: &str) -> bool {
+        match self {
+            // Downloaders and language toolchains ship everywhere hood runs.
+            Self::Curl | Self::Wget | Self::Npm | Self::Pnpm | Self::Yarn | Self::Bun
+            | Self::Pip | Self::Pipx | Self::Uv | Self::Poetry | Self::Go | Self::Cargo
+            | Self::Exec => true,
+            // Homebrew targets macOS and Linux (Linuxbrew).
+            Self::Brew => matches!(os, "macos" | "linux"),
+            // Arch (pacman/AUR), RPM (dnf/yum/zypper/rpm), and Alpine (apk) system
+            // package managers are Linux-only.
+            Self::Pacman
+            | Self::Yay
+            | Self::Paru
+            | Self::Makepkg
+            | Self::Dnf
+            | Self::Yum
+            | Self::Zypper
+            | Self::Rpm
+            | Self::Apk => os == "linux",
+            // pkgng is the BSD family.
+            Self::Pkg => matches!(os, "freebsd" | "dragonfly" | "netbsd" | "openbsd"),
+        }
+    }
+
     /// Tools eligible for shell-shim installation (everything except `Exec`).
     pub const SHIMMABLE: &'static [Self] = &[
         Self::Curl,
@@ -1127,6 +1160,30 @@ mod tests {
     #[test]
     fn exec_has_no_default_binary() {
         assert!(Tool::Exec.default_binary().is_none());
+    }
+
+    #[test]
+    fn plausible_on_gates_system_managers_by_os() {
+        // Arch/RPM/Alpine managers are Linux-only.
+        for t in [Tool::Pacman, Tool::Yay, Tool::Dnf, Tool::Rpm, Tool::Apk] {
+            assert!(t.plausible_on("linux"), "{t:?} should be plausible on linux");
+            assert!(!t.plausible_on("macos"), "{t:?} must not be plausible on macos");
+            assert!(!t.plausible_on("windows"), "{t:?} must not be plausible on windows");
+        }
+        // Homebrew: macOS and Linux, not BSD/Windows.
+        assert!(Tool::Brew.plausible_on("macos"));
+        assert!(Tool::Brew.plausible_on("linux"));
+        assert!(!Tool::Brew.plausible_on("freebsd"));
+        // pkgng: BSD only.
+        assert!(Tool::Pkg.plausible_on("freebsd"));
+        assert!(!Tool::Pkg.plausible_on("linux"));
+        assert!(!Tool::Pkg.plausible_on("macos"));
+        // Language toolchains and downloaders: everywhere.
+        for t in [Tool::Curl, Tool::Npm, Tool::Cargo, Tool::Go, Tool::Pip] {
+            for os in ["macos", "linux", "windows", "freebsd"] {
+                assert!(t.plausible_on(os), "{t:?} should be plausible on {os}");
+            }
+        }
     }
 
     // ----- PATH-skipping binary resolution --------------------------------

@@ -101,6 +101,56 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `pacman`. `-S`/`-U` (sync/upgrade) operations are intercepted; `-Q`/`-R` pass through.
+    Pacman {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `yay` (Arch AUR helper). Installs and upgrades are intercepted; queries pass through.
+    Yay {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `paru` (Arch AUR helper). Same intercept model as yay.
+    Paru {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `makepkg`. Any build fetches sources and is intercepted; info flags pass through.
+    Makepkg {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `dnf`. `install`/`upgrade`/`update`/`download` and friends are intercepted.
+    Dnf {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `yum` (dnf-compatible front end).
+    Yum {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `zypper`. `install`/`in`/`update`/`dup`/`patch`/`refresh` are intercepted.
+    Zypper {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `rpm`. Intercepted only when given an `http(s)`/`ftp` URL; local installs pass through.
+    Rpm {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `pkg` (FreeBSD). `install`/`add`/`upgrade`/`fetch`/`update` are intercepted.
+    Pkg {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `apk` (Alpine). `add`/`upgrade`/`update`/`fetch` are intercepted.
+    Apk {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run an arbitrary command; hood injects every env var it knows.
     Exec {
         /// Binary to run, followed by its args.
@@ -323,6 +373,16 @@ fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
         Command::Go { args } => (Tool::Go, args, None),
         Command::Cargo { args } => (Tool::Cargo, args, None),
         Command::Brew { args } => (Tool::Brew, args, None),
+        Command::Pacman { args } => (Tool::Pacman, args, None),
+        Command::Yay { args } => (Tool::Yay, args, None),
+        Command::Paru { args } => (Tool::Paru, args, None),
+        Command::Makepkg { args } => (Tool::Makepkg, args, None),
+        Command::Dnf { args } => (Tool::Dnf, args, None),
+        Command::Yum { args } => (Tool::Yum, args, None),
+        Command::Zypper { args } => (Tool::Zypper, args, None),
+        Command::Rpm { args } => (Tool::Rpm, args, None),
+        Command::Pkg { args } => (Tool::Pkg, args, None),
+        Command::Apk { args } => (Tool::Apk, args, None),
         Command::Exec { mut argv } => {
             let bin = PathBuf::from(argv.remove(0));
             (Tool::Exec, argv, Some(bin))

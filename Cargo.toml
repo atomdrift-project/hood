@@ -63,6 +63,8 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 url = "2"
@@ -82,3 +84,10 @@ path = "src/lib.rs"
 [profile.release]
 strip = "debuginfo"
 lto = "thin"
+
+# The `scan` dependency uses `fletch::fetch::fetch_references_with`, which lives
+# in local fletch ahead of a published release. `[patch]` only applies from the
+# top-level crate, so hood must mirror scan's patch to resolve fletch to the same
+# local source. Remove once fletch publishes a git rev carrying that API.
+[patch."https://codeberg.org/atomdrift/fletch.git"]
+fletch = { path = "../fletch" }

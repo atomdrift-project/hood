@@ -25,17 +25,47 @@ use tokio::net::TcpListener;
 use tokio_rustls::rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer};
 
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AllowAll, Scanner};
+use hood::scanner::{
+    AllowAll, BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict,
+};
+
+/// A scanner that blocks everything it is asked to inspect, in-memory or on
+/// disk. Used to prove a path was *not* scanned: if a response still comes back
+/// forwarded, the scanner was never consulted.
+#[derive(Debug)]
+struct BlockAll;
+
+#[async_trait::async_trait]
+impl Scanner for BlockAll {
+    async fn scan(&self, _req: ScanRequest) -> Result<Verdict> {
+        Ok(Verdict::Block(BlockReason::Hostile))
+    }
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
+        Ok(Verdict::Block(BlockReason::Hostile))
+    }
+}
 
 /// Body the test origin returns. Some plain ASCII so we don't accidentally
 /// trip cleave/scan heuristics in tests that use the real scanner.
 const PAYLOAD: &[u8] = b"hello from origin\n";
 
-async fn handle(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+/// A larger, deterministic body used to exercise the spill-to-disk and
+/// oversized-passthrough paths. 256 KiB so a small `max_body_bytes` forces a
+/// spill and a small `max_scan_bytes` forces an unscanned forward.
+fn big_payload() -> Vec<u8> {
+    (0..256 * 1024).map(|i| (i % 251) as u8).collect()
+}
+
+async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let body = if req.uri().path() == "/big" {
+        Bytes::from(big_payload())
+    } else {
+        Bytes::from_static(PAYLOAD)
+    };
     Ok(Response::builder()
-        .header("content-type", "text/plain")
+        .header("content-type", "application/octet-stream")
         .header("x-origin-marker", "yes")
-        .body(Full::new(Bytes::from_static(PAYLOAD)))
+        .body(Full::new(body))
         .unwrap())
 }
 
@@ -209,21 +239,90 @@ async fn https_mitm_round_trip_with_allow_all() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_body_spills_to_disk_and_forwards_intact() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let origin_addr = start_http_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
+    // RAM cap far below the 256 KiB body → spill to disk and scan from there
+    // (AllowAll → allow); disk-scan cap generous so it's the scanned-from-disk
+    // path, not the unscanned one.
+    let cfg = Config {
+        max_body_bytes: 4096,
+        max_scan_bytes: 8 * 1024 * 1024,
+        ..Config::default()
+    };
+    let proxy = Proxy::new(scanner, cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let url = format!("http://{origin_addr}/big");
+    let resp = client.get(&url).send().await?;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await?;
+    assert_eq!(body.as_ref(), big_payload().as_slice());
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_body_forwards_unscanned_intact() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let origin_addr = start_http_origin().await?;
+    // BlockAll would block anything it scans — so if the 256 KiB body still
+    // comes back whole, it proves the body was forwarded *without* scanning
+    // because it exceeded the disk-scan cap.
+    let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
+    let cfg = Config {
+        max_body_bytes: 4096,
+        max_scan_bytes: 16 * 1024, // 256 KiB body exceeds this → unscanned
+        ..Config::default()
+    };
+    let proxy = Proxy::new(scanner, cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let url = format!("http://{origin_addr}/big");
+    let resp = client.get(&url).send().await?;
+    assert_eq!(resp.status(), 200, "oversized body must be forwarded, not blocked");
+    let body = resp.bytes().await?;
+    assert_eq!(body.as_ref(), big_payload().as_slice());
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_request_is_forwarded_without_scanning() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // A HEAD reply carries no body. With BlockAll — which blocks anything it
+    // scans — a HEAD that comes back forwarded proves the scanner was never
+    // consulted (regression: an empty body was fed to the tar analyzer and
+    // spuriously blocked as a scan error).
+    let origin_addr = start_http_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
+    let proxy = Proxy::new(scanner, Config::default())?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    // `/big` would be a 256 KiB body on GET — definitely scanned-and-blocked if
+    // the short-circuit failed.
+    let url = format!("http://{origin_addr}/big");
+    let resp = client.head(&url).send().await?;
+    assert_eq!(resp.status(), 200, "HEAD must be forwarded, not scan-blocked");
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_returns_451() -> Result<()> {
-    use anyhow::Result as AResult;
-    use async_trait::async_trait;
-    use hood::scanner::{BlockReason, ScanRequest, Verdict};
-
-    #[derive(Debug)]
-    struct BlockAll;
-
-    #[async_trait]
-    impl Scanner for BlockAll {
-        async fn scan(&self, _req: ScanRequest) -> AResult<Verdict> {
-            Ok(Verdict::Block(BlockReason::Hostile))
-        }
-    }
-
     drop(rustls::crypto::ring::default_provider().install_default());
 
     let origin_addr = start_http_origin().await?;

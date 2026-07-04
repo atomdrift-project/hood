@@ -242,7 +242,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
         Tool::Yay | Tool::Paru => aur_helper_fetches(&args),
         Tool::Makepkg => makepkg_fetches(&args),
         Tool::Rpm => rpm_fetches(&args),
-        _ => is_fetching_subcommand(tool, first_positional(&args).as_deref()),
+        _ => has_fetching_subcommand(tool, &args),
     };
     if !fetches {
         return Dispatch::Passthrough(args);
@@ -251,7 +251,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
     // For npm-family install-style subcommands, inject --ignore-scripts so we
     // match pnpm's default safety posture. The user can opt back in with
     // --enable-scripts on the hood command.
-    let final_args = if matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun) {
+    let final_args = if runs_install_scripts(tool, leading_subcommand(&args).as_deref()) {
         maybe_add_ignore_scripts(args, enable_scripts)
     } else {
         args
@@ -259,13 +259,43 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
     Dispatch::Intercept(final_args)
 }
 
-/// Find the first positional (non-flag) argument. Flags here are anything
-/// starting with `-`; we don't expand combined short flags, but the only
-/// thing that matters is "is the subcommand we expect at the front."
-fn first_positional(args: &[OsString]) -> Option<String> {
+/// True when a subcommand installs dependencies and thus runs lifecycle scripts
+/// worth suppressing with `--ignore-scripts`. Gated on the *leading* subcommand
+/// (so a fetch verb appearing only as a flag value doesn't trigger injection),
+/// and excludes `bun x` — that's exec, not install, so the flag would be handed
+/// to the executed package and suppress nothing.
+fn runs_install_scripts(tool: Tool, sub: Option<&str>) -> bool {
+    matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun)
+        && sub != Some("x")
+        && is_fetching_subcommand(tool, sub)
+}
+
+/// The leading subcommand token: the first argument that is neither a flag
+/// (`-…`) nor a toolchain selector (`+nightly`, which cargo/rustup consume
+/// before the real subcommand). `None` when the invocation is all flags (e.g.
+/// bare `npm`). We don't expand combined short flags — the only question is
+/// which token is the subcommand.
+fn leading_subcommand(args: &[OsString]) -> Option<String> {
     args.iter()
-        .find(|a| !a.to_string_lossy().starts_with('-'))
-        .map(|a| a.to_string_lossy().into_owned())
+        .map(|a| a.to_string_lossy())
+        .find(|s| !s.starts_with('-') && !s.starts_with('+'))
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// True when *any* non-flag, non-toolchain token is a fetching subcommand for
+/// the tool. Checking every token (not just the first) is the security-biased
+/// choice: a leading toolchain selector (`cargo +nightly install`) or a
+/// value-taking global flag (`npm --prefix /tmp install`, `pip --log f install`)
+/// would otherwise push the real subcommand out of first position and pass the
+/// fetch through unscanned. Scanning an occasional local command by mistake is
+/// the safe failure mode; missing a real download is not.
+fn has_fetching_subcommand(tool: Tool, args: &[OsString]) -> bool {
+    args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        !s.starts_with('-')
+            && !s.starts_with('+')
+            && is_fetching_subcommand(tool, Some(s.as_ref()))
+    })
 }
 
 /// Per-tool subcommand list that triggers interception. Anything not in the
@@ -417,12 +447,22 @@ fn makepkg_fetches(args: &[OsString]) -> bool {
 
 /// True when an `rpm` invocation names a remote payload. rpm installs local
 /// files the vast majority of the time; it only reaches the network when an
-/// argument is an explicit `http(s)`/`ftp` URL, so that is the precise trigger.
+/// argument is an explicit `http(s)`/`ftp(s)` URL, so that is the precise trigger.
 fn rpm_fetches(args: &[OsString]) -> bool {
-    args.iter().any(|a| {
-        let s = a.to_string_lossy();
-        s.starts_with("http://") || s.starts_with("https://") || s.starts_with("ftp://")
-    })
+    args.iter().any(|a| is_remote_url(&a.to_string_lossy()))
+}
+
+/// True when `s` begins with a remote URL scheme libcurl would fetch. URL
+/// schemes are case-insensitive (RFC 3986 §3.1), so `HTTPS://` must match too —
+/// matching only lowercase would let `rpm -i HTTPS://host/x.rpm` fetch unscanned.
+fn is_remote_url(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return false;
+    };
+    !rest.is_empty()
+        && ["http", "https", "ftp", "ftps"]
+            .iter()
+            .any(|p| scheme.eq_ignore_ascii_case(p))
 }
 
 /// Return the letters of a single-dash flag group (`-Syu` → `Syu`). Returns
@@ -480,6 +520,16 @@ impl ChildEnv {
             "ALL_PROXY",
         ] {
             out.insert(k, proxy.clone());
+        }
+
+        // Neutralize any inherited NO_PROXY exclusion list. A curl/Go/Node child
+        // that inherits `NO_PROXY=*.internal` (or `NO_PROXY=*`) would route
+        // matching hosts straight to the origin, bypassing the proxy entirely and
+        // leaving those downloads unscanned. Setting it empty (both cases, since
+        // clients differ on which they read) excludes no host, so everything is
+        // forced through hood.
+        for k in ["no_proxy", "NO_PROXY"] {
+            out.insert(k, OsString::new());
         }
 
         match tool {
@@ -665,8 +715,14 @@ pub async fn run_child(
 ) -> Result<i32> {
     let bin: PathBuf = match (bin_override, tool.default_binary()) {
         (Some(p), _) => p.to_path_buf(),
-        (None, Some(name)) => resolve_real_binary(name, shim_dir)
-            .unwrap_or_else(|| PathBuf::from(name)),
+        (None, Some(name)) => resolve_real_binary(name, shim_dir).ok_or_else(|| {
+            // Falling back to a bare name would re-resolve through the child's
+            // PATH — which still contains the shim dir — and re-exec the hood
+            // shim endlessly. Fail instead.
+            anyhow::anyhow!(
+                "no real `{name}` found on PATH (only the hood shim); refusing to re-exec the shim",
+            )
+        })?,
         (None, None) => {
             return Err(anyhow::anyhow!(
                 "hood exec requires a command to run (use `hood exec -- <cmd> [args]`)",
@@ -703,8 +759,12 @@ pub async fn run_passthrough(
 ) -> Result<i32> {
     let bin: PathBuf = match (bin_override, tool.default_binary()) {
         (Some(p), _) => p.to_path_buf(),
-        (None, Some(name)) => resolve_real_binary(name, shim_dir)
-            .unwrap_or_else(|| PathBuf::from(name)),
+        (None, Some(name)) => resolve_real_binary(name, shim_dir).ok_or_else(|| {
+            // See run_child: a bare-name fallback re-execs the shim endlessly.
+            anyhow::anyhow!(
+                "no real `{name}` found on PATH (only the hood shim); refusing to re-exec the shim",
+            )
+        })?,
         (None, None) => return Err(anyhow::anyhow!("missing binary for passthrough")),
     };
 
@@ -978,7 +1038,13 @@ mod tests {
 
     #[test]
     fn bun_x_is_intercepted_but_bun_test_is_not() {
-        let _v = intercept_args(dispatch(Tool::Bun, vec![os("x"), os("create-app")], false));
+        let args = intercept_args(dispatch(Tool::Bun, vec![os("x"), os("create-app")], false));
+        // `bun x` is exec, not install: --ignore-scripts would go to the executed
+        // package and suppress nothing, so it must NOT be injected.
+        assert!(!args.contains(&os("--ignore-scripts")), "bun x got {args:?}");
+        // But `bun install` is an install and does get the flag.
+        let installed = intercept_args(dispatch(Tool::Bun, vec![os("install")], false));
+        assert!(installed.contains(&os("--ignore-scripts")));
         let _v = passthrough_args(dispatch(Tool::Bun, vec![os("test")], false));
     }
 
@@ -1021,6 +1087,50 @@ mod tests {
     fn cargo_update_and_fetch_intercepted() {
         let _v = intercept_args(dispatch(Tool::Cargo, vec![os("update")], false));
         let _v = intercept_args(dispatch(Tool::Cargo, vec![os("fetch")], false));
+    }
+
+    #[test]
+    fn cargo_toolchain_selector_does_not_hide_the_subcommand() {
+        // `+nightly` is a rustup toolchain selector, not the subcommand — the
+        // install must still be intercepted, and the selector preserved in argv.
+        let d = dispatch(
+            Tool::Cargo,
+            vec![os("+nightly"), os("install"), os("ripgrep")],
+            false,
+        );
+        assert_eq!(
+            intercept_args(d),
+            vec![os("+nightly"), os("install"), os("ripgrep")],
+        );
+        // A toolchain selector in front of a non-fetching verb still passes through.
+        let _v = passthrough_args(dispatch(
+            Tool::Cargo,
+            vec![os("+stable"), os("build")],
+            false,
+        ));
+    }
+
+    #[test]
+    fn value_flag_before_subcommand_still_intercepts() {
+        // A value-taking global flag (`--prefix /tmp`) pushes `install` out of
+        // first position; the fetch must still be intercepted, not passed through.
+        let d = dispatch(
+            Tool::Npm,
+            vec![os("--prefix"), os("/tmp"), os("install"), os("lodash")],
+            false,
+        );
+        let _v = intercept_args(d);
+        // And a non-fetching run with a flag value that isn't a verb stays local.
+        let _v = passthrough_args(dispatch(Tool::Npm, vec![os("run"), os("test")], false));
+    }
+
+    #[test]
+    fn no_proxy_is_neutralized_in_env() {
+        // The overlay must blank out any inherited NO_PROXY so the child can't
+        // route matching hosts around the proxy unscanned.
+        let v = fake_env().vars_for(Tool::Curl);
+        assert_eq!(v.get("NO_PROXY"), Some(&OsString::new()));
+        assert_eq!(v.get("no_proxy"), Some(&OsString::new()));
     }
 
     #[test]
@@ -1117,6 +1227,18 @@ mod tests {
         ));
         let _v = passthrough_args(dispatch(Tool::Rpm, vec![os("-ivh"), os("./local.rpm")], false));
         let _v = passthrough_args(dispatch(Tool::Rpm, vec![os("-q"), os("bash")], false));
+        // URL schemes are case-insensitive: an uppercase scheme must still be
+        // recognized as remote, not passed through unscanned.
+        let _v = intercept_args(dispatch(
+            Tool::Rpm,
+            vec![os("-i"), os("HTTPS://example.com/x.rpm")],
+            false,
+        ));
+        let _v = intercept_args(dispatch(
+            Tool::Rpm,
+            vec![os("-i"), os("FTPS://example.com/x.rpm")],
+            false,
+        ));
     }
 
     // ----- subcommand package managers: dispatch -------------------------

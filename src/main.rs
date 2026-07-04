@@ -256,14 +256,17 @@ async fn run(cli: Cli) -> Result<i32> {
 
     let policy = resolve_policy();
 
-    // Setup the full scan/proxy pipeline. Under bypass we tolerate startup
-    // failure — the user has explicitly opted into reduced enforcement, so a
-    // missing model or unavailable port shouldn't break their workflow.
+    // Setup the full scan/proxy pipeline. Only the top bypass tier
+    // (`HOOD_BYPASS=3`) tolerates a startup failure by forwarding unscanned —
+    // that level already forwards every verdict. Levels 1 and 2 promise to keep
+    // *blocking* hostile/suspicious payloads; the scanner being down makes that
+    // impossible, so an infrastructure failure fails closed like Strict rather
+    // than silently downgrading to "download everything unscanned."
     let setup_result =
         setup_proxy(cli.model_dir.clone(), policy, invocation.clone()).await;
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
-        Err(e) if !matches!(policy, ScanPolicy::Strict) => {
+        Err(e) if matches!(policy, ScanPolicy::Bypass) => {
             hood::output::emit_failsafe(&invocation, policy, &format!("{e:#}"));
             return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref())
                 .await;

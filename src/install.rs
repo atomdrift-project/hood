@@ -200,8 +200,8 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
         eprintln!("\nRestart your shell (or `source` the rc file) to activate.");
     } else {
         eprintln!(
-            "\nNo shell rc file was updated. Add this line to your shell rc manually:\n  export PATH=\"{}:$PATH\"",
-            layout.shim_dir.display()
+            "\nNo shell rc file was updated. Add this line to your shell rc manually:\n  export PATH={}:\"$PATH\"",
+            posix_quote(&layout.shim_dir.to_string_lossy())
         );
     }
 }
@@ -380,6 +380,38 @@ fn detect_shell_rcs_at(home: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// POSIX single-quote a string so every character is literal — spaces, `$`,
+/// `"`, `;` and the like can't break the surrounding rc line or inject shell
+/// text. An embedded single quote becomes `'\''` (close, escaped quote, reopen).
+fn posix_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// fish single-quote: inside `'…'` fish treats only `\` and `'` specially, so
+/// escape just those two. Spaces and `$` are already literal.
+fn fish_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\\' || ch == '\'' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('\'');
+    out
+}
+
 /// Add (or replace) the hood-marked block in `rc_file`. Idempotent.
 fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
     let is_fish = rc_file
@@ -391,15 +423,15 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
     let mut filtered = strip_block(&existing);
 
     let block = if is_fish {
+        let dir = fish_quote(&shim_dir.to_string_lossy());
         format!(
             "{MARK_BEGIN}\nif type -q fish_add_path\n    fish_add_path -p {dir}\nelse\n    set -gx PATH {dir} $PATH\nend\n{MARK_END}\n",
-            dir = shim_dir.display()
         )
     } else {
-        format!(
-            "{MARK_BEGIN}\nexport PATH=\"{dir}:$PATH\"\n{MARK_END}\n",
-            dir = shim_dir.display()
-        )
+        // Single-quote the literal dir (so spaces, `$`, `"` stay literal) and
+        // concatenate the still-expanding "$PATH".
+        let dir = posix_quote(&shim_dir.to_string_lossy());
+        format!("{MARK_BEGIN}\nexport PATH={dir}:\"$PATH\"\n{MARK_END}\n")
     };
 
     if !filtered.is_empty() && !filtered.ends_with('\n') {
@@ -512,6 +544,19 @@ mod tests {
     fn strip_block_is_noop_on_unmarked_input() {
         let input = "alpha\nbeta\ngamma\n";
         assert_eq!(strip_block(input), input);
+    }
+
+    #[test]
+    fn shell_quoting_neutralizes_special_chars() {
+        // POSIX: a space, `$`, and `"` must all end up literal, and an embedded
+        // single quote must be escaped without breaking out of the quoting.
+        assert_eq!(posix_quote("/home/a b/.hood/bin"), "'/home/a b/.hood/bin'");
+        assert_eq!(posix_quote("/x/$y/bin"), "'/x/$y/bin'");
+        assert_eq!(posix_quote("/x/a'b/bin"), "'/x/a'\\''b/bin'");
+        // fish: only `\` and `'` are special inside single quotes.
+        assert_eq!(fish_quote("/home/a b/.hood/bin"), "'/home/a b/.hood/bin'");
+        assert_eq!(fish_quote(r"/x/a\b/bin"), r"'/x/a\\b/bin'");
+        assert_eq!(fish_quote("/x/a'b/bin"), r"'/x/a\'b/bin'");
     }
 
     #[test]

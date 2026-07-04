@@ -144,7 +144,7 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
         fg_bold(verdict_color, verdict_label),
         fg(c.dim, &format!("{:>3}%", percent(p.probability))),
     )?;
-    writeln!(w, "  {}", fg_bold(c.text, p.url))?;
+    writeln!(w, "  {}", fg_bold(c.text, sanitize(p.url).as_ref()))?;
 
     if let Some(orig) = p.original {
         if orig != p.classification {
@@ -224,7 +224,7 @@ fn write_command_hint<W: Write>(
             "  {}  {} {}",
             fg(c.dim, label),
             fg(c.accent, env),
-            fg(c.text, invocation),
+            fg(c.text, sanitize(invocation).as_ref()),
         )
     }
 }
@@ -242,7 +242,7 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
         w,
         "hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]{}",
         header,
-        p.url,
+        sanitize(p.url),
         classification_label(p.classification),
         p.probability,
         traits,
@@ -287,13 +287,13 @@ pub fn emit_scan_error(p: &ScanErrorPanel<'_>) {
         drop(writeln!(
             stderr,
             "hood scan-error url={} policy={} disposition={} error={}",
-            p.url,
+            sanitize(p.url),
             policy_tag(p.policy),
             match p.disposition {
                 Disposition::Blocked => "block",
                 Disposition::Forwarded => "forward",
             },
-            p.error,
+            sanitize(p.error),
         ));
     }
 }
@@ -315,9 +315,9 @@ fn write_scan_error_pretty<W: Write>(
         fg_bold(header_color, header),
         fg(c.chrome, &"─".repeat(62)),
     )?;
-    writeln!(w, "  {}  {}", fg(c.dim, "scan-error"), fg_bold(c.text, p.url))?;
+    writeln!(w, "  {}  {}", fg(c.dim, "scan-error"), fg_bold(c.text, sanitize(p.url).as_ref()))?;
     writeln!(w)?;
-    writeln!(w, "  {}  {}", fg(c.dim, "reason:"), fg(c.text, p.error))?;
+    writeln!(w, "  {}  {}", fg(c.dim, "reason:"), fg(c.text, sanitize(p.error).as_ref()))?;
     writeln!(w)?;
     match p.disposition {
         Disposition::Forwarded => writeln!(
@@ -348,8 +348,14 @@ const LAB_FILE_URL: &str = "https://lab.atomdrift.org/file/";
 pub struct KnownBadPanel<'a> {
     /// URL the tool was about to fetch.
     pub url: &'a str,
-    /// Lower-hex SHA-256 of the payload; forms the lab permalink.
+    /// Lower-hex SHA-256 of the payload; forms the lab permalink. Empty for a
+    /// pre-fetch PURL match, where no bytes were downloaded to hash — the panel
+    /// then keys the match on [`Self::purl`] instead.
     pub sha256: &'a str,
+    /// PURL the known-bad match fired on, when it was a pre-fetch PURL hit rather
+    /// than a content-hash hit. Shown in place of the lab link when `sha256` is
+    /// empty.
+    pub purl: Option<&'a str>,
     /// Effective policy, for the bypass hint / active tag.
     pub policy: ScanPolicy,
     /// Whether the body was withheld or forwarded (under `HOOD_BYPASS=3`).
@@ -364,11 +370,24 @@ pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
     if stderr.is_terminal() {
         let theme = scan::output::detect_theme();
         drop(write_known_bad_pretty(&mut stderr, p, Palette::for_theme(theme)));
+    } else if p.sha256.is_empty() {
+        // Pre-fetch PURL match: no bytes were downloaded, so key on the PURL.
+        drop(writeln!(
+            stderr,
+            "hood known-bad url={} purl={} policy={} disposition={}",
+            sanitize(p.url),
+            sanitize(p.purl.unwrap_or("?")),
+            policy_tag(p.policy),
+            match p.disposition {
+                Disposition::Blocked => "block",
+                Disposition::Forwarded => "forward",
+            },
+        ));
     } else {
         drop(writeln!(
             stderr,
             "hood known-bad url={} sha256={} lab={}{} policy={} disposition={}",
-            p.url,
+            sanitize(p.url),
             p.sha256,
             LAB_FILE_URL,
             p.sha256,
@@ -402,15 +421,25 @@ fn write_known_bad_pretty<W: Write>(
         w,
         "  {}  {}",
         fg_bold(c.hostile, "known bad package"),
-        fg_bold(c.text, p.url),
+        fg_bold(c.text, sanitize(p.url).as_ref()),
     )?;
     writeln!(w)?;
-    writeln!(
-        w,
-        "  {}  {}",
-        fg(c.dim, "lab:"),
-        fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
-    )?;
+    if p.sha256.is_empty() {
+        // Pre-fetch PURL match: no hash to permalink, so show the matched PURL.
+        writeln!(
+            w,
+            "  {}  {}",
+            fg(c.dim, "purl:"),
+            fg(c.accent, sanitize(p.purl.unwrap_or("?")).as_ref()),
+        )?;
+    } else {
+        writeln!(
+            w,
+            "  {}  {}",
+            fg(c.dim, "lab:"),
+            fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
+        )?;
+    }
     writeln!(w)?;
     match p.disposition {
         Disposition::Forwarded => writeln!(
@@ -540,6 +569,22 @@ fn percent(p: f32) -> u32 {
     (p.clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
+/// Neutralize control characters in an attacker-influenced string before it is
+/// written to a terminal or a single-line log record. A crafted URL, PURL, or
+/// scan-error message could otherwise embed an ANSI escape (recoloring or
+/// clearing the terminal, hiding text) or a newline (forging a second log line).
+/// Printable characters and tabs pass through; everything else becomes U+FFFD.
+fn sanitize(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(|c| c.is_control() && c != '\t') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| if c.is_control() && c != '\t' { '\u{fffd}' } else { c })
+            .collect(),
+    )
+}
+
 fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
     format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m")
 }
@@ -552,6 +597,20 @@ fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_strips_escape_and_newline_but_keeps_printable() {
+        // No control chars → borrowed, unchanged.
+        assert_eq!(sanitize("https://example.com/pkg.tgz"), "https://example.com/pkg.tgz");
+        // ESC (ANSI injection) and newline (forged log line) are neutralized.
+        let evil = "https://x/\x1b[2Jpkg\nhood forged=line";
+        let clean = sanitize(evil);
+        assert!(!clean.contains('\x1b'), "escape survived: {clean:?}");
+        assert!(!clean.contains('\n'), "newline survived: {clean:?}");
+        assert!(clean.contains("pkg"), "printable text dropped: {clean:?}");
+        // Tab is preserved.
+        assert_eq!(sanitize("a\tb"), "a\tb");
+    }
 
     fn trait_(id: &str, crit: u32, conf: f32) -> TopFinding {
         TopFinding {
@@ -709,6 +768,7 @@ mod tests {
         let p = KnownBadPanel {
             url: "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
             sha256: "7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b",
+            purl: None,
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "npm install evil",
@@ -729,6 +789,7 @@ mod tests {
         let p = KnownBadPanel {
             url: "https://x/evil.tgz",
             sha256: "abc123",
+            purl: None,
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "",

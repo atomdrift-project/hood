@@ -70,11 +70,51 @@ pub struct ScanRequest {
     pub body: Vec<u8>,
 }
 
+/// A payload too large to buffer in RAM, spilled to a temporary file. The
+/// SHA-256 is computed incrementally as the body streams to disk, so the bloom
+/// gate runs without re-reading the file, and cleave memory-maps the path so the
+/// ML scan's resident memory stays bounded regardless of payload size.
+#[derive(Debug)]
+pub struct DiskScanRequest {
+    /// The URL the tool requested — cleave filename hint and log/panel field.
+    pub url: String,
+    /// On-disk file holding the full payload. Named with the payload's real
+    /// extension so cleave's type detection matches an in-memory scan.
+    pub path: std::path::PathBuf,
+    /// SHA-256 of the payload, computed while it streamed to disk.
+    pub sha256: [u8; 32],
+}
+
+/// Outcome of the pre-fetch PURL gate — decided from the URL alone, before a
+/// single response byte is downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prefetch {
+    /// Known-good PURL: forward the response without scanning it.
+    SkipForward,
+    /// Known-bad PURL: withhold before spending any download (unless a bypass
+    /// policy forwards it, in which case [`Prefetch::SkipForward`] is returned).
+    Block(BlockReason),
+    /// No decisive PURL signal: fetch, then scan according to size.
+    Proceed,
+}
+
 /// A scanner backend.
 #[async_trait::async_trait]
 pub trait Scanner: Send + Sync + std::fmt::Debug {
-    /// Inspect a payload and return a verdict.
+    /// Inspect an in-memory payload and return a verdict.
     async fn scan(&self, req: ScanRequest) -> Result<Verdict>;
+
+    /// Consult the known-good/known-bad PURL channel before fetching. The
+    /// default backend (no bloom) always proceeds to a full fetch-and-scan.
+    fn prefetch(&self, _url: &str) -> Prefetch {
+        Prefetch::Proceed
+    }
+
+    /// Scan a payload spilled to disk (too large to buffer in RAM). The default
+    /// backend has no model, so it forwards the payload unscanned.
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
+        Ok(Verdict::Allow)
+    }
 }
 
 /// Trivial scanner that allows everything. For tests and `--no-scan`.
@@ -175,55 +215,126 @@ impl AtomScanner {
 
     /// Consult the bloom filters before any expensive analysis. Returns
     /// `Some(verdict)` to short-circuit (a known-good skip or a known-bad
-    /// block), or `None` to fall through to the ML scan.
-    ///
-    /// Trust model: a byte-exact known-good hash is proof the *bytes* are good,
-    /// so it skips the scan. A known-good *PURL* is not — the same
-    /// `name@version` can be republished with hostile bytes — so it never skips;
-    /// only the known-bad PURL signal is honored, as an extra block. Either
-    /// known-bad channel blocks (except under `HOOD_BYPASS=3`, which forwards
-    /// everything). The panel always links the lab by the payload's own SHA-256.
+    /// block), or `None` to fall through to the ML scan. Hashes the body, then
+    /// defers to [`bloom_gate_sha`].
     fn bloom_gate(&self, req: &ScanRequest) -> Option<Verdict> {
         let lookup = self.inner.bloom.as_ref()?;
-        bloom_gate_with(lookup, self.inner.policy, &self.inner.invocation, req)
+        let mut hasher = Sha256::new();
+        hasher.update(&req.body);
+        let sha: [u8; 32] = hasher.finalize().into();
+        bloom_gate_sha(
+            lookup,
+            self.inner.policy,
+            &self.inner.invocation,
+            &req.url,
+            &sha,
+        )
     }
 
     fn verdict_for(&self, result: &ScanResult) -> Verdict {
         verdict_from(result.classification, self.inner.policy)
     }
+
+    /// Turn a raw analyzer result into a [`Verdict`], emitting the appropriate
+    /// panel — a non-benign classification, or a scan error handled under the
+    /// active policy. Shared by the in-memory ([`Scanner::scan`]) and
+    /// streamed-to-disk ([`Scanner::scan_disk`]) paths so both render identically.
+    fn classify_result(&self, url: &str, result: Result<ScanResult>) -> Verdict {
+        match result {
+            Ok(r) => {
+                let verdict = self.verdict_for(&r);
+                if matches!(r.classification, Classification::Benign) {
+                    tracing::debug!(url, probability = r.probability, "scan clean");
+                } else {
+                    let disposition = match &verdict {
+                        Verdict::Allow => crate::output::Disposition::Forwarded,
+                        Verdict::Block(_) => crate::output::Disposition::Blocked,
+                    };
+                    // `top_findings` is already deduped, ranked strongest-first,
+                    // and capped at 5 by the engine; take the leading three to
+                    // keep the panel tight.
+                    let n_traits = r.top_findings.len().min(3);
+                    let traits_slice = r.top_findings.get(..n_traits).unwrap_or(&[]);
+                    let n_reasons = r.reasons.len().min(3);
+                    let reasons_slice = r.reasons.get(..n_reasons).unwrap_or(&[]);
+                    crate::output::emit(&crate::output::Panel {
+                        classification: r.classification,
+                        // The scan backend no longer exposes a pre-upgrade
+                        // classification, so there is nothing to attribute here.
+                        original: None,
+                        disposition,
+                        policy: self.inner.policy,
+                        probability: r.probability,
+                        url,
+                        traits: traits_slice,
+                        reasons: reasons_slice,
+                        invocation: &self.inner.invocation,
+                    });
+                }
+                verdict
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let policy = self.inner.policy;
+                let allowed = policy_allows_error(policy);
+                let disposition = if allowed {
+                    crate::output::Disposition::Forwarded
+                } else {
+                    crate::output::Disposition::Blocked
+                };
+                crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
+                    url,
+                    error: &msg,
+                    policy,
+                    disposition,
+                    invocation: &self.inner.invocation,
+                });
+                if allowed {
+                    Verdict::Allow
+                } else {
+                    Verdict::Block(BlockReason::ScanError(msg))
+                }
+            }
+        }
+    }
 }
 
-/// Run the bloom gate against a loaded filter set. Free-standing (rather than a
-/// method) so it can be exercised with a synthetic [`Lookup`] and no ML model.
-/// Hashes the body once, derives a PURL from the URL via [`fletch::url_to_purl`],
-/// and consults both channels. Emits the known-bad panel as a side effect on a
-/// bad hit.
-fn bloom_gate_with(
+/// Run the bloom gate against a loaded filter set, given a payload's URL and its
+/// already-computed SHA-256. Free-standing (rather than a method) so it can be
+/// exercised with a synthetic [`Lookup`] and no ML model, and so both the
+/// in-memory ([`AtomScanner::bloom_gate`]) and streamed-to-disk
+/// ([`AtomScanner::scan_disk`]) paths share one gate. Derives a PURL from the URL
+/// via [`fletch::url_to_purl`], consults both channels, and emits the known-bad
+/// panel as a side effect on a bad hit.
+///
+/// Trust model: a byte-exact known-good *hash* proves the bytes are good, and a
+/// known-good *PURL* is likewise honored as a skip here (hood trusts the synced
+/// good set as an allowlist). Either known-bad channel blocks, except under
+/// `HOOD_BYPASS=3` which forwards everything. The panel links the lab by the
+/// payload's own SHA-256.
+fn bloom_gate_sha(
     lookup: &Lookup,
     policy: ScanPolicy,
     invocation: &str,
-    req: &ScanRequest,
+    url: &str,
+    sha: &[u8; 32],
 ) -> Option<Verdict> {
-    let mut hasher = Sha256::new();
-    hasher.update(&req.body);
-    let sha: [u8; 32] = hasher.finalize().into();
-
-    let by_hash = lookup.decide_sha256(&sha);
-    let by_purl =
-        fletch::url_to_purl(&req.url).map_or(Decision::Unknown, |p| lookup.decide_purl(&p));
+    let by_hash = lookup.decide_sha256(sha);
+    let by_purl = fletch::url_to_purl(url).map_or(Decision::Unknown, |p| lookup.decide_purl(&p));
 
     match gate_outcome(by_hash, by_purl, policy) {
         GateOutcome::Scan => None,
         GateOutcome::Skip => {
-            tracing::debug!(url = req.url, "bloom known-good skip");
+            tracing::debug!(url, "bloom known-good skip");
             Some(Verdict::Allow)
         }
         outcome => {
-            let sha_hex = hex32(&sha);
+            let sha_hex = hex32(sha);
             let blocked = matches!(outcome, GateOutcome::Block);
             crate::output::emit_known_bad(&crate::output::KnownBadPanel {
-                url: &req.url,
+                url,
                 sha256: &sha_hex,
+                purl: None,
                 policy,
                 disposition: if blocked {
                     crate::output::Disposition::Blocked
@@ -255,8 +366,8 @@ enum GateOutcome {
 }
 
 /// Resolve the two bloom channels + policy into an action. Pulled out so the
-/// precedence (known-bad wins; only a *hash* known-good skips) is unit-testable
-/// without loading real filters.
+/// precedence (known-bad wins; a known-good *hash or PURL* skips) is
+/// unit-testable without loading real filters.
 fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) -> GateOutcome {
     if matches!(by_hash, Decision::KnownBad) || matches!(by_purl, Decision::KnownBad) {
         // Known-bad is at least as severe as an ML "hostile" verdict, so only
@@ -266,7 +377,9 @@ fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) -> Gat
         } else {
             GateOutcome::Block
         }
-    } else if matches!(by_hash, Decision::Skip) {
+    } else if matches!(by_hash, Decision::Skip) || matches!(by_purl, Decision::Skip) {
+        // A known-good hash proves the bytes; a known-good PURL is trusted as an
+        // allowlist entry. Either skips the scan.
         GateOutcome::Skip
     } else {
         GateOutcome::Scan
@@ -331,7 +444,7 @@ const fn policy_allows_error(policy: ScanPolicy) -> bool {
 #[async_trait::async_trait]
 impl Scanner for AtomScanner {
     async fn scan(&self, req: ScanRequest) -> Result<Verdict> {
-        // Fast path: a bloom hit (known-good hash → skip, known-bad → block)
+        // Fast path: a bloom hit (known-good hash/PURL → skip, known-bad → block)
         // returns a verdict without ever touching the ML model. Near-invisible
         // for the common known-good case.
         if let Some(verdict) = self.bloom_gate(&req) {
@@ -347,67 +460,74 @@ impl Scanner for AtomScanner {
         let result = tokio::task::spawn_blocking(move || inner.analyzer.scan_bytes(body, &url))
             .await
             .context("scan task join")?;
+        Ok(self.classify_result(&req.url, result))
+    }
 
-        match result {
-            Ok(r) => {
-                let verdict = self.verdict_for(&r);
-                if !matches!(r.classification, Classification::Benign) {
-                    let disposition = match &verdict {
-                        Verdict::Allow => crate::output::Disposition::Forwarded,
-                        Verdict::Block(_) => crate::output::Disposition::Blocked,
-                    };
-                    // `top_findings` is already deduped, ranked strongest-first,
-                    // and capped at 5 by the engine; take the leading three to
-                    // keep the panel tight.
-                    let n_traits = r.top_findings.len().min(3);
-                    let traits_slice = r.top_findings.get(..n_traits).unwrap_or(&[]);
-                    let n_reasons = r.reasons.len().min(3);
-                    let reasons_slice = r.reasons.get(..n_reasons).unwrap_or(&[]);
-                    crate::output::emit(&crate::output::Panel {
-                        classification: r.classification,
-                        // The scan backend no longer exposes a pre-upgrade
-                        // classification, so there is nothing to attribute here.
-                        original: None,
-                        disposition,
-                        policy: self.inner.policy,
-                        probability: r.probability,
-                        url: &req.url,
-                        traits: traits_slice,
-                        reasons: reasons_slice,
-                        invocation: &self.inner.invocation,
-                    });
-                } else {
-                    tracing::debug!(
-                        url = req.url,
-                        probability = r.probability,
-                        "scan clean",
-                    );
-                }
-                Ok(verdict)
+    fn prefetch(&self, url: &str) -> Prefetch {
+        let Some(lookup) = self.inner.bloom.as_ref() else {
+            return Prefetch::Proceed;
+        };
+        let Some(purl) = fletch::url_to_purl(url) else {
+            return Prefetch::Proceed;
+        };
+        match lookup.decide_purl(&purl) {
+            // Known-good PURL: trusted allowlist entry — forward without scanning.
+            Decision::Skip => {
+                tracing::debug!(url, purl, "bloom known-good purl skip (pre-fetch)");
+                Prefetch::SkipForward
             }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                let policy = self.inner.policy;
-                let allowed = policy_allows_error(policy);
-                let disposition = if allowed {
-                    crate::output::Disposition::Forwarded
-                } else {
-                    crate::output::Disposition::Blocked
-                };
-                crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
-                    url: &req.url,
-                    error: &msg,
-                    policy,
-                    disposition,
+            // Known-bad PURL: withhold before downloading a byte. `HOOD_BYPASS=3`
+            // forwards it (still unscanned) instead of blocking.
+            Decision::KnownBad => {
+                let blocked = !matches!(self.inner.policy, ScanPolicy::Bypass);
+                crate::output::emit_known_bad(&crate::output::KnownBadPanel {
+                    url,
+                    // No bytes fetched yet, so no hash to link — the panel keys
+                    // the match on the PURL instead.
+                    sha256: "",
+                    purl: Some(&purl),
+                    policy: self.inner.policy,
+                    disposition: if blocked {
+                        crate::output::Disposition::Blocked
+                    } else {
+                        crate::output::Disposition::Forwarded
+                    },
                     invocation: &self.inner.invocation,
                 });
-                if allowed {
-                    Ok(Verdict::Allow)
+                if blocked {
+                    Prefetch::Block(BlockReason::KnownBad(purl))
                 } else {
-                    Ok(Verdict::Block(BlockReason::ScanError(msg)))
+                    Prefetch::SkipForward
                 }
             }
+            Decision::Conflicted | Decision::Unknown => Prefetch::Proceed,
         }
+    }
+
+    async fn scan_disk(&self, req: DiskScanRequest) -> Result<Verdict> {
+        // Bloom gate on the SHA computed while streaming to disk (plus the URL's
+        // PURL) — no re-read of the file. A decisive hit skips the ML scan.
+        if let Some(lookup) = self.inner.bloom.as_ref() {
+            if let Some(verdict) = bloom_gate_sha(
+                lookup,
+                self.inner.policy,
+                &self.inner.invocation,
+                &req.url,
+                &req.sha256,
+            ) {
+                return Ok(verdict);
+            }
+        }
+
+        // cleave memory-maps the file, so this classifies a multi-hundred-megabyte
+        // payload without loading it whole into RAM. Still CPU-bound → blocking pool.
+        let inner = Arc::clone(&self.inner);
+        let url = req.url.clone();
+        let path = req.path.clone();
+        let result = tokio::task::spawn_blocking(move || inner.analyzer.scan_file(&path, &url))
+            .await
+            .context("disk scan task join")?;
+        Ok(self.classify_result(&req.url, result))
     }
 }
 
@@ -465,17 +585,17 @@ mod tests {
     }
 
     #[test]
-    fn gate_skips_only_on_hash_known_good() {
+    fn gate_skips_on_hash_or_purl_known_good() {
         // Byte-exact known-good is safe to skip.
         assert_eq!(
             gate_outcome(Decision::Skip, Decision::Unknown, ScanPolicy::Strict),
             GateOutcome::Skip,
         );
-        // A known-good PURL alone is NOT proof the bytes are good (same
-        // name@version can be republished with hostile bytes) — so it scans.
+        // A known-good PURL also skips: hood trusts the synced good set as an
+        // allowlist (the deliberate trust-model change).
         assert_eq!(
             gate_outcome(Decision::Unknown, Decision::Skip, ScanPolicy::Strict),
-            GateOutcome::Scan,
+            GateOutcome::Skip,
         );
         // Conflicted and Unknown both fall through to the ML scan.
         assert_eq!(
@@ -542,50 +662,44 @@ mod tests {
         let lookup = Lookup::load_from(tmp.path());
         assert!(lookup.is_active());
 
-        let req = |url: &str, body: &[u8]| ScanRequest {
-            url: url.into(),
-            body: body.to_vec(),
-        };
-
         // Known-bad hash → hard block carrying the payload's SHA-256.
-        let v = bloom_gate_with(&lookup, ScanPolicy::Strict, "", &req("https://x/e.tgz", &bad_body));
+        let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/e.tgz", &bad_sha);
         assert_eq!(v, Some(Verdict::Block(BlockReason::KnownBad(hex32(&bad_sha)))));
 
         // Same known-bad hash under HOOD_BYPASS=3 → forwarded, not blocked.
-        let v = bloom_gate_with(&lookup, ScanPolicy::Bypass, "", &req("https://x/e.tgz", &bad_body));
+        let v = bloom_gate_sha(&lookup, ScanPolicy::Bypass, "", "https://x/e.tgz", &bad_sha);
         assert_eq!(v, Some(Verdict::Allow));
 
         // Known-bad *PURL* (derived from the npm URL) with novel bytes → block,
         // even though the hash is unknown. Proves the fletch url→purl wiring.
-        let v = bloom_gate_with(
+        let novel = sha_of(b"repackaged novel bytes");
+        let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
             "",
-            &req(
-                "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
-                b"repackaged novel bytes",
-            ),
+            "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+            &novel,
         );
         assert!(matches!(v, Some(Verdict::Block(BlockReason::KnownBad(_)))));
 
         // Byte-exact known-good → skip (allow) without scanning.
-        let v = bloom_gate_with(&lookup, ScanPolicy::Strict, "", &req("https://x/g.tgz", &good_body));
+        let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/g.tgz", &good_sha);
         assert_eq!(v, Some(Verdict::Allow));
 
-        // A known-good PURL with unknown bytes must NOT skip → falls through.
-        let v = bloom_gate_with(
+        // A known-good PURL now skips even with unknown bytes: hood trusts the
+        // synced good set as an allowlist (the deliberate trust-model change).
+        let tampered = sha_of(b"tampered bytes under a good name");
+        let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
             "",
-            &req(
-                "https://registry.npmjs.org/good/-/good-1.0.0.tgz",
-                b"tampered bytes under a good name",
-            ),
+            "https://registry.npmjs.org/good/-/good-1.0.0.tgz",
+            &tampered,
         );
-        assert_eq!(v, None);
+        assert_eq!(v, Some(Verdict::Allow));
 
         // Nothing matches → fall through to the ML scan.
-        let v = bloom_gate_with(&lookup, ScanPolicy::Strict, "", &req("https://x/u.tgz", b"novel"));
+        let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/u.tgz", &sha_of(b"novel"));
         assert_eq!(v, None);
     }
 

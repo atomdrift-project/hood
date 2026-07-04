@@ -5,7 +5,7 @@
 //!
 //! - [`ca`] — ephemeral certificate authority used to MITM TLS.
 //! - [`proxy`] — HTTP/1.1 forward proxy with transparent CONNECT interception.
-//! - [`scanner`] — pluggable scanner trait + in-process litmus backend.
+//! - [`scanner`] — pluggable scanner trait + in-process atomscan backend.
 //!
 //! Higher-level glue (env-var injection for child processes, per-tool subcommands)
 //! lives in [`tools`].

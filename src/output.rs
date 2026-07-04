@@ -1,8 +1,8 @@
 //! Human-facing stderr panels for non-benign scan verdicts.
 //!
-//! Design language mirrors litmus and cleave: truecolor classification accents,
+//! Design language mirrors atomscan and cleave: truecolor classification accents,
 //! confidence indicator blocks, indented evidence. The presentation goes one
-//! step further than litmus's per-file streaming output: hood has the *whole*
+//! step further than atomscan's per-file streaming output: hood has the *whole*
 //! verdict in hand for a single payload, so the panel can be a focused unit
 //! instead of a one-liner. Operators get the verdict, evidence, and an
 //! actionable next step in one glance.
@@ -12,10 +12,10 @@
 
 use std::io::{IsTerminal, Write};
 
-use litmus::explain::Reason;
-use litmus::model::Classification;
-use litmus::output::Theme;
-use litmus::scan::TopFinding;
+use scan::engine::TopFinding;
+use scan::explain::Reason;
+use scan::model::Classification;
+use scan::output::Theme;
 
 use crate::scanner::ScanPolicy;
 
@@ -23,7 +23,7 @@ use crate::scanner::ScanPolicy;
 #[derive(Debug, Clone, Copy)]
 struct Rgb(u8, u8, u8);
 
-/// Per-theme palette. Classification colors track litmus's so the two
+/// Per-theme palette. Classification colors track atomscan's so the two
 /// tools look like cousins, not strangers.
 #[derive(Debug, Clone, Copy)]
 struct Palette {
@@ -75,7 +75,7 @@ pub enum Disposition {
 }
 
 /// Bundle of everything the panel needs to render. Pulled out of the scan
-/// result so the renderer doesn't have to know litmus internals beyond the
+/// result so the renderer doesn't have to know scan internals beyond the
 /// already-public `TopFinding` / `Reason` types.
 #[derive(Debug)]
 pub struct Panel<'a> {
@@ -109,7 +109,7 @@ pub struct Panel<'a> {
 pub fn emit(panel: &Panel<'_>) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
-        let theme = litmus::output::detect_theme();
+        let theme = scan::output::detect_theme();
         drop(write_pretty(&mut stderr, panel, Palette::for_theme(theme)));
     } else {
         drop(write_plain(&mut stderr, panel));
@@ -277,7 +277,7 @@ pub struct ScanErrorPanel<'a> {
 pub fn emit_scan_error(p: &ScanErrorPanel<'_>) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
-        let theme = litmus::output::detect_theme();
+        let theme = scan::output::detect_theme();
         drop(write_scan_error_pretty(
             &mut stderr,
             p,
@@ -341,7 +341,7 @@ fn write_scan_error_pretty<W: Write>(
 pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
-        let theme = litmus::output::detect_theme();
+        let theme = scan::output::detect_theme();
         drop(write_failsafe_pretty(
             &mut stderr,
             invocation,
@@ -423,7 +423,7 @@ const fn classification_label(c: Classification) -> &'static str {
 /// Five-cell confidence indicator: ▰ filled / ▱ empty.
 ///
 /// The fill count tracks probability, the color tracks the classification —
-/// same idiom litmus uses, expanded from two cells to five for a finer read.
+/// same idiom atomscan uses, expanded from two cells to five for a finer read.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
     const CELLS: usize = 5;
@@ -583,14 +583,14 @@ mod tests {
             &mut buf,
             "curl -O https://example.com",
             ScanPolicy::Bypass,
-            "load litmus model: not found",
+            "load scan model: not found",
             Palette::dark(),
         )
         .unwrap();
         let s = strip_ansi(&String::from_utf8(buf).unwrap());
         assert!(s.contains("UNSCANNED"));
         assert!(s.contains("HOOD_BYPASS=3"));
-        assert!(s.contains("load litmus model: not found"));
+        assert!(s.contains("load scan model: not found"));
         assert!(s.contains("curl -O https://example.com"));
     }
 

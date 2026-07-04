@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AllowAll, LitmusScanner, ScanPolicy, Scanner};
+use hood::scanner::{AllowAll, AtomScanner, ScanPolicy, Scanner};
 use hood::tools::{dispatch, prepare_child_env, run_child, run_passthrough, Dispatch, Tool};
 
 #[derive(Parser, Debug)]
@@ -17,7 +17,7 @@ use hood::tools::{dispatch, prepare_child_env, run_child, run_passthrough, Dispa
 #[command(version)]
 #[command(about = "Scan HTTP(S) payloads before they reach package managers and installers")]
 struct Cli {
-    /// Override litmus model directory (default: auto-resolve via litmus models repo).
+    /// Override scan model directory (default: auto-resolve via atomscan models repo).
     #[arg(long, global = true)]
     model_dir: Option<PathBuf>,
 
@@ -376,13 +376,13 @@ fn build_scanner(
         return Ok(Arc::new(AllowAll));
     }
     Ok(Arc::new(
-        LitmusScanner::load(model_dir, policy, invocation).context("load litmus scanner")?,
+        AtomScanner::load(model_dir, policy, invocation).context("load scan scanner")?,
     ))
 }
 
 fn init_logging(verbose: bool) {
     let filter = if verbose {
-        tracing_subscriber::EnvFilter::new("hood=debug,litmus=info,cleave=warn")
+        tracing_subscriber::EnvFilter::new("hood=debug,scan=info,cleave=warn")
     } else {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hood=info,warn"))

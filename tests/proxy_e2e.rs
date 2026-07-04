@@ -3,7 +3,7 @@
 //! These tests stand up a small in-process HTTP server (over plain TCP for
 //! the HTTP case, and a tokio-rustls-wrapped TCP for HTTPS), start a hood
 //! proxy in front of it, and drive traffic through using reqwest configured
-//! to trust the proxy's ephemeral CA. We don't depend on litmus models here
+//! to trust the proxy's ephemeral CA. We don't depend on scan models here
 //! — the scanner is [`hood::scanner::AllowAll`].
 
 // Test code intentionally uses unwrap()/expect()/panic for fast-fail assertion
@@ -28,7 +28,7 @@ use hood::proxy::{Config, Proxy};
 use hood::scanner::{AllowAll, Scanner};
 
 /// Body the test origin returns. Some plain ASCII so we don't accidentally
-/// trip cleave/litmus heuristics in tests that use the real scanner.
+/// trip cleave/scan heuristics in tests that use the real scanner.
 const PAYLOAD: &[u8] = b"hello from origin\n";
 
 async fn handle(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {

@@ -3,7 +3,7 @@ BINARY = hood
 OUT_DIR = out
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
-# scripts that spawn their own `make` (e.g. tikv-jemalloc-sys via litmus)
+# scripts that spawn their own `make` (e.g. tikv-jemalloc-sys via scan)
 # inherit a malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 

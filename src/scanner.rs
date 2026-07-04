@@ -1,25 +1,25 @@
 //! In-process payload scanner.
 //!
-//! `hood` does not shell out to `litmus`. Instead it loads litmus's model,
-//! feature extractor, and SHAP table once at startup and reuses them for every
-//! intercepted response. cleave's SHA256-keyed analysis cache short-circuits
-//! repeated identical payloads (very common on `npm install`-style workloads).
+//! `hood` does not shell out to `atomscan`. Instead it loads the scan crate's
+//! model, feature extractor, and SHAP table once at startup and reuses them for
+//! every intercepted response. cleave's SHA256-keyed analysis cache
+//! short-circuits repeated identical payloads (very common on `npm
+//! install`-style workloads).
 //!
 //! Two backends ship today:
 //!
 //! - [`AllowAll`] — short-circuits to [`Verdict::Allow`]. Used in tests and
 //!   when `--no-scan` is requested.
-//! - [`LitmusScanner`] — production backend. Calls
-//!   [`litmus::scan::scan_bytes`] with bytes drawn directly from the buffered
-//!   HTTP response.
+//! - [`AtomScanner`] — production backend. Calls [`Analyzer::scan_bytes`] with
+//!   bytes drawn directly from the buffered HTTP response.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use litmus::model::Classification;
-use litmus::scan::ScanResult;
-use litmus::Analyzer;
+use scan::engine::ScanResult;
+use scan::model::Classification;
+use scan::Analyzer;
 
 /// Outcome of scanning a single payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,14 +107,14 @@ pub enum ScanPolicy {
     Bypass,
 }
 
-/// In-process litmus scanner.
+/// In-process atomscan scanner.
 ///
-/// Construct with [`LitmusScanner::load`], which loads model artifacts and
+/// Construct with [`AtomScanner::load`], which loads model artifacts and
 /// warms cleave's shared resources via [`Analyzer::load`]. The struct is
 /// cheap to clone (everything is held behind `Arc`) and is `Send + Sync` so
 /// the proxy can share it across all concurrent connections.
 #[derive(Clone)]
-pub struct LitmusScanner {
+pub struct AtomScanner {
     inner: Arc<Inner>,
 }
 
@@ -124,20 +124,20 @@ struct Inner {
     invocation: String,
 }
 
-impl std::fmt::Debug for LitmusScanner {
+impl std::fmt::Debug for AtomScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LitmusScanner")
+        f.debug_struct("AtomScanner")
             .field("policy", &self.inner.policy)
             .field("model_dir", &self.inner.analyzer.model_dir())
             .finish()
     }
 }
 
-impl LitmusScanner {
+impl AtomScanner {
     /// Load model artifacts from disk and prepare a ready-to-use scanner.
     ///
-    /// `model_dir` is the same directory passed to `litmus scan --model-dir`;
-    /// when `None`, the litmus models_repo resolver is used (auto-clone on
+    /// `model_dir` is the same directory passed to `atomscan --model-dir`;
+    /// when `None`, the scan models_repo resolver is used (auto-clone on
     /// first call).
     ///
     /// `invocation` is the shell-quoted command the user ran (e.g.
@@ -150,10 +150,9 @@ impl LitmusScanner {
     ) -> Result<Self> {
         let model_dir = match model_dir {
             Some(d) => d,
-            None => litmus::models_repo::model_dir()
-                .map_err(|e| anyhow::anyhow!("resolve litmus model dir: {e}"))?,
+            None => scan::models_repo::model_dir().context("resolve scan model dir")?,
         };
-        let analyzer = Analyzer::load(model_dir).context("load litmus analyzer")?;
+        let analyzer = Analyzer::load(model_dir).context("load scan analyzer")?;
         Ok(Self {
             inner: Arc::new(Inner {
                 analyzer,
@@ -184,7 +183,7 @@ fn verdict_from(classification: Classification, policy: ScanPolicy) -> Verdict {
         // Block paths.
         (Classification::Hostile, _) => Verdict::Block(BlockReason::Hostile),
         (Classification::Suspicious, _) => Verdict::Block(BlockReason::Suspicious),
-        // litmus marks Classification non_exhaustive — fail-closed on new
+        // scan marks Classification non_exhaustive — fail-closed on new
         // variants we don't recognize (bypass already handled above).
         (other, _) => Verdict::Block(BlockReason::ScanError(format!(
             "unknown classification: {other:?}",
@@ -202,9 +201,9 @@ const fn policy_allows_error(policy: ScanPolicy) -> bool {
 
 
 #[async_trait::async_trait]
-impl Scanner for LitmusScanner {
+impl Scanner for AtomScanner {
     async fn scan(&self, req: ScanRequest) -> Result<Verdict> {
-        // litmus::scan::scan_bytes is CPU-bound (XGBoost + cleave). Run it on
+        // Analyzer::scan_bytes is CPU-bound (XGBoost + cleave). Run it on
         // the blocking pool so the proxy's async reactor isn't stalled by a
         // multi-megabyte binary classification.
         let inner = Arc::clone(&self.inner);
@@ -222,17 +221,23 @@ impl Scanner for LitmusScanner {
                         Verdict::Allow => crate::output::Disposition::Forwarded,
                         Verdict::Block(_) => crate::output::Disposition::Blocked,
                     };
-                    let traits = r.top_traits(3);
+                    // `top_findings` is already deduped, ranked strongest-first,
+                    // and capped at 5 by the engine; take the leading three to
+                    // keep the panel tight.
+                    let n_traits = r.top_findings.len().min(3);
+                    let traits_slice = r.top_findings.get(..n_traits).unwrap_or(&[]);
                     let n_reasons = r.reasons.len().min(3);
                     let reasons_slice = r.reasons.get(..n_reasons).unwrap_or(&[]);
                     crate::output::emit(&crate::output::Panel {
                         classification: r.classification,
-                        original: r.original_classification,
+                        // The scan backend no longer exposes a pre-upgrade
+                        // classification, so there is nothing to attribute here.
+                        original: None,
                         disposition,
                         policy: self.inner.policy,
                         probability: r.probability,
                         url: &req.url,
-                        traits: &traits,
+                        traits: traits_slice,
                         reasons: reasons_slice,
                         invocation: &self.inner.invocation,
                     });

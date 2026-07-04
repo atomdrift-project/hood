@@ -53,7 +53,7 @@ dirs = "6"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
-litmus = { path = "../litmus" }
+scan = { package = "atomdrift-scan", path = "../scan" }
 rcgen = { version = "0.13", features = ["pem"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"

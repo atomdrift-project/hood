@@ -335,6 +335,99 @@ fn write_scan_error_pretty<W: Write>(
     writeln!(w)
 }
 
+/// Base of the atomdrift lab file view. The payload's SHA-256 is appended to
+/// form a permalink to its full report — the actionable next step on a
+/// known-bad block.
+const LAB_FILE_URL: &str = "https://lab.atomdrift.org/file/";
+
+/// Context for a known-bad panel: the payload matched the known-bad bloom
+/// filter (by content hash or PURL) and was blocked without an ML scan. Distinct
+/// from [`Panel`] because there is no classification, probability, or trait
+/// evidence — the verdict is the match itself.
+#[derive(Debug)]
+pub struct KnownBadPanel<'a> {
+    /// URL the tool was about to fetch.
+    pub url: &'a str,
+    /// Lower-hex SHA-256 of the payload; forms the lab permalink.
+    pub sha256: &'a str,
+    /// Effective policy, for the bypass hint / active tag.
+    pub policy: ScanPolicy,
+    /// Whether the body was withheld or forwarded (under `HOOD_BYPASS=3`).
+    pub disposition: Disposition,
+    /// Shell-quoted reproducer for the bypass hint.
+    pub invocation: &'a str,
+}
+
+/// Render a known-bad panel to stderr — same TTY-vs-pipe split as [`emit`].
+pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    if stderr.is_terminal() {
+        let theme = scan::output::detect_theme();
+        drop(write_known_bad_pretty(&mut stderr, p, Palette::for_theme(theme)));
+    } else {
+        drop(writeln!(
+            stderr,
+            "hood known-bad url={} sha256={} lab={}{} policy={} disposition={}",
+            p.url,
+            p.sha256,
+            LAB_FILE_URL,
+            p.sha256,
+            policy_tag(p.policy),
+            match p.disposition {
+                Disposition::Blocked => "block",
+                Disposition::Forwarded => "forward",
+            },
+        ));
+    }
+}
+
+fn write_known_bad_pretty<W: Write>(
+    w: &mut W,
+    p: &KnownBadPanel<'_>,
+    c: Palette,
+) -> std::io::Result<()> {
+    let header = match p.disposition {
+        Disposition::Blocked => "BLOCKED",
+        Disposition::Forwarded => "FORWARDED",
+    };
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {} {} {}",
+        fg(c.dim, "──"),
+        fg_bold(c.hostile, header),
+        fg(c.chrome, &"─".repeat(63)),
+    )?;
+    writeln!(
+        w,
+        "  {}  {}",
+        fg_bold(c.hostile, "known bad package"),
+        fg_bold(c.text, p.url),
+    )?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {}  {}",
+        fg(c.dim, "lab:"),
+        fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
+    )?;
+    writeln!(w)?;
+    match p.disposition {
+        Disposition::Forwarded => writeln!(
+            w,
+            "  {}  {}",
+            fg(c.dim, "active:"),
+            fg(c.accent, policy_tag(p.policy)),
+        )?,
+        // Only HOOD_BYPASS=3 would forward a known-bad match.
+        Disposition::Blocked => {
+            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=3", p.invocation)?;
+        }
+    }
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
+    writeln!(w)
+}
+
 /// Failsafe panel: scanning was bypassed because the proxy couldn't start.
 /// Only emitted when `HOOD_BYPASS` is set; under strict policy a startup
 /// failure aborts the run before this is ever called.
@@ -609,6 +702,50 @@ mod tests {
         assert!(s.contains("BLOCKED"));
         assert!(s.contains("scan-error"));
         assert!(s.contains("HOOD_BYPASS=1 curl -fsSL https://x/install.sh"));
+    }
+
+    #[test]
+    fn known_bad_pretty_shows_lab_link_and_block_hint() {
+        let p = KnownBadPanel {
+            url: "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+            sha256: "7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b",
+            policy: ScanPolicy::Strict,
+            disposition: Disposition::Blocked,
+            invocation: "npm install evil",
+        };
+        let mut buf = Vec::new();
+        write_known_bad_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("BLOCKED"));
+        assert!(s.contains("known bad package"));
+        assert!(s.contains(
+            "https://lab.atomdrift.org/file/7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b"
+        ));
+        assert!(s.contains("HOOD_BYPASS=3 npm install evil"));
+    }
+
+    #[test]
+    fn known_bad_plain_is_grep_friendly() {
+        let p = KnownBadPanel {
+            url: "https://x/evil.tgz",
+            sha256: "abc123",
+            policy: ScanPolicy::Strict,
+            disposition: Disposition::Blocked,
+            invocation: "",
+        };
+        // Exercise the non-TTY plain branch directly.
+        let line = format!(
+            "hood known-bad url={} sha256={} lab={}{} policy={} disposition={}",
+            p.url,
+            p.sha256,
+            LAB_FILE_URL,
+            p.sha256,
+            policy_tag(p.policy),
+            "block",
+        );
+        assert!(line.contains("hood known-bad"));
+        assert!(line.contains("sha256=abc123"));
+        assert!(line.contains("lab=https://lab.atomdrift.org/file/abc123"));
     }
 
     #[test]

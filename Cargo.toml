@@ -50,6 +50,7 @@ async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+fletch = { git = "https://codeberg.org/atomdrift/fletch.git" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }

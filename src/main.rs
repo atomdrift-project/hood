@@ -54,8 +54,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `npx` through the proxy; argv is preserved exactly.
+    Npx {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run `pnpm` (same intercept set as npm).
     Pnpm {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `pnpx` through the proxy; argv is preserved exactly.
+    Pnpx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
@@ -64,13 +74,33 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `rush`; custom commands may provision autoinstallers.
+    Rush {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `rushx`; project scripts inherit hood's proxy environment.
+    Rushx {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run `bun`.
     Bun {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `bunx` through the proxy; argv is preserved exactly.
+    Bunx {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run `pip`. install/download/wheel are intercepted; everything else passes through.
     Pip {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `pip3` (same intercept set and trust model as pip).
+    Pip3 {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
@@ -84,8 +114,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `uvx` (equivalent to `uv tool run`) through the proxy.
+    Uvx {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run `poetry`.
     Poetry {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Run `pdm`; dependency-resolving commands are intercepted.
+    Pdm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
@@ -390,13 +430,21 @@ fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
         Command::Curl { args } => (Tool::Curl, args, None),
         Command::Wget { args } => (Tool::Wget, args, None),
         Command::Npm { args } => (Tool::Npm, args, None),
+        Command::Npx { args } => (Tool::Npx, args, None),
         Command::Pnpm { args } => (Tool::Pnpm, args, None),
+        Command::Pnpx { args } => (Tool::Pnpx, args, None),
         Command::Yarn { args } => (Tool::Yarn, args, None),
+        Command::Rush { args } => (Tool::Rush, args, None),
+        Command::Rushx { args } => (Tool::Rushx, args, None),
         Command::Bun { args } => (Tool::Bun, args, None),
+        Command::Bunx { args } => (Tool::Bunx, args, None),
         Command::Pip { args } => (Tool::Pip, args, None),
+        Command::Pip3 { args } => (Tool::Pip3, args, None),
         Command::Pipx { args } => (Tool::Pipx, args, None),
         Command::Uv { args } => (Tool::Uv, args, None),
+        Command::Uvx { args } => (Tool::Uvx, args, None),
         Command::Poetry { args } => (Tool::Poetry, args, None),
+        Command::Pdm { args } => (Tool::Pdm, args, None),
         Command::Go { args } => (Tool::Go, args, None),
         Command::Cargo { args } => (Tool::Cargo, args, None),
         Command::Brew { args } => (Tool::Brew, args, None),

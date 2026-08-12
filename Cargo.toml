@@ -2,7 +2,7 @@
 name = "hood"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.96"
+rust-version = "1.94"
 authors = ["The Atomdrift Project"]
 description = "Scan HTTP(S) payloads before they reach package managers, installers, and curl|sh scripts"
 license = "Apache-2.0"
@@ -93,6 +93,11 @@ path = "src/lib.rs"
 [profile.release]
 strip = "debuginfo"
 lto = "thin"
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 
 # illumos support for tree-sitter's vendored endian.h, pulled in transitively

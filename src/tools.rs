@@ -36,20 +36,36 @@ pub enum Tool {
     Wget,
     /// `npm <args...>` — Node, respects `NODE_EXTRA_CA_CERTS`.
     Npm,
+    /// `npx <args...>` — npm's package-executable runner.
+    Npx,
     /// `pnpm <args...>` — same trust model as npm.
     Pnpm,
+    /// `pnpx <args...>` — pnpm's package-executable runner.
+    Pnpx,
     /// `yarn <args...>` — Node, same trust as npm.
     Yarn,
+    /// `rush <args...>` — Rush monorepo manager; commands may provision tools.
+    Rush,
+    /// `rushx <args...>` — Rush project-script runner; scripts may fetch dependencies.
+    Rushx,
     /// `bun <args...>` — Node-compatible toolchain.
     Bun,
+    /// `bunx <args...>` — alias for `bun x`.
+    Bunx,
     /// `pip <args...>` — pip uses bundled certifi; needs `PIP_CERT`.
     Pip,
+    /// `pip3 <args...>` — Python 3 spelling of pip.
+    Pip3,
     /// `pipx <args...>` — pip-based; inherits `PIP_CERT`.
     Pipx,
     /// `uv <args...>` — Astral's pip replacement; `SSL_CERT_FILE` works.
     Uv,
+    /// `uvx <args...>` — alias for `uv tool run`.
+    Uvx,
     /// `poetry <args...>` — Python; `POETRY_REQUESTS_CA_BUNDLE` honored.
     Poetry,
+    /// `pdm <args...>` — Python package and project manager.
+    Pdm,
     /// `go <args...>` — Go toolchain. Uses `SSL_CERT_FILE` where supported and
     /// hood's loopback module/sumdb bridge on macOS.
     Go,
@@ -94,13 +110,21 @@ impl Tool {
             Self::Curl => Some("curl"),
             Self::Wget => Some("wget"),
             Self::Npm => Some("npm"),
+            Self::Npx => Some("npx"),
             Self::Pnpm => Some("pnpm"),
+            Self::Pnpx => Some("pnpx"),
             Self::Yarn => Some("yarn"),
+            Self::Rush => Some("rush"),
+            Self::Rushx => Some("rushx"),
             Self::Bun => Some("bun"),
+            Self::Bunx => Some("bunx"),
             Self::Pip => Some("pip"),
+            Self::Pip3 => Some("pip3"),
             Self::Pipx => Some("pipx"),
             Self::Uv => Some("uv"),
+            Self::Uvx => Some("uvx"),
             Self::Poetry => Some("poetry"),
+            Self::Pdm => Some("pdm"),
             Self::Go => Some("go"),
             Self::Cargo => Some("cargo"),
             Self::Brew => Some("brew"),
@@ -127,13 +151,21 @@ impl Tool {
             Self::Curl => "curl",
             Self::Wget => "wget",
             Self::Npm => "npm",
+            Self::Npx => "npx",
             Self::Pnpm => "pnpm",
+            Self::Pnpx => "pnpx",
             Self::Yarn => "yarn",
+            Self::Rush => "rush",
+            Self::Rushx => "rushx",
             Self::Bun => "bun",
+            Self::Bunx => "bunx",
             Self::Pip => "pip",
+            Self::Pip3 => "pip3",
             Self::Pipx => "pipx",
             Self::Uv => "uv",
+            Self::Uvx => "uvx",
             Self::Poetry => "poetry",
+            Self::Pdm => "pdm",
             Self::Go => "go",
             Self::Cargo => "cargo",
             Self::Brew => "brew",
@@ -166,13 +198,21 @@ impl Tool {
             Self::Curl
             | Self::Wget
             | Self::Npm
+            | Self::Npx
             | Self::Pnpm
+            | Self::Pnpx
             | Self::Yarn
+            | Self::Rush
+            | Self::Rushx
             | Self::Bun
+            | Self::Bunx
             | Self::Pip
+            | Self::Pip3
             | Self::Pipx
             | Self::Uv
+            | Self::Uvx
             | Self::Poetry
+            | Self::Pdm
             | Self::Go
             | Self::Cargo
             | Self::Exec => true,
@@ -199,13 +239,21 @@ impl Tool {
         Self::Curl,
         Self::Wget,
         Self::Npm,
+        Self::Npx,
         Self::Pnpm,
+        Self::Pnpx,
         Self::Yarn,
+        Self::Rush,
+        Self::Rushx,
         Self::Bun,
+        Self::Bunx,
         Self::Pip,
+        Self::Pip3,
         Self::Pipx,
         Self::Uv,
+        Self::Uvx,
         Self::Poetry,
+        Self::Pdm,
         Self::Go,
         Self::Cargo,
         Self::Brew,
@@ -236,12 +284,22 @@ pub enum Dispatch {
 /// `--ignore-scripts` is injected).
 #[must_use]
 pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispatch {
-    // Exec is always intercepted — that's its entire purpose.
-    if tool == Tool::Exec {
-        return Dispatch::Intercept(args);
-    }
-    // curl/wget are downloaders by nature — intercept every invocation.
-    if matches!(tool, Tool::Curl | Tool::Wget) {
+    // Downloaders, package-executable runners, and Rush script/custom-command
+    // runners can fetch without a stable leading verb. Keep them inside the
+    // proxy environment for every invocation; local-only runs pay only proxy
+    // startup and preserve their original argv exactly.
+    if matches!(
+        tool,
+        Tool::Exec
+            | Tool::Curl
+            | Tool::Wget
+            | Tool::Npx
+            | Tool::Pnpx
+            | Tool::Rush
+            | Tool::Rushx
+            | Tool::Bunx
+            | Tool::Uvx
+    ) {
         return Dispatch::Intercept(args);
     }
 
@@ -316,7 +374,15 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
         return false;
     };
     match tool {
-        Tool::Curl | Tool::Wget | Tool::Exec => true, // handled before this fn
+        Tool::Curl
+        | Tool::Wget
+        | Tool::Npx
+        | Tool::Pnpx
+        | Tool::Rush
+        | Tool::Rushx
+        | Tool::Bunx
+        | Tool::Uvx
+        | Tool::Exec => true, // handled before this fn
 
         Tool::Npm | Tool::Pnpm | Tool::Yarn => matches!(
             sub,
@@ -325,7 +391,7 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
 
         Tool::Bun => matches!(sub, "install" | "i" | "add" | "x" | "update" | "upgrade"),
 
-        Tool::Pip => matches!(sub, "install" | "download" | "wheel"),
+        Tool::Pip | Tool::Pip3 => matches!(sub, "install" | "download" | "wheel"),
 
         Tool::Pipx => matches!(sub, "install" | "upgrade" | "inject" | "run" | "runpip"),
 
@@ -334,6 +400,23 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
         Tool::Uv => matches!(sub, "pip" | "tool" | "add" | "sync" | "lock" | "run"),
 
         Tool::Poetry => matches!(sub, "add" | "install" | "update" | "lock" | "publish"),
+
+        // PDM can resolve or provision dependencies through its normal project
+        // commands, script runner, self-management, and Python manager.
+        Tool::Pdm => matches!(
+            sub,
+            "add"
+                | "install"
+                | "update"
+                | "sync"
+                | "lock"
+                | "run"
+                | "build"
+                | "publish"
+                | "self"
+                | "python"
+                | "import"
+        ),
 
         // Go: only network-fetch verbs. NOT `run`/`test`/`build`/`vet`.
         // `go install` and `go mod download` both fetch modules; the latter
@@ -524,6 +607,62 @@ fn maybe_add_ignore_scripts(args: Vec<OsString>, enable_scripts: bool) -> Vec<Os
     out
 }
 
+/// TLS/proxy behavior shared by command aliases and tools built on the same
+/// network stack. Keeping this separate from [`Tool`] prevents aliases such as
+/// `pip3` and `uvx` from accumulating subtly different environment overlays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustProfile {
+    Curl,
+    Wget,
+    Node,
+    Pip,
+    Uv,
+    Requests,
+    Pdm,
+    Go,
+    Cargo,
+    Brew,
+    SystemCurl,
+    Yay,
+    Exec,
+}
+
+impl Tool {
+    const fn trust_profile(self) -> TrustProfile {
+        match self {
+            Self::Curl => TrustProfile::Curl,
+            Self::Wget => TrustProfile::Wget,
+            Self::Npm
+            | Self::Npx
+            | Self::Pnpm
+            | Self::Pnpx
+            | Self::Yarn
+            | Self::Rush
+            | Self::Rushx
+            | Self::Bun
+            | Self::Bunx => TrustProfile::Node,
+            Self::Pip | Self::Pip3 | Self::Pipx => TrustProfile::Pip,
+            Self::Uv | Self::Uvx => TrustProfile::Uv,
+            Self::Poetry => TrustProfile::Requests,
+            Self::Pdm => TrustProfile::Pdm,
+            Self::Go => TrustProfile::Go,
+            Self::Cargo => TrustProfile::Cargo,
+            Self::Brew => TrustProfile::Brew,
+            Self::Pacman
+            | Self::Paru
+            | Self::Makepkg
+            | Self::Dnf
+            | Self::Yum
+            | Self::Zypper
+            | Self::Rpm
+            | Self::Pkg
+            | Self::Apk => TrustProfile::SystemCurl,
+            Self::Yay => TrustProfile::Yay,
+            Self::Exec => TrustProfile::Exec,
+        }
+    }
+}
+
 /// Per-tool runtime context: where the proxy listens, where the CA file lives.
 #[derive(Debug)]
 pub struct ChildEnv {
@@ -566,37 +705,44 @@ impl ChildEnv {
             out.insert(k, OsString::new());
         }
 
-        match tool {
-            Tool::Curl => {
+        match tool.trust_profile() {
+            TrustProfile::Curl => {
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
             }
-            Tool::Wget => {
+            TrustProfile::Wget => {
                 out.insert("SSL_CERT_FILE", ca);
             }
-            Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun => {
+            TrustProfile::Node => {
                 out.insert("NODE_EXTRA_CA_CERTS", ca.clone());
                 out.insert("npm_config_proxy", proxy.clone());
                 out.insert("npm_config_https_proxy", proxy);
                 out.insert("npm_config_cafile", ca);
             }
-            Tool::Pip | Tool::Pipx => {
+            TrustProfile::Pip => {
                 // pip uses certifi by default; PIP_CERT is the supported override.
                 out.insert("PIP_CERT", ca);
             }
-            Tool::Uv => {
+            TrustProfile::Uv => {
                 // uv (Astral) honors SSL_CERT_FILE and also its own UV_CA_CERT.
                 out.insert("UV_CA_CERT", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
             }
-            Tool::Poetry => {
+            TrustProfile::Requests => {
                 // poetry uses requests under the hood and honors
                 // POETRY_REQUESTS_CA_BUNDLE per-repo, but supports the bundled
                 // env at runtime as well. Set both to be safe.
                 out.insert("POETRY_REQUESTS_CA_BUNDLE", ca.clone());
                 out.insert("REQUESTS_CA_BUNDLE", ca);
             }
-            Tool::Go => {
+            TrustProfile::Pdm => {
+                // PDM documents both variables as CA-bundle overrides. Keep
+                // the user's index and credential configuration untouched.
+                out.insert("REQUESTS_CA_BUNDLE", ca.clone());
+                out.insert("CURL_CA_BUNDLE", ca.clone());
+                out.insert("SSL_CERT_FILE", ca);
+            }
+            TrustProfile::Go => {
                 if let Some(go) = &self.go {
                     out.insert("GOPROXY", OsString::from(&go.goproxy));
                     out.insert("GOSUMDB", OsString::from(&go.gosumdb));
@@ -611,13 +757,13 @@ impl ChildEnv {
                     out.insert("SSL_CERT_FILE", ca);
                 }
             }
-            Tool::Cargo => {
+            TrustProfile::Cargo => {
                 // CARGO_HTTP_CAINFO is the documented cargo override.
                 // SSL_CERT_FILE covers git+https fetches that cargo invokes.
                 out.insert("CARGO_HTTP_CAINFO", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
             }
-            Tool::Brew => {
+            TrustProfile::Brew => {
                 // brew uses curl internally and respects CURL_CA_BUNDLE.
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
@@ -634,20 +780,12 @@ impl ChildEnv {
             // shells out to curl DLAGENTs. We set every CA-file var these
             // backends honor — each tool consults the one matching its stack
             // and ignores the rest, which keeps the overlay backend-agnostic.
-            Tool::Pacman
-            | Tool::Paru
-            | Tool::Makepkg
-            | Tool::Dnf
-            | Tool::Yum
-            | Tool::Zypper
-            | Tool::Rpm
-            | Tool::Pkg
-            | Tool::Apk => {
+            TrustProfile::SystemCurl => {
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca.clone());
                 out.insert("SSL_CA_CERT_FILE", ca);
             }
-            Tool::Yay => {
+            TrustProfile::Yay => {
                 // yay is Go: its AUR RPC uses crypto/tls (SSL_CERT_FILE, plus
                 // the macOS fallback-roots knob), while package and source
                 // downloads delegate to pacman and makepkg (libcurl / curl).
@@ -656,7 +794,7 @@ impl ChildEnv {
                 out.insert("SSL_CA_CERT_FILE", ca);
                 out.insert("GODEBUG", OsString::from("x509usefallbackroots=1"));
             }
-            Tool::Exec => {
+            TrustProfile::Exec => {
                 // Set every flavor we know about so whatever the user runs
                 // has a reasonable shot at trusting us.
                 out.insert("CURL_CA_BUNDLE", ca.clone());

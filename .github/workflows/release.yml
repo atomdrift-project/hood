@@ -3,70 +3,166 @@ name: Prerelease
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build; empty performs a dry run of the selected ref.
+        type: string
+        default: ""
+      target:
+        description: Build one target; empty builds the complete shipping matrix.
+        type: string
+        default: ""
+      publish:
+        description: Publish the prerelease (requires a tag).
+        type: boolean
+        default: false
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      publish: ${{ steps.release.outputs.publish }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Verify tag matches Cargo version
-        shell: bash
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve release
+        id: release
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || '' }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
-          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          test "${GITHUB_REF_NAME#v}" = "$cargo_version"
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
-      - name: Build
-        run: cargo +stable build --locked --release
-      - name: Package and checksum
-        id: package
-        shell: bash
+          set -eu
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          case "$GITHUB_REF" in refs/tags/*) tag="${GITHUB_REF#refs/tags/}" ;; *) tag="$REQUESTED_TAG" ;; esac
+          if [ -n "$tag" ]; then
+            case "$tag" in v*) ;; *) echo "::error::release tag must start with v"; exit 1 ;; esac
+            test "${tag#v}" = "$version" || { echo "::error::$tag does not match Cargo.toml $version"; exit 1; }
+          elif [ "$PUBLISH" = true ]; then
+            echo "::error::publishing requires a v* tag"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ needs.verify.outputs.tag }}
+      target: ${{ inputs.target || '' }}
+      profile: release-lto
+      sign: ${{ vars.MACOS_SIGNING_ENABLED == 'true' }}
+      notarize: ${{ vars.MACOS_NOTARIZATION_ENABLED == 'true' }}
+      require-notarization: ${{ needs.verify.outputs.publish == 'true' && vars.MACOS_NOTARIZATION_ENABLED == 'true' }}
+    secrets:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      TAG: ${{ needs.verify.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: hood-*
+          merge-multiple: true
+          path: dist
+      - name: Inventory targets
+        env:
+          EXPECTED: >-
+            x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+            aarch64-apple-darwin x86_64-apple-darwin
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            arm-unknown-linux-musleabihf armv7-unknown-linux-musleabihf
+            loongarch64-unknown-linux-musl s390x-unknown-linux-gnu
+            riscv64gc-unknown-linux-gnu powerpc64le-unknown-linux-gnu
+            x86_64-unknown-freebsd x86_64-unknown-openbsd
+            x86_64-unknown-netbsd x86_64-unknown-illumos
+            x86_64-pc-solaris x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+          REQUESTED_TARGET: ${{ inputs.target || '' }}
         run: |
-          mkdir -p dist
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64) asset=hood-linux-x86_64 ;;
-            Darwin-arm64) asset=hood-macos-arm64 ;;
-            Darwin-x86_64) asset=hood-macos-x86_64 ;;
-            *) echo "unsupported release runner" >&2; exit 1 ;;
-          esac
-          cp target/release/hood "dist/$asset"
-          shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          set -eu
+          missing=""
+          for target in $EXPECTED; do
+            if [ -n "$REQUESTED_TARGET" ] && [ "$target" != "$REQUESTED_TARGET" ]; then continue; fi
+            if [ -f "dist/hood-$target.tar.gz" ]; then
+              echo "ok      $target"
+            else
+              echo "MISSING $target"
+              missing="$missing $target"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::release is missing targets:$missing"
+            echo "Missing targets:$missing" >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "$REQUESTED_TARGET" ]; then exit 1; fi
+          fi
+      - name: Assemble checksummed assets
+        run: |
+          set -eu
+          cd dist
+          for file in hood-*.tar.gz; do
+            target="${file#hood-}"
+            target="${target%.tar.gz}"
+            mv "$file" "hood-$VERSION-$target.tar.gz"
+          done
+          sha256sum ./*.tar.gz > SHA256SUMS
       - name: Generate CycloneDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
-          path: target/release/hood
+          path: dist
           format: cyclonedx-json
-          output-file: dist/${{ steps.package.outputs.asset }}.cdx.json
+          output-file: dist/hood-${{ needs.verify.outputs.version }}.cdx.json
           upload-artifact: false
-      - name: Attest binary provenance
+      - name: Attest build provenance
+        if: ${{ needs.verify.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/') }}
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: dist/${{ steps.package.outputs.asset }}
+          subject-path: dist/*.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ steps.package.outputs.asset }}
+          name: hood-${{ needs.verify.outputs.version }}-release
           path: dist/*
           if-no-files-found: error
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: dist
-          merge-multiple: true
       - name: Publish GitHub prerelease
+        if: ${{ needs.verify.outputs.publish == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --prerelease --generate-notes
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --prerelease --generate-notes
+          fi

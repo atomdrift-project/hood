@@ -24,10 +24,9 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer};
 
+use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{
-    AllowAll, BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict,
-};
+use hood::scanner::{AllowAll, BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
 
 /// A scanner that blocks everything it is asked to inspect, in-memory or on
 /// disk. Used to prove a path was *not* scanned: if a response still comes back
@@ -57,6 +56,13 @@ fn big_payload() -> Vec<u8> {
 }
 
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if req.uri().path() == "/redirect" {
+        return Ok(Response::builder()
+            .status(302)
+            .header("location", "/hello")
+            .body(Full::new(Bytes::new()))
+            .unwrap());
+    }
     let body = if req.uri().path() == "/big" {
         Bytes::from(big_payload())
     } else {
@@ -156,26 +162,26 @@ async fn start_https_origin() -> Result<(SocketAddr, String)> {
     Ok((addr, root_pem))
 }
 
+fn roots_from_pem(pem: &str) -> Vec<CertificateDer<'static>> {
+    rustls_pemfile::certs(&mut pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
 /// Build a reqwest client that:
 ///   - routes through the hood proxy at `proxy_addr`
 ///   - trusts hood's ephemeral CA (so MITM cert verifies)
 ///   - trusts an additional CA (the origin's, for direct upstream TLS in proxy)
-fn client_with_proxy(
-    proxy_addr: SocketAddr,
-    hood_ca_pem: &str,
-) -> reqwest::Client {
+fn client_with_proxy(proxy_addr: SocketAddr, hood_ca_pem: &str) -> reqwest::Client {
     let proxy_url = format!("http://{proxy_addr}");
     let proxy_all = reqwest::Proxy::all(&proxy_url).unwrap();
     let mut builder = reqwest::Client::builder()
         .proxy(proxy_all)
         .danger_accept_invalid_certs(false)
         .tls_built_in_root_certs(true);
-    for cert in rustls_pemfile::certs(&mut hood_ca_pem.as_bytes())
-        .filter_map(Result::ok)
-    {
+    for cert in rustls_pemfile::certs(&mut hood_ca_pem.as_bytes()).filter_map(Result::ok) {
         let der = cert.to_vec();
-        builder = builder
-            .add_root_certificate(reqwest::Certificate::from_der(&der).unwrap());
+        builder = builder.add_root_certificate(reqwest::Certificate::from_der(&der).unwrap());
     }
     builder.build().unwrap()
 }
@@ -209,18 +215,11 @@ async fn https_mitm_round_trip_with_allow_all() -> Result<()> {
     let (origin_addr, origin_ca_pem) = start_https_origin().await?;
     let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
 
-    // Patch the platform root store: the proxy verifies upstream TLS against
-    // it. Append our origin CA via SSL_CERT_FILE so rustls-native-certs picks
-    // it up. We write both the native bundle and the origin CA so that real
-    // public hosts continue to work in other tests in the same process.
-    // (Simpler approach: bypass with a custom client tls config in Proxy.
-    // For v1 we just point SSL_CERT_FILE at a temp file containing only the
-    // origin CA, since this test doesn't talk to anything else.)
-    let bundle = tempfile::NamedTempFile::new()?;
-    std::fs::write(bundle.path(), origin_ca_pem.as_bytes())?;
-    std::env::set_var("SSL_CERT_FILE", bundle.path());
-
-    let proxy = Proxy::new(scanner, Config::default())?;
+    let cfg = Config {
+        extra_upstream_roots: roots_from_pem(&origin_ca_pem),
+        ..Config::default()
+    };
+    let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
     let handle = proxy.spawn().await?;
 
@@ -232,6 +231,46 @@ async fn https_mitm_round_trip_with_allow_all() -> Result<()> {
     let resp = client.get(&url).send().await?;
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await?;
+    assert_eq!(body.as_ref(), PAYLOAD);
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_loopback_bridge_verifies_https_and_contains_redirects() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let (origin_addr, origin_ca_pem) = start_https_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
+    let cfg = Config {
+        extra_upstream_roots: roots_from_pem(&origin_ca_pem),
+        ..Config::default()
+    };
+    let proxy = Proxy::new(scanner, cfg)?;
+    let token = proxy.go_bridge_token().to_owned();
+    let handle = proxy.spawn().await?;
+    let bridge = GoBridge::new(&format!("https://localhost:{}", origin_addr.port()), "off")?;
+    let child = bridge.child_env(handle.addr, &token)?;
+
+    // This client trusts no hood CA: like Go on macOS, it only speaks plain
+    // HTTP to loopback. Hood verifies HTTPS on the upstream leg. The origin's
+    // redirect must also be rewritten back through loopback before following.
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let resp = client
+        .get(format!("{}/redirect", child.goproxy))
+        .send()
+        .await?;
+    let status = resp.status();
+    let origin_marker = resp.headers().get("x-origin-marker").cloned();
+    let body = resp.bytes().await?;
+    assert_eq!(
+        status,
+        200,
+        "bridge response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(origin_marker.unwrap(), "yes");
     assert_eq!(body.as_ref(), PAYLOAD);
 
     handle.stop().await;
@@ -288,7 +327,11 @@ async fn oversized_body_forwards_unscanned_intact() -> Result<()> {
     let client = client_with_proxy(handle.addr, &hood_ca);
     let url = format!("http://{origin_addr}/big");
     let resp = client.get(&url).send().await?;
-    assert_eq!(resp.status(), 200, "oversized body must be forwarded, not blocked");
+    assert_eq!(
+        resp.status(),
+        200,
+        "oversized body must be forwarded, not blocked"
+    );
     let body = resp.bytes().await?;
     assert_eq!(body.as_ref(), big_payload().as_slice());
 
@@ -315,7 +358,11 @@ async fn head_request_is_forwarded_without_scanning() -> Result<()> {
     // the short-circuit failed.
     let url = format!("http://{origin_addr}/big");
     let resp = client.head(&url).send().await?;
-    assert_eq!(resp.status(), 200, "HEAD must be forwarded, not scan-blocked");
+    assert_eq!(
+        resp.status(),
+        200,
+        "HEAD must be forwarded, not scan-blocked"
+    );
 
     handle.stop().await;
     Ok(())

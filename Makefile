@@ -7,7 +7,7 @@ OUT_DIR = out
 # inherit a malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release install lint test clean check-cargo
+.PHONY: all build release install lint test test-tools clean check-cargo
 
 all: build
 
@@ -50,6 +50,11 @@ lint:
 
 test:
 	$(CARGO) test --release
+
+# Command-level tests against real package-manager binaries. Strict mode makes
+# a missing tool a failure instead of a local-development skip.
+test-tools:
+	HOOD_REQUIRE_TOOL_INTEGRATION=1 $(CARGO) test --release --test tool_integration
 
 clean:
 	$(CARGO) clean

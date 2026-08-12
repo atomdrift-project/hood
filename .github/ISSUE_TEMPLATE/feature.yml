@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a focused capability or supported tool.
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and threat model
+      description: Describe the risk or workflow gap, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Failure modes and security boundaries
+      description: Explain bypass, compatibility, privacy, and false-positive implications.
+    validations:
+      required: true

@@ -440,7 +440,6 @@ const fn policy_allows_error(policy: ScanPolicy) -> bool {
     )
 }
 
-
 #[async_trait::async_trait]
 impl Scanner for AtomScanner {
     async fn scan(&self, req: ScanRequest) -> Result<Verdict> {
@@ -551,13 +550,13 @@ mod tests {
 
     #[test]
     fn block_reason_labels() {
-        assert_eq!(BlockReason::KnownBad("deadbeef".into()).label(), "known-bad");
+        assert_eq!(
+            BlockReason::KnownBad("deadbeef".into()).label(),
+            "known-bad"
+        );
         assert_eq!(BlockReason::Hostile.label(), "hostile");
         assert_eq!(BlockReason::Suspicious.label(), "suspicious");
-        assert_eq!(
-            BlockReason::ScanError("boom".into()).label(),
-            "scan-error"
-        );
+        assert_eq!(BlockReason::ScanError("boom".into()).label(), "scan-error");
     }
 
     // ----- bloom gate ------------------------------------------------------
@@ -574,7 +573,11 @@ mod tests {
         );
         // A known-bad is at least as severe as ML "hostile": even =2 blocks it.
         assert_eq!(
-            gate_outcome(Decision::KnownBad, Decision::Unknown, ScanPolicy::AllowSuspicious),
+            gate_outcome(
+                Decision::KnownBad,
+                Decision::Unknown,
+                ScanPolicy::AllowSuspicious
+            ),
             GateOutcome::Block,
         );
         // Only =3 (forward everything) lets it through.
@@ -599,7 +602,11 @@ mod tests {
         );
         // Conflicted and Unknown both fall through to the ML scan.
         assert_eq!(
-            gate_outcome(Decision::Conflicted, Decision::Conflicted, ScanPolicy::Strict),
+            gate_outcome(
+                Decision::Conflicted,
+                Decision::Conflicted,
+                ScanPolicy::Strict
+            ),
             GateOutcome::Scan,
         );
         assert_eq!(
@@ -664,7 +671,10 @@ mod tests {
 
         // Known-bad hash → hard block carrying the payload's SHA-256.
         let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/e.tgz", &bad_sha);
-        assert_eq!(v, Some(Verdict::Block(BlockReason::KnownBad(hex32(&bad_sha)))));
+        assert_eq!(
+            v,
+            Some(Verdict::Block(BlockReason::KnownBad(hex32(&bad_sha))))
+        );
 
         // Same known-bad hash under HOOD_BYPASS=3 → forwarded, not blocked.
         let v = bloom_gate_sha(&lookup, ScanPolicy::Bypass, "", "https://x/e.tgz", &bad_sha);
@@ -683,7 +693,13 @@ mod tests {
         assert!(matches!(v, Some(Verdict::Block(BlockReason::KnownBad(_)))));
 
         // Byte-exact known-good → skip (allow) without scanning.
-        let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/g.tgz", &good_sha);
+        let v = bloom_gate_sha(
+            &lookup,
+            ScanPolicy::Strict,
+            "",
+            "https://x/g.tgz",
+            &good_sha,
+        );
         assert_eq!(v, Some(Verdict::Allow));
 
         // A known-good PURL now skips even with unknown bytes: hood trusts the
@@ -699,7 +715,13 @@ mod tests {
         assert_eq!(v, Some(Verdict::Allow));
 
         // Nothing matches → fall through to the ML scan.
-        let v = bloom_gate_sha(&lookup, ScanPolicy::Strict, "", "https://x/u.tgz", &sha_of(b"novel"));
+        let v = bloom_gate_sha(
+            &lookup,
+            ScanPolicy::Strict,
+            "",
+            "https://x/u.tgz",
+            &sha_of(b"novel"),
+        );
         assert_eq!(v, None);
     }
 
@@ -712,7 +734,9 @@ mod tests {
         assert_eq!(s.len(), 64);
         assert!(s.starts_with("00ff"));
         assert!(s.ends_with("ab"));
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     // ----- verdict matrix --------------------------------------------------
@@ -790,5 +814,4 @@ mod tests {
         assert!(policy_allows_error(ScanPolicy::AllowSuspicious));
         assert!(policy_allows_error(ScanPolicy::Bypass));
     }
-
 }

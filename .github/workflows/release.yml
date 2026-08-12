@@ -1,0 +1,72 @@
+name: Prerelease
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "${GITHUB_REF_NAME#v}" = "$cargo_version"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build
+        run: cargo +stable build --locked --release
+      - name: Package and checksum
+        id: package
+        shell: bash
+        run: |
+          mkdir -p dist
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) asset=hood-linux-x86_64 ;;
+            Darwin-arm64) asset=hood-macos-arm64 ;;
+            Darwin-x86_64) asset=hood-macos-x86_64 ;;
+            *) echo "unsupported release runner" >&2; exit 1 ;;
+          esac
+          cp target/release/hood "dist/$asset"
+          shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: target/release/hood
+          format: cyclonedx-json
+          output-file: dist/${{ steps.package.outputs.asset }}.cdx.json
+          upload-artifact: false
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/${{ steps.package.outputs.asset }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --prerelease --generate-notes

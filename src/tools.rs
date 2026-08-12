@@ -25,6 +25,8 @@ use anyhow::{Context, Result};
 use tempfile::TempDir;
 use tokio::process::Command;
 
+use crate::go_bridge::GoChildEnv;
+
 /// Subcommands hood knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -48,8 +50,8 @@ pub enum Tool {
     Uv,
     /// `poetry <args...>` — Python; `POETRY_REQUESTS_CA_BUNDLE` honored.
     Poetry,
-    /// `go <args...>` — Go toolchain. Needs `SSL_CERT_FILE` plus `GODEBUG`
-    /// fallback on macOS.
+    /// `go <args...>` — Go toolchain. Uses `SSL_CERT_FILE` where supported and
+    /// hood's loopback module/sumdb bridge on macOS.
     Go,
     /// `cargo <args...>` — Rust. Respects `CARGO_HTTP_CAINFO` and `SSL_CERT_FILE`.
     Cargo,
@@ -161,8 +163,18 @@ impl Tool {
     pub fn plausible_on(self, os: &str) -> bool {
         match self {
             // Downloaders and language toolchains ship everywhere hood runs.
-            Self::Curl | Self::Wget | Self::Npm | Self::Pnpm | Self::Yarn | Self::Bun
-            | Self::Pip | Self::Pipx | Self::Uv | Self::Poetry | Self::Go | Self::Cargo
+            Self::Curl
+            | Self::Wget
+            | Self::Npm
+            | Self::Pnpm
+            | Self::Yarn
+            | Self::Bun
+            | Self::Pip
+            | Self::Pipx
+            | Self::Uv
+            | Self::Poetry
+            | Self::Go
+            | Self::Cargo
             | Self::Exec => true,
             // Homebrew targets macOS and Linux (Linuxbrew).
             Self::Brew => matches!(os, "macos" | "linux"),
@@ -292,9 +304,7 @@ fn leading_subcommand(args: &[OsString]) -> Option<String> {
 fn has_fetching_subcommand(tool: Tool, args: &[OsString]) -> bool {
     args.iter().any(|a| {
         let s = a.to_string_lossy();
-        !s.starts_with('-')
-            && !s.starts_with('+')
-            && is_fetching_subcommand(tool, Some(s.as_ref()))
+        !s.starts_with('-') && !s.starts_with('+') && is_fetching_subcommand(tool, Some(s.as_ref()))
     })
 }
 
@@ -348,17 +358,41 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
         // refresh metadata. `list`/`info`/`remove`/`history` stay local.
         Tool::Dnf | Tool::Yum => matches!(
             sub,
-            "install" | "in" | "reinstall" | "upgrade" | "upgrade-minimal" | "update"
-                | "up" | "downgrade" | "distro-sync" | "dsync" | "group"
-                | "groupinstall" | "groupupdate" | "localinstall" | "swap" | "download"
+            "install"
+                | "in"
+                | "reinstall"
+                | "upgrade"
+                | "upgrade-minimal"
+                | "update"
+                | "up"
+                | "downgrade"
+                | "distro-sync"
+                | "dsync"
+                | "group"
+                | "groupinstall"
+                | "groupupdate"
+                | "localinstall"
+                | "swap"
+                | "download"
         ),
 
         // zypper accepts both long verbs and its classic short aliases.
         Tool::Zypper => matches!(
             sub,
-            "install" | "in" | "remove-and-install" | "update" | "up" | "dist-upgrade"
-                | "dup" | "patch" | "source-install" | "si" | "install-new-recommends"
-                | "inr" | "refresh" | "ref"
+            "install"
+                | "in"
+                | "remove-and-install"
+                | "update"
+                | "up"
+                | "dist-upgrade"
+                | "dup"
+                | "patch"
+                | "source-install"
+                | "si"
+                | "install-new-recommends"
+                | "inr"
+                | "refresh"
+                | "ref"
         ),
 
         // FreeBSD pkg: install/add/upgrade/fetch pull packages; update and
@@ -417,9 +451,7 @@ fn aur_helper_fetches(args: &[OsString]) -> bool {
         } else if let Some(long) = s.strip_prefix("--") {
             match long {
                 "sync" | "upgrade" | "files" => return true,
-                "query" | "remove" | "database" | "deptest" | "help" | "version" => {
-                    return false
-                }
+                "query" | "remove" | "database" | "deptest" | "help" | "version" => return false,
                 _ => {}
             }
         } else if !s.starts_with('-') {
@@ -499,6 +531,8 @@ pub struct ChildEnv {
     pub proxy_url: String,
     /// Path the child process can pass to its TLS verifier.
     pub ca_pem_path: PathBuf,
+    /// macOS Go module/sumdb bridge settings, when enabled for this run.
+    pub go: Option<GoChildEnv>,
 }
 
 impl ChildEnv {
@@ -563,10 +597,19 @@ impl ChildEnv {
                 out.insert("REQUESTS_CA_BUNDLE", ca);
             }
             Tool::Go => {
-                out.insert("SSL_CERT_FILE", ca);
-                // macOS Go uses the system keychain unless this is set.
-                // Harmless on other platforms.
-                out.insert("GODEBUG", OsString::from("x509usefallbackroots=1"));
+                if let Some(go) = &self.go {
+                    out.insert("GOPROXY", OsString::from(&go.goproxy));
+                    out.insert("GOSUMDB", OsString::from(&go.gosumdb));
+                    // The Go bridge is an origin server on loopback. Make the
+                    // bypass explicit so inherited proxy behavior cannot feed
+                    // that request recursively back into this same listener.
+                    let loopback = OsString::from("127.0.0.1,localhost");
+                    out.insert("no_proxy", loopback.clone());
+                    out.insert("NO_PROXY", loopback);
+                } else {
+                    // Go honors this on Unix systems other than macOS.
+                    out.insert("SSL_CERT_FILE", ca);
+                }
             }
             Tool::Cargo => {
                 // CARGO_HTTP_CAINFO is the documented cargo override.
@@ -662,6 +705,7 @@ pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<(ChildE
         ChildEnv {
             proxy_url,
             ca_pem_path: pem_path,
+            go: None,
         },
         dir,
     ))
@@ -670,7 +714,7 @@ pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<(ChildE
 /// Resolve the real binary for `tool`, skipping any directory matching
 /// `skip_dir` during PATH search. This prevents the `hood`-installed PATH shim
 /// from being invoked recursively.
-fn resolve_real_binary(name: &str, skip_dir: Option<&Path>) -> Option<PathBuf> {
+pub fn resolve_real_binary(name: &str, skip_dir: Option<&Path>) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for entry in std::env::split_paths(&path) {
         if let Some(skip) = skip_dir {
@@ -791,6 +835,7 @@ mod tests {
         ChildEnv {
             proxy_url: "http://127.0.0.1:12345".into(),
             ca_pem_path: PathBuf::from("/tmp/hood.pem"),
+            go: None,
         }
     }
 
@@ -836,10 +881,33 @@ mod tests {
     }
 
     #[test]
-    fn go_env_sets_godebug_fallback_roots() {
+    fn go_env_uses_ssl_cert_file_without_bridge() {
         let v = fake_env().vars_for(Tool::Go);
-        let godebug = v.get("GODEBUG").unwrap().to_string_lossy();
-        assert!(godebug.contains("x509usefallbackroots=1"));
+        assert!(v.contains_key("SSL_CERT_FILE"));
+        assert!(!v.contains_key("GODEBUG"));
+        assert!(!v.contains_key("GOPROXY"));
+    }
+
+    #[test]
+    fn go_bridge_replaces_ca_override_and_exempts_loopback() {
+        let mut env = fake_env();
+        env.go = Some(GoChildEnv {
+            goproxy: "http://127.0.0.1:12345/__hood_go/token/proxy".into(),
+            gosumdb: "sum.golang.org http://127.0.0.1:12345/__hood_go/token/sumdb".into(),
+        });
+        let v = env.vars_for(Tool::Go);
+        assert_eq!(
+            v.get("GOPROXY"),
+            Some(&OsString::from(
+                "http://127.0.0.1:12345/__hood_go/token/proxy"
+            )),
+        );
+        assert!(v.contains_key("GOSUMDB"));
+        assert!(!v.contains_key("SSL_CERT_FILE"));
+        assert_eq!(
+            v.get("NO_PROXY"),
+            Some(&OsString::from("127.0.0.1,localhost")),
+        );
     }
 
     #[test]
@@ -937,7 +1005,11 @@ mod tests {
 
     #[test]
     fn curl_always_intercepted_regardless_of_args() {
-        let _v = intercept_args(dispatch(Tool::Curl, vec![os("-fsSL"), os("https://x")], false));
+        let _v = intercept_args(dispatch(
+            Tool::Curl,
+            vec![os("-fsSL"), os("https://x")],
+            false,
+        ));
         let _v = intercept_args(dispatch(Tool::Curl, vec![os("--help")], false));
     }
 
@@ -970,7 +1042,10 @@ mod tests {
             false,
         );
         let args = intercept_args(d);
-        let count = args.iter().filter(|a| *a == &os("--ignore-scripts")).count();
+        let count = args
+            .iter()
+            .filter(|a| *a == &os("--ignore-scripts"))
+            .count();
         assert_eq!(count, 1);
     }
 
@@ -1041,7 +1116,10 @@ mod tests {
         let args = intercept_args(dispatch(Tool::Bun, vec![os("x"), os("create-app")], false));
         // `bun x` is exec, not install: --ignore-scripts would go to the executed
         // package and suppress nothing, so it must NOT be injected.
-        assert!(!args.contains(&os("--ignore-scripts")), "bun x got {args:?}");
+        assert!(
+            !args.contains(&os("--ignore-scripts")),
+            "bun x got {args:?}"
+        );
         // But `bun install` is an install and does get the flag.
         let installed = intercept_args(dispatch(Tool::Bun, vec![os("install")], false));
         assert!(installed.contains(&os("--ignore-scripts")));
@@ -1067,20 +1145,12 @@ mod tests {
     #[test]
     fn poetry_add_intercepted_run_passthrough() {
         let _v = intercept_args(dispatch(Tool::Poetry, vec![os("add"), os("flask")], false));
-        let _v = passthrough_args(dispatch(
-            Tool::Poetry,
-            vec![os("run"), os("pytest")],
-            false,
-        ));
+        let _v = passthrough_args(dispatch(Tool::Poetry, vec![os("run"), os("pytest")], false));
     }
 
     #[test]
     fn go_mod_download_intercepted() {
-        let _v = intercept_args(dispatch(
-            Tool::Go,
-            vec![os("mod"), os("download")],
-            false,
-        ));
+        let _v = intercept_args(dispatch(Tool::Go, vec![os("mod"), os("download")], false));
     }
 
     #[test]
@@ -1135,7 +1205,11 @@ mod tests {
 
     #[test]
     fn brew_bundle_intercepted_brew_info_passthrough() {
-        let _v = intercept_args(dispatch(Tool::Brew, vec![os("bundle"), os("install")], false));
+        let _v = intercept_args(dispatch(
+            Tool::Brew,
+            vec![os("bundle"), os("install")],
+            false,
+        ));
         let _v = passthrough_args(dispatch(Tool::Brew, vec![os("info"), os("jq")], false));
     }
 
@@ -1190,7 +1264,11 @@ mod tests {
     fn pacman_sync_and_upgrade_intercepted_query_passthrough() {
         let _v = intercept_args(dispatch(Tool::Pacman, vec![os("-Syu")], false));
         let _v = intercept_args(dispatch(Tool::Pacman, vec![os("-S"), os("firefox")], false));
-        let _v = intercept_args(dispatch(Tool::Pacman, vec![os("-U"), os("./p.pkg.tar.zst")], false));
+        let _v = intercept_args(dispatch(
+            Tool::Pacman,
+            vec![os("-U"), os("./p.pkg.tar.zst")],
+            false,
+        ));
         let _v = intercept_args(dispatch(Tool::Pacman, vec![os("--sync"), os("vim")], false));
         // Query/remove are local — and `-Rns` must not be read as a sync.
         let _v = passthrough_args(dispatch(Tool::Pacman, vec![os("-Q")], false));
@@ -1225,7 +1303,11 @@ mod tests {
             vec![os("-Uvh"), os("https://example.com/x.rpm")],
             false,
         ));
-        let _v = passthrough_args(dispatch(Tool::Rpm, vec![os("-ivh"), os("./local.rpm")], false));
+        let _v = passthrough_args(dispatch(
+            Tool::Rpm,
+            vec![os("-ivh"), os("./local.rpm")],
+            false,
+        ));
         let _v = passthrough_args(dispatch(Tool::Rpm, vec![os("-q"), os("bash")], false));
         // URL schemes are case-insensitive: an uppercase scheme must still be
         // recognized as remote, not passed through unscanned.
@@ -1245,9 +1327,17 @@ mod tests {
 
     #[test]
     fn dnf_yum_install_intercepted_list_passthrough() {
-        let _v = intercept_args(dispatch(Tool::Dnf, vec![os("install"), os("ripgrep")], false));
+        let _v = intercept_args(dispatch(
+            Tool::Dnf,
+            vec![os("install"), os("ripgrep")],
+            false,
+        ));
         let _v = intercept_args(dispatch(Tool::Yum, vec![os("upgrade")], false));
-        let _v = passthrough_args(dispatch(Tool::Dnf, vec![os("list"), os("installed")], false));
+        let _v = passthrough_args(dispatch(
+            Tool::Dnf,
+            vec![os("list"), os("installed")],
+            false,
+        ));
         let _v = passthrough_args(dispatch(Tool::Yum, vec![os("remove"), os("nano")], false));
     }
 
@@ -1288,9 +1378,18 @@ mod tests {
     fn plausible_on_gates_system_managers_by_os() {
         // Arch/RPM/Alpine managers are Linux-only.
         for t in [Tool::Pacman, Tool::Yay, Tool::Dnf, Tool::Rpm, Tool::Apk] {
-            assert!(t.plausible_on("linux"), "{t:?} should be plausible on linux");
-            assert!(!t.plausible_on("macos"), "{t:?} must not be plausible on macos");
-            assert!(!t.plausible_on("windows"), "{t:?} must not be plausible on windows");
+            assert!(
+                t.plausible_on("linux"),
+                "{t:?} should be plausible on linux"
+            );
+            assert!(
+                !t.plausible_on("macos"),
+                "{t:?} must not be plausible on macos"
+            );
+            assert!(
+                !t.plausible_on("windows"),
+                "{t:?} must not be plausible on windows"
+            );
         }
         // Homebrew: macOS and Linux, not BSD/Windows.
         assert!(Tool::Brew.plausible_on("macos"));

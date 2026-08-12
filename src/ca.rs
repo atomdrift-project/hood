@@ -44,7 +44,10 @@ impl std::fmt::Debug for Ca {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ca")
             .field("root_common_name", &ROOT_COMMON_NAME)
-            .field("cached_leaves", &self.inner.cache.lock().map_or(0, |c| c.len()))
+            .field(
+                "cached_leaves",
+                &self.inner.cache.lock().map_or(0, |c| c.len()),
+            )
             .finish()
     }
 }
@@ -105,7 +108,9 @@ impl Ca {
             .lock()
             .map_err(|e| anyhow::anyhow!("ca cache poisoned: {e}"))?;
         // Another thread might have populated it concurrently; prefer their copy.
-        Ok(Arc::clone(cache.entry(host.to_owned()).or_insert(certified)))
+        Ok(Arc::clone(
+            cache.entry(host.to_owned()).or_insert(certified),
+        ))
     }
 
     fn mint_leaf(&self, host: &str) -> Result<Arc<CertifiedKey>> {
@@ -192,8 +197,9 @@ mod tests {
         let ca = Ca::generate().unwrap();
         let pem = ca.root_pem();
         assert!(pem.contains("BEGIN CERTIFICATE"));
-        let parsed: Vec<_> =
-            rustls_pemfile::certs(&mut pem.as_bytes()).collect::<Result<_, _>>().unwrap();
+        let parsed: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(parsed.len(), 1);
     }
 

@@ -306,9 +306,7 @@ fn is_hood_shim(path: &Path) -> bool {
         return target
             .file_name()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| {
-                s.eq_ignore_ascii_case("hood") || s.eq_ignore_ascii_case("hood.exe")
-            });
+            .is_some_and(|s| s.eq_ignore_ascii_case("hood") || s.eq_ignore_ascii_case("hood.exe"));
     }
     // Hard-linked / copied fallback (Windows): match by canonicalized target
     // path against our own current_exe.
@@ -524,9 +522,7 @@ mod tests {
 
     #[test]
     fn strip_block_removes_marked_section() {
-        let input = format!(
-            "before\n{MARK_BEGIN}\nexport PATH=...\n{MARK_END}\nafter\n"
-        );
+        let input = format!("before\n{MARK_BEGIN}\nexport PATH=...\n{MARK_END}\nafter\n");
         assert_eq!(strip_block(&input), "before\nafter\n");
     }
 

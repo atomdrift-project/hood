@@ -4,6 +4,7 @@
 //! The library is structured around three pieces:
 //!
 //! - [`ca`] — ephemeral certificate authority used to MITM TLS.
+//! - [`go_bridge`] — keychain-free macOS transport for Go modules and sumdb.
 //! - [`proxy`] — HTTP/1.1 forward proxy with transparent CONNECT interception.
 //! - [`scanner`] — pluggable scanner trait + in-process atomscan backend.
 //!
@@ -11,6 +12,7 @@
 //! lives in [`tools`].
 
 pub mod ca;
+pub mod go_bridge;
 pub mod install;
 pub mod output;
 pub mod proxy;

@@ -30,13 +30,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
-use hyper::header::{HeaderName, HeaderValue, ACCEPT_ENCODING, CONTENT_LENGTH, HOST};
+use hyper::header::{
+    HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HOST, LOCATION,
+};
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
@@ -51,6 +55,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::io::ReaderStream;
 
 use crate::ca::{Ca, CaResolver};
+use crate::go_bridge;
 use crate::scanner::{BlockReason, DiskScanRequest, Prefetch, ScanRequest, Scanner, Verdict};
 
 /// The proxy's response body. A [`BoxBody`] so one return type covers three
@@ -92,6 +97,20 @@ const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 /// body is too large to scan and is forwarded unscanned — bounded only by the
 /// pre-fetch PURL gate. Tunable via `HOOD_MAX_SCAN_MB`.
 const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Derive a 128-bit route token from the freshly generated ephemeral CA. The
+/// CA is random per process, so the token cannot be guessed by another local
+/// process probing the loopback listener.
+fn bridge_token(ca_pem: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(ca_pem.as_bytes());
+    let mut out = String::with_capacity(32);
+    for byte in &digest[..16] {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
 
 /// Resolve the in-memory body cap from the environment, falling back to the default.
 fn max_body_bytes_from_env() -> u64 {
@@ -135,6 +154,9 @@ pub struct Config {
     pub max_scan_bytes: u64,
     /// Bind address. Forced to a loopback address for safety.
     pub bind: SocketAddr,
+    /// Additional roots used to verify upstream TLS. Intended for private PKI
+    /// and deterministic tests; native platform roots are always loaded too.
+    pub extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl Default for Config {
@@ -144,6 +166,7 @@ impl Default for Config {
             max_scan_bytes: max_scan_bytes_from_env(),
             // 127.0.0.1:0 → kernel-assigned ephemeral port.
             bind: ([127, 0, 0, 1], 0).into(),
+            extra_upstream_roots: Vec::new(),
         }
     }
 }
@@ -159,6 +182,7 @@ struct Inner {
     ca: Ca,
     tls_acceptor: TlsAcceptor,
     upstream_tls: Arc<ClientConfig>,
+    go_bridge_token: String,
     config: Config,
 }
 
@@ -182,6 +206,7 @@ impl Proxy {
             ));
         }
         let ca = Ca::generate()?;
+        let go_bridge_token = bridge_token(ca.root_pem());
         let resolver = Arc::new(CaResolver::new(ca.clone()));
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
@@ -195,6 +220,9 @@ impl Proxy {
             // Individual cert failures are common (expired/unsupported algos);
             // skip them and keep building the set.
             drop(roots.add(cert));
+        }
+        for cert in &config.extra_upstream_roots {
+            drop(roots.add(cert.clone()));
         }
         if roots.is_empty() {
             return Err(anyhow!(
@@ -212,6 +240,7 @@ impl Proxy {
                 ca,
                 tls_acceptor,
                 upstream_tls: Arc::new(upstream_tls),
+                go_bridge_token,
                 config,
             }),
         })
@@ -222,6 +251,12 @@ impl Proxy {
     #[must_use]
     pub fn ca_pem(&self) -> &str {
         self.inner.ca.root_pem()
+    }
+
+    /// Unpredictable per-run token protecting the loopback Go bridge route.
+    #[must_use]
+    pub fn go_bridge_token(&self) -> &str {
+        &self.inner.go_bridge_token
     }
 
     /// Bind the listener and start accepting. Returns a handle for shutdown.
@@ -313,9 +348,7 @@ where
     let svc = service_fn(move |req| {
         let proxy = proxy_clone.clone();
         let authority = Arc::clone(&authority);
-        async move {
-            Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(authority)).await)
-        }
+        async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(authority)).await) }
     });
     if let Err(e) = server_http1::Builder::new()
         .keep_alive(true)
@@ -331,14 +364,48 @@ impl Proxy {
     /// when we're handling the decrypted side of a CONNECT tunnel.
     async fn dispatch_inbound(
         &self,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         mitm_authority: Option<Arc<str>>,
     ) -> Response<ProxyBody> {
         // CONNECT only ever arrives on the plaintext side.
         if req.method() == Method::CONNECT && mitm_authority.is_none() {
             return self.handle_connect(req);
         }
-        match self.handle_forward(req, mitm_authority).await {
+
+        // Go on macOS cannot trust hood's ephemeral CA from SSL_CERT_FILE.
+        // Its module and sumdb requests instead arrive as authenticated,
+        // origin-form loopback HTTP requests. Restore the encoded upstream URL
+        // before feeding them into the normal verified+scanned forward path.
+        let mut go_bridge_request = false;
+        if mitm_authority.is_none() && req.uri().path().starts_with(go_bridge::ROUTE_PREFIX) {
+            if !matches!(*req.method(), Method::GET | Method::HEAD) {
+                return error_response(StatusCode::METHOD_NOT_ALLOWED, "Go bridge requires GET");
+            }
+            match go_bridge::resolve_request(req.uri(), &self.inner.go_bridge_token) {
+                Ok(Some(target)) => match target.as_str().parse::<Uri>() {
+                    Ok(uri) => {
+                        *req.uri_mut() = uri;
+                        go_bridge_request = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid Go bridge target URI");
+                        return error_response(StatusCode::BAD_REQUEST, "invalid Go bridge target");
+                    }
+                },
+                Ok(None) => {
+                    return error_response(StatusCode::NOT_FOUND, "unknown Go bridge route");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "invalid Go bridge request");
+                    return error_response(StatusCode::BAD_REQUEST, "invalid Go bridge request");
+                }
+            }
+        }
+
+        match self
+            .handle_forward(req, mitm_authority, go_bridge_request)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "forward failed");
@@ -393,8 +460,12 @@ impl Proxy {
         &self,
         mut req: Request<Incoming>,
         mitm_authority: Option<Arc<str>>,
+        go_bridge_request: bool,
     ) -> Result<Response<ProxyBody>> {
-        let (target_url, host_header) = resolve_target(&req, mitm_authority.as_deref())?;
+        let (mut target_url, host_header) =
+            resolve_target(&req, mitm_authority.as_deref(), go_bridge_request)?;
+        let redirect_base = target_url.clone();
+        let url_authorization = take_url_authorization(&mut target_url)?;
         // Captured before `req` is consumed by the upstream call: a HEAD request
         // never carries a response body to scan.
         let method = req.method().clone();
@@ -403,9 +474,7 @@ impl Proxy {
             .ok_or_else(|| anyhow!("no host"))?
             .to_owned();
         let is_https = target_url.scheme() == "https";
-        let port = target_url
-            .port()
-            .unwrap_or(if is_https { 443 } else { 80 });
+        let port = target_url.port().unwrap_or(if is_https { 443 } else { 80 });
 
         // Rewrite request: switch to origin-form URI, drop hop-by-hop, force identity encoding.
         let mut origin_form = target_url.path().to_owned();
@@ -420,6 +489,9 @@ impl Proxy {
         strip_hop_by_hop(headers);
         // Some clients send Proxy-Connection; hop-by-hop strip covers it. Reset Host.
         headers.insert(HOST, HeaderValue::try_from(host_header.as_str())?);
+        if let Some(authorization) = url_authorization {
+            headers.insert(AUTHORIZATION, authorization);
+        }
         // Force identity so we always see plaintext bytes for scanning.
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
@@ -434,7 +506,14 @@ impl Proxy {
             Prefetch::SkipForward => {
                 // Known-good PURL: stream straight through, no buffering, no scan.
                 let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
-                let (parts, body) = response.into_parts();
+                let (mut parts, body) = response.into_parts();
+                if go_bridge_request {
+                    rewrite_go_bridge_location(
+                        &mut parts.headers,
+                        &redirect_base,
+                        &self.inner.go_bridge_token,
+                    );
+                }
                 tracing::debug!(url = %scan_url, "forward (known-good purl skip)");
                 return build_response(parts.status, &parts.headers, passthrough_body(body), None);
             }
@@ -443,7 +522,14 @@ impl Proxy {
 
         // Open upstream connection (no pool for v1; one TCP per request).
         let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
-        let (parts, body) = response.into_parts();
+        let (mut parts, body) = response.into_parts();
+        if go_bridge_request {
+            rewrite_go_bridge_location(
+                &mut parts.headers,
+                &redirect_base,
+                &self.inner.go_bridge_token,
+            );
+        }
 
         // A response with no body — a HEAD reply, a 204/304, or an explicit zero
         // length — has nothing to scan. Forward it as-is (preserving upstream
@@ -497,7 +583,13 @@ impl Proxy {
             // Spilled to disk. `tmp` unlinks the spill file when it drops at the
             // end of this function; any `File` opened from its path before then
             // keeps the bytes alive until the response body is fully sent.
-            Buffered::Spilled { tmp, path, sha256, len, scan } => {
+            Buffered::Spilled {
+                tmp,
+                path,
+                sha256,
+                len,
+                scan,
+            } => {
                 let verdict = if scan {
                     self.inner
                         .scanner
@@ -520,7 +612,12 @@ impl Proxy {
                             .await
                             .context("reopen spill file for forwarding")?;
                         tracing::debug!(url = %scan_url, status = parts.status.as_u16(), bytes = len, "forward (from disk)");
-                        let resp = build_response(parts.status, &parts.headers, file_body(file), Some(len));
+                        let resp = build_response(
+                            parts.status,
+                            &parts.headers,
+                            file_body(file),
+                            Some(len),
+                        );
                         drop(tmp); // unlink now; the open fd above keeps the data live
                         resp
                     }
@@ -540,14 +637,18 @@ impl Proxy {
 ///   is taken from it directly.
 /// - In the MITM case, the URI is origin-form; the authority comes from the
 ///   original CONNECT.
-fn resolve_target(req: &Request<Incoming>, mitm_authority: Option<&str>) -> Result<(url::Url, String)> {
+fn resolve_target(
+    req: &Request<Incoming>,
+    mitm_authority: Option<&str>,
+    allow_absolute_https: bool,
+) -> Result<(url::Url, String)> {
     if let Some(authority) = mitm_authority {
         let path = req
             .uri()
             .path_and_query()
             .map_or_else(|| "/".to_owned(), ToString::to_string);
-        let url = url::Url::parse(&format!("https://{authority}{path}"))
-            .context("build mitm url")?;
+        let url =
+            url::Url::parse(&format!("https://{authority}{path}")).context("build mitm url")?;
         // RFC 7230 §5.4: the Host header should match the request target.
         let host_header = url.host_str().map_or_else(
             || authority.to_owned(),
@@ -562,7 +663,7 @@ fn resolve_target(req: &Request<Incoming>, mitm_authority: Option<&str>) -> Resu
     let scheme = uri
         .scheme_str()
         .ok_or_else(|| anyhow!("missing scheme in absolute URI"))?;
-    if scheme != "http" {
+    if scheme != "http" && !(allow_absolute_https && scheme == "https") {
         return Err(anyhow!(
             "plaintext proxy only accepts http://; got {scheme}",
         ));
@@ -717,7 +818,9 @@ fn temp_suffix(url: &str) -> String {
     let basename = basename.split(['?', '#']).next().unwrap_or(basename);
     match basename.rsplit_once('.') {
         Some((_, ext))
-            if !ext.is_empty() && ext.len() <= 16 && ext.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+            if !ext.is_empty()
+                && ext.len() <= 16
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric()) =>
         {
             format!(".{ext}")
         }
@@ -774,10 +877,71 @@ fn build_response(
     builder.body(body).context("build response")
 }
 
+/// Convert credentials embedded in a configured GOPROXY/GOSUMDB URL into an
+/// Authorization header, then remove them from the URL before scanning or
+/// logging it. Relative redirects retain credentials through `redirect_base`.
+fn take_url_authorization(target: &mut url::Url) -> Result<Option<HeaderValue>> {
+    if target.username().is_empty() && target.password().is_none() {
+        return Ok(None);
+    }
+    let username = percent_encoding::percent_decode_str(target.username()).collect::<Vec<_>>();
+    let password = target.password().map_or_else(Vec::new, |password| {
+        percent_encoding::percent_decode_str(password).collect::<Vec<_>>()
+    });
+    let mut credentials = Vec::with_capacity(username.len() + password.len() + 1);
+    credentials.extend_from_slice(&username);
+    credentials.push(b':');
+    credentials.extend_from_slice(&password);
+    let value = HeaderValue::try_from(format!("Basic {}", STANDARD.encode(credentials)))
+        .context("encode upstream URL credentials")?;
+    target
+        .set_username("")
+        .map_err(|()| anyhow!("remove upstream URL username"))?;
+    target
+        .set_password(None)
+        .map_err(|()| anyhow!("remove upstream URL password"))?;
+    Ok(Some(value))
+}
+
+/// Keep redirects from escaping the macOS Go loopback bridge. Module proxies
+/// commonly redirect zip payloads to object storage; an absolute HTTPS
+/// Location would otherwise send Go back through the CA path it cannot trust.
+fn rewrite_go_bridge_location(headers: &mut hyper::HeaderMap, request_url: &url::Url, token: &str) {
+    let Some(raw) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) else {
+        return;
+    };
+    let Ok(mut target) = request_url.join(raw) else {
+        tracing::warn!(location = raw, "invalid upstream Go bridge redirect");
+        return;
+    };
+    if !matches!(target.scheme(), "http" | "https") {
+        tracing::warn!(
+            location = raw,
+            scheme = target.scheme(),
+            "unsupported Go bridge redirect"
+        );
+        return;
+    }
+    target.set_fragment(None);
+    let local = go_bridge::redirect_location(token, &target);
+    match HeaderValue::try_from(local) {
+        Ok(value) => {
+            headers.insert(LOCATION, value);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not encode Go bridge redirect");
+        }
+    }
+}
+
 fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     let to_remove: Vec<HeaderName> = headers
         .keys()
-        .filter(|k| HOP_BY_HOP.iter().any(|h| k.as_str().eq_ignore_ascii_case(h)))
+        .filter(|k| {
+            HOP_BY_HOP
+                .iter()
+                .any(|h| k.as_str().eq_ignore_ascii_case(h))
+        })
         .cloned()
         .collect();
     for k in to_remove {
@@ -859,4 +1023,11 @@ mod tests {
         assert!(!is_hop_by_hop(&HeaderName::from_static("content-type")));
     }
 
+    #[test]
+    fn bridge_url_credentials_become_basic_auth_and_leave_logs() {
+        let mut target = url::Url::parse("https://user:p%40ss@proxy.example/base").unwrap();
+        let authorization = take_url_authorization(&mut target).unwrap().unwrap();
+        assert_eq!(authorization, "Basic dXNlcjpwQHNz");
+        assert_eq!(target.as_str(), "https://proxy.example/base");
+    }
 }

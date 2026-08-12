@@ -1,76 +1,65 @@
 # hood
 
-**Highly experimental** local supply-chain protection: a safety layer between your
-package managers and the internet. Expect rough edges — try it in a VM first.
+[![Status: highly experimental](https://img.shields.io/badge/status-highly%20experimental-E5A50A)](#security-posture) [![CI](https://github.com/atomdrift-project/hood/actions/workflows/ci.yml/badge.svg)](https://github.com/atomdrift-project/hood/actions/workflows/ci.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/atomdrift-project/hood/badge)](https://scorecard.dev/viewer/?uri=github.com/atomdrift-project/hood) [![License: Apache-2.0](https://img.shields.io/github/license/atomdrift-project/hood)](LICENSE)
 
-## The fume-hood metaphor
+**A local package firewall that inspects downloaded bytes before they reach developer workstations.**
 
-A chemist doesn't stop handling volatile reagents — they work under a **fume hood**
-that pulls the dangerous vapors away before they reach their lungs. `hood` is that
-for your terminal: you still run `npm install`, `pip install`, `curl | sh`, but hood
-inspects what comes through before it reaches you.
+> [!WARNING] Evaluation software, not an enterprise endpoint control. Test in a VM before piloting it with developers.
+
+<p align="center"><img src="media/hood.jpg" alt="Handle chemicals under a fume hood" width="560"></p>
+
+## Why
+Developer machines hold source code, signing keys, registry credentials, cloud tokens, and production access. `hood` blocks suspicious downloads before install scripts execute, analyzes private packages absent from threat feeds, and preserves familiar commands—including `curl | sh`.
 
 ## How it works
-
-When you install something, hood:
-
-1. spins up a short-lived HTTPS-intercepting proxy trusted only by that child process
-   via an **ephemeral, throwaway CA** — nothing touches your system trust store;
-2. checks each payload against atomscan's **bloom filters** first: a known-good hash
-   skips the scan entirely (near-invisible), a known-bad hash or package coordinate is
-   blocked on the spot with a link to its report at `lab.atomdrift.org`;
-3. otherwise **scans the bytes** with an in-process ML classifier
-   ([Atomdrift Scan](https://github.com/atomdrift-project/scan) + cleave) *before* they reach the tool;
-4. **blocks** anything hostile with a panel explaining why — or forwards clean bytes.
-
-Bloom filters are optional (populated by `atomscan update-rules`); without them, every
-payload simply takes the full scan.
-
-## What it protects
-
-One wrapper per command; `hood install` only wires up the ones your platform has.
-Non-fetching subcommands (`npm test`, `cargo build`, `pacman -Q`) pass through untouched.
-
-- `curl` / `wget` — every fetch, including `curl … | sh` bootstrap scripts.
-- `npm` / `pnpm` / `yarn` / `bun` — Node installs; lifecycle scripts off by default.
-- `pip` / `pipx` — Python package installs.
-- `uv` / `poetry` — modern Python installs, adds, and syncs.
-- `go` — module fetches (`get`, `install`, `mod download`).
-- `cargo` — Rust crate `install` / `add` / `update` / `fetch`.
-- `brew` — Homebrew `install` / `upgrade` / `fetch` / `tap` / `bundle` (macOS & Linux).
-- `pacman` — Arch sync / upgrade (`-S`, `-U`).
-- `yay` / `paru` — Arch AUR helper installs & upgrades.
-- `makepkg` — Arch/AUR builds from fetched sources.
-- `dnf` / `yum` — Fedora/RHEL `install` / `upgrade` / `download`.
-- `zypper` — openSUSE `install` / `dup` / `patch` / `refresh`.
-- `rpm` — installs pulled from an `http(s)` / `ftp` URL.
-- `apk` — Alpine `add` / `upgrade` / `fetch`.
-- `pkg` — FreeBSD `install` / `add` / `upgrade` / `fetch`.
-
-## Install
-
-```sh
-make install     # build the `hood` binary onto your PATH
-hood install     # shim your tools + shell rc, then restart the shell
+```mermaid
+flowchart LR
+    A["Developer or agent<br/>original tool"] --> B["Loopback proxy<br/>ephemeral child-only CA"] --> C["Public/private registry<br/>or any URL"] -->|bytes| B
+    B --> D{"Known-good/bad<br/>hash or PURL?"}
+    D -->|good| E["Release to tool"]; D -->|bad| G["Block and explain"]
+    D -->|unknown| F["Local ML + static analysis"]; F -->|benign| E; F -->|suspicious/hostile| G
 ```
+The host trust store is unchanged. Unknown bytes are analyzed locally by [Atomdrift Scan](https://github.com/atomdrift-project/scan); optional bloom filters fast-path known artifacts.
 
-Run ad hoc without shimming anything: `hood npm install left-pad`, `hood exec -- ./setup.sh`.
+## Tool coverage
+✅ = automatic wrapper; ◐ = experimental explicit command; — = unsupported. Matrix verified against each project's source (August 2026). `hood` also supports `hood exec -- <command>`; only `hood` locally classifies private artifact contents. Competitors may route private packages but decide from feeds or metadata.
 
-## Override or remove
+| Tool | hood | [PMG](https://github.com/safedep/pmg) | [SCFW](https://github.com/DataDog/supply-chain-firewall) | [Safe Chain](https://github.com/AikidoSec/safe-chain) |
+| --- | :---: | :---: | :---: | :---: |
+| `curl` | ✅ | — | — | — |
+| `wget` | ✅ | — | — | — |
+| `npm` | ✅ | ✅ | ✅ | ✅ |
+| `npx` | — | ✅ | — | ✅ |
+| `pnpm` | ✅ | ✅ | — | ✅ |
+| `pnpx` | — | ✅ | — | ✅ |
+| `yarn` | ✅ | ✅ | — | ✅ |
+| `rush` | — | — | — | ✅ |
+| `rushx` | — | — | — | ✅ |
+| `bun` | ✅ | ✅ | — | ✅ |
+| `bunx` | — | — | — | ✅ |
+| `pip` | ✅ | ✅ | ✅ | ✅ |
+| `pip3` | — | ✅ | — | ✅ |
+| `pipx` | ✅ | ✅ | — | ✅ |
+| `uv` | ✅ | ✅ | — | ✅ |
+| `uvx` | — | ✅ | — | ✅ |
+| `poetry` | ✅ | ✅ | ✅ | ✅ |
+| `pdm` | — | — | — | ✅ |
+| `go` | ✅ | ◐ | — | — |
+| `cargo` | ✅ | — | — | — |
+| `brew` | ✅ | — | — | — |
+| `pacman` | ✅ | — | — | — |
+| `yay` | ✅ | — | — | — |
+| `paru` | ✅ | — | — | — |
+| `makepkg` | ✅ | — | — | — |
+| `dnf` | ✅ | — | — | — |
+| `yum` | ✅ | — | — | — |
+| `zypper` | ✅ | — | — | — |
+| `rpm` | ✅ | — | — | — |
+| `apk` | ✅ | — | — | — |
+| `pkg` | ✅ | — | — | — |
 
-- **Let a payload through:** `HOOD_BYPASS=1` forwards on scan error, `=2` also on
-  *suspicious*, `=3` on *everything*. `--enable-scripts` re-enables npm lifecycle scripts.
-- **Skip hood for one run:** invoke the real binary by full path (e.g. `/usr/bin/npm`).
-- **Remove one wrapper:** `rm ~/.hood/bin/<tool>`. **Remove all + shell rc:** `hood uninstall`.
+## Security posture
+Strict by default: scan errors and suspicious or hostile content are blocked. User-level shims are bypassable; bodies above 2 GiB are forwarded unscanned; centralized policy, fleet health, approvals, and organization-wide audit are not implemented. PMG, SCFW, and Safe Chain are operationally more mature.
 
-## How it compares
-
-- **Datadog GuardDog** — a rule-based (Semgrep) scanner limited to PyPI, npm, Go, and
-  GitHub Actions packages, which you point at a manifest or package, mostly in CI. It
-  never sees `curl | sh` or system package managers. hood needs nothing pointed at it
-  and inspects the actual bytes at install time.
-- **Aikido Safe-Chain** — shims only the npm family (`npm`/`npx`/`yarn`/`pnpm`) and
-  matches names against a cloud feed of *known* malware: Node-only, blocklist-based.
-  hood classifies intercepted payload bytes locally, including previously unknown
-  files, across every ecosystem above. Package installation still needs the network,
-  and Scan may refresh bundles or follow references unless configured otherwise.
+## Evaluate
+Requires Rust 1.96+: `git clone https://github.com/atomdrift-project/hood.git && cd hood && make install && hood install`. Restart the shell; remove with `hood uninstall`. `make test` runs the Rust suite; `make test-tools` runs isolated command-level tests against installed toolchains without contacting public registries.

@@ -2,9 +2,15 @@
 name = "hood"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.96"
 authors = ["The Atomdrift Project"]
 description = "Scan HTTP(S) payloads before they reach package managers, installers, and curl|sh scripts"
 license = "Apache-2.0"
+repository = "https://github.com/atomdrift-project/hood"
+homepage = "https://github.com/atomdrift-project/hood"
+readme = "README.md"
+keywords = ["malware", "supply-chain", "package-manager", "security", "proxy"]
+categories = ["command-line-utilities", "development-tools", "network-programming"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -47,6 +53,7 @@ cast_possible_truncation = "warn"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
@@ -54,7 +61,8 @@ fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
-scan = { package = "atomdrift-scan", path = "../scan" }
+percent-encoding = "2"
+scan = { package = "atomdrift-scan", git = "https://github.com/atomdrift-project/scan.git" }
 rcgen = { version = "0.13", features = ["pem"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
@@ -72,6 +80,7 @@ url = "2"
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["test-util", "macros"] }
+zip = { version = "2.4", default-features = false }
 
 [[bin]]
 name = "hood"

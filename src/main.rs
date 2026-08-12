@@ -8,9 +8,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
 use hood::scanner::{AllowAll, AtomScanner, ScanPolicy, Scanner};
-use hood::tools::{dispatch, prepare_child_env, run_child, run_passthrough, Dispatch, Tool};
+use hood::tools::{
+    dispatch, prepare_child_env, resolve_real_binary, run_child, run_passthrough, Dispatch, Tool,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "hood")]
@@ -248,8 +251,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // `go run`, etc. Hot path; no model load, no listener, no env injection.
     let args = match dispatch(tool, argv, cli.enable_scripts) {
         Dispatch::Passthrough(args) => {
-            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref())
-                .await;
+            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref()).await;
         }
         Dispatch::Intercept(args) => args,
     };
@@ -262,14 +264,25 @@ async fn run(cli: Cli) -> Result<i32> {
     // *blocking* hostile/suspicious payloads; the scanner being down makes that
     // impossible, so an infrastructure failure fails closed like Strict rather
     // than silently downgrading to "download everything unscanned."
+    let go_bridge = if cfg!(target_os = "macos") && tool == Tool::Go {
+        let go = resolve_real_binary("go", shim_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no real `go` found on PATH (only the hood shim)"))?;
+        Some(
+            GoBridge::query(&go)
+                .await
+                .context("read effective Go network settings")?,
+        )
+    } else {
+        None
+    };
+
     let setup_result =
-        setup_proxy(cli.model_dir.clone(), policy, invocation.clone()).await;
+        setup_proxy(cli.model_dir.clone(), policy, invocation.clone(), go_bridge).await;
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
         Err(e) if matches!(policy, ScanPolicy::Bypass) => {
             hood::output::emit_failsafe(&invocation, policy, &format!("{e:#}"));
-            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref())
-                .await;
+            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref()).await;
         }
         Err(e) => return Err(e),
     };
@@ -301,13 +314,24 @@ async fn setup_proxy(
     model_dir: Option<PathBuf>,
     policy: ScanPolicy,
     invocation: String,
+    go_bridge: Option<GoBridge>,
 ) -> Result<ProxySetup> {
     let scanner = build_scanner(model_dir, policy, invocation)?;
     let proxy = Proxy::new(scanner, Config::default()).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
+    let go_bridge_token = proxy.go_bridge_token().to_owned();
     let handle = proxy.spawn().await.context("start proxy")?;
     tracing::debug!(addr = %handle.addr, "hood proxy listening");
-    let (env, ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
+    let (mut env, ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
+    if let Some(go_bridge) = go_bridge {
+        match go_bridge.child_env(handle.addr, &go_bridge_token) {
+            Ok(go) => env.go = Some(go),
+            Err(e) => {
+                handle.stop().await;
+                return Err(e).context("prepare macOS Go loopback bridge");
+            }
+        }
+    }
     Ok(ProxySetup {
         handle,
         env,
@@ -474,8 +498,7 @@ mod tests {
 
     #[test]
     fn curl_passes_hyphen_args() {
-        let cli =
-            Cli::try_parse_from(["hood", "curl", "-fsSL", "https://example.com"]).unwrap();
+        let cli = Cli::try_parse_from(["hood", "curl", "-fsSL", "https://example.com"]).unwrap();
         match cli.command {
             Command::Curl { args } => {
                 assert_eq!(args, vec!["-fsSL", "https://example.com"]);
@@ -503,8 +526,7 @@ mod tests {
 
     #[test]
     fn npm_with_install_args() {
-        let cli =
-            Cli::try_parse_from(["hood", "npm", "install", "lodash", "--save"]).unwrap();
+        let cli = Cli::try_parse_from(["hood", "npm", "install", "lodash", "--save"]).unwrap();
         match cli.command {
             Command::Npm { args } => {
                 assert_eq!(args, vec!["install", "lodash", "--save"]);

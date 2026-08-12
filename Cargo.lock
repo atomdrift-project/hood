@@ -280,6 +280,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "2.6.0"
+source = "git+https://github.com/atomdrift-project/scan.git#e5825c9859b05ebcc17ccdb9750e11c481a1b5c3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2288,6 +2289,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "atomdrift-scan",
+ "base64",
  "bytes",
  "clap",
  "dirs",
@@ -2296,6 +2298,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "percent-encoding",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -2309,6 +2312,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zip 2.4.2",
 ]
 
 [[package]]

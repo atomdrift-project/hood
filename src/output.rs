@@ -248,7 +248,8 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
         traits,
         reasons.join(", "),
         match p.original {
-            Some(o) if o != p.classification => format!(" upgraded_from={}", classification_label(o)),
+            Some(o) if o != p.classification =>
+                format!(" upgraded_from={}", classification_label(o)),
             _ => String::new(),
         },
     )
@@ -315,9 +316,19 @@ fn write_scan_error_pretty<W: Write>(
         fg_bold(header_color, header),
         fg(c.chrome, &"─".repeat(62)),
     )?;
-    writeln!(w, "  {}  {}", fg(c.dim, "scan-error"), fg_bold(c.text, sanitize(p.url).as_ref()))?;
+    writeln!(
+        w,
+        "  {}  {}",
+        fg(c.dim, "scan-error"),
+        fg_bold(c.text, sanitize(p.url).as_ref())
+    )?;
     writeln!(w)?;
-    writeln!(w, "  {}  {}", fg(c.dim, "reason:"), fg(c.text, sanitize(p.error).as_ref()))?;
+    writeln!(
+        w,
+        "  {}  {}",
+        fg(c.dim, "reason:"),
+        fg(c.text, sanitize(p.error).as_ref())
+    )?;
     writeln!(w)?;
     match p.disposition {
         Disposition::Forwarded => writeln!(
@@ -369,7 +380,11 @@ pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
         let theme = scan::output::detect_theme();
-        drop(write_known_bad_pretty(&mut stderr, p, Palette::for_theme(theme)));
+        drop(write_known_bad_pretty(
+            &mut stderr,
+            p,
+            Palette::for_theme(theme),
+        ));
     } else if p.sha256.is_empty() {
         // Pre-fetch PURL match: no bytes were downloaded, so key on the PURL.
         drop(writeln!(
@@ -580,7 +595,13 @@ fn sanitize(s: &str) -> std::borrow::Cow<'_, str> {
     }
     std::borrow::Cow::Owned(
         s.chars()
-            .map(|c| if c.is_control() && c != '\t' { '\u{fffd}' } else { c })
+            .map(|c| {
+                if c.is_control() && c != '\t' {
+                    '\u{fffd}'
+                } else {
+                    c
+                }
+            })
             .collect(),
     )
 }
@@ -601,7 +622,10 @@ mod tests {
     #[test]
     fn sanitize_strips_escape_and_newline_but_keeps_printable() {
         // No control chars → borrowed, unchanged.
-        assert_eq!(sanitize("https://example.com/pkg.tgz"), "https://example.com/pkg.tgz");
+        assert_eq!(
+            sanitize("https://example.com/pkg.tgz"),
+            "https://example.com/pkg.tgz"
+        );
         // ESC (ANSI injection) and newline (forged log line) are neutralized.
         let evil = "https://x/\x1b[2Jpkg\nhood forged=line";
         let clean = sanitize(evil);

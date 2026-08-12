@@ -20,7 +20,7 @@ When you install something, hood:
    skips the scan entirely (near-invisible), a known-bad hash or package coordinate is
    blocked on the spot with a link to its report at `lab.atomdrift.org`;
 3. otherwise **scans the bytes** with an in-process ML classifier
-   ([atomscan](https://codeberg.org/atomdrift/scan) + cleave) *before* they reach the tool;
+   ([Atomdrift Scan](https://github.com/atomdrift-project/scan) + cleave) *before* they reach the tool;
 4. **blocks** anything hostile with a panel explaining why — or forwards clean bytes.
 
 Bloom filters are optional (populated by `atomscan update-rules`); without them, every
@@ -71,5 +71,6 @@ Run ad hoc without shimming anything: `hood npm install left-pad`, `hood exec --
   and inspects the actual bytes at install time.
 - **Aikido Safe-Chain** — shims only the npm family (`npm`/`npx`/`yarn`/`pnpm`) and
   matches names against a cloud feed of *known* malware: Node-only, blocklist-based.
-  hood classifies each payload locally — offline, unknown / zero-day — across every
-  ecosystem above, from `curl | sh` to Arch and RPM.
+  hood classifies intercepted payload bytes locally, including previously unknown
+  files, across every ecosystem above. Package installation still needs the network,
+  and Scan may refresh bundles or follow references unless configured otherwise.

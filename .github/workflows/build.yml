@@ -629,9 +629,8 @@ jobs:
           # Newest image available. OpenBSD makes no cross-release ABI promise,
           # so there is no reach argument for staying back — the artifact is
           # effectively single-release either way, and this pin needs bumping
-          # every six months. 7.8's ports rust was 1.90, below this crate's
-          # 1.94 MSRV. OpenBSD 7.9 ships rust 1.94.1, making it the first image
-          # new enough to build this release.
+          # every six months. OpenBSD 7.9 ships rust 1.94.1, below this crate's
+          # 1.96 MSRV; keep this diagnostic job until a newer image is available.
           release: "7.9"
           cpu: "4"
           mem: "12288"
@@ -730,7 +729,7 @@ jobs:
 
   # DragonFlyBSD is a diagnostic target, not part of normal CI or releases.
   # Rust supports it only at Tier 3, and the newest vmactions/DPorts environment
-  # currently provides rustc 1.85.1 while Scan requires 1.94. Keep the job
+  # currently provides rustc 1.85.1 while Hood requires 1.96. Keep the job
   # available for an explicit compatibility probe when the OS toolchain catches
   # up, without spending runner time or producing a known-missing release asset.
   dragonfly:
@@ -752,7 +751,7 @@ jobs:
         with:
           usesh: true
           # This is the newest image vmactions publishes. DragonFly's official
-          # DPorts tree currently stops at rustc 1.85.1, below our 1.94 MSRV;
+          # DPorts tree currently stops at rustc 1.85.1, below our 1.96 MSRV;
           # The explicit job remains an honest compatibility canary until the
           # OS package catches up.
           release: "6.4.2"
@@ -877,8 +876,8 @@ jobs:
             cargo --version --verbose
             df -h . /
             installed="$(rustc --version | awk '{print $2}')"
-            if dpkg --compare-versions "$installed" lt 1.94; then
-              echo "::error::GNU/Hurd provides rustc $installed; hood requires Rust 1.94 or newer"
+            if dpkg --compare-versions "$installed" lt 1.96; then
+              echo "::error::GNU/Hurd provides rustc $installed; hood requires Rust 1.96 or newer"
               exit 1
             fi
             export CARGO_HOME="$PWD/.native-cargo"
@@ -1014,7 +1013,7 @@ jobs:
             pkg publisher
             # Names resolved against r151058: rust and cmake live under the
             # extra.omnios publisher (ooce/), the rest under core. r151058
-            # ships rust 1.97.1, comfortably over this crate's 1.94 MSRV —
+            # ships rust 1.97.1, over this crate's 1.96 MSRV —
             # unlike OpenBSD ports, which is the reason that target fails.
             # git is not optional: five of our dependencies are git deps.
             # `pkg list -a '*<name>*'` is how to re-derive these if an image

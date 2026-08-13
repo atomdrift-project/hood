@@ -16,6 +16,7 @@
 //! fall back to hardlinks (preserving the single-binary semantics) or, as a
 //! last resort, copies.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -50,7 +51,7 @@ pub struct Layout {
 
 impl Layout {
     /// Layout rooted at an arbitrary `home`. The shim directory follows the
-    /// `<home>/.hood/bin` convention. Used in tests and by [`layout_default`].
+    /// `<home>/.hood/bin` convention used by the platform-default layout.
     #[must_use]
     pub fn at_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
@@ -59,7 +60,7 @@ impl Layout {
     }
 }
 
-/// Resolve the platform default layout: HOME (or HOOD_HOME override) plus the
+/// Resolve the platform default layout: `HOME` (or `HOOD_HOME` override) plus the
 /// standard `<home>/.hood/bin` shim directory.
 fn layout_default() -> Result<Layout> {
     if let Some(home) = std::env::var_os("HOOD_HOME") {
@@ -86,6 +87,7 @@ pub fn shim_names() -> Vec<&'static str> {
 }
 
 /// If `argv0` (basename) is a shimmed tool name, return the matching tool.
+///
 /// Used by `main.rs` to translate `npm install foo` into the `hood npm install foo`
 /// dispatch path when hood was invoked through one of its busybox links.
 #[must_use]
@@ -135,8 +137,9 @@ pub struct InstallReport {
     pub touched_files: Vec<PathBuf>,
 }
 
-/// Install hood shims using an explicit [`Layout`] and hood binary path. The
-/// public [`install`] is a thin wrapper that derives the layout from the user's
+/// Install hood shims using an explicit [`Layout`] and hood binary path.
+///
+/// The public [`install`] derives the layout from the user's
 /// real home and passes [`std::env::consts::OS`]. Tests should use this entry
 /// point.
 ///
@@ -155,13 +158,24 @@ pub fn install_at(
     force: bool,
     os: &str,
 ) -> Result<InstallReport> {
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    install_at_with_path(layout, hood_bin, force, os, &search_path)
+}
+
+fn install_at_with_path(
+    layout: &Layout,
+    hood_bin: &Path,
+    force: bool,
+    os: &str,
+    search_path: &OsStr,
+) -> Result<InstallReport> {
     fs::create_dir_all(&layout.shim_dir)
         .with_context(|| format!("create shim dir {}", layout.shim_dir.display()))?;
 
     let mut report = InstallReport::default();
     for tool in Tool::SHIMMABLE {
         let name = tool.name();
-        if is_tool_present(name, &layout.shim_dir) {
+        if is_tool_present(name, &layout.shim_dir, search_path) {
             // Present on PATH — it exists here, so shim it whatever the platform.
             install_link(&layout.shim_dir, name, hood_bin, force)
                 .with_context(|| format!("install shim for {name}"))?;
@@ -192,17 +206,17 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
     if !report.skipped.is_empty() {
         eprintln!("  skipped (not on PATH): {}", report.skipped.join(", "));
     }
-    if !report.touched_files.is_empty() {
+    if report.touched_files.is_empty() {
+        eprintln!(
+            "\nNo shell rc file was updated. Add this line to your shell rc manually:\n  export PATH={}:\"$PATH\"",
+            posix_quote(&layout.shim_dir.to_string_lossy())
+        );
+    } else {
         eprintln!("  updated rc files:");
         for f in &report.touched_files {
             eprintln!("    {}", f.display());
         }
         eprintln!("\nRestart your shell (or `source` the rc file) to activate.");
-    } else {
-        eprintln!(
-            "\nNo shell rc file was updated. Add this line to your shell rc manually:\n  export PATH={}:\"$PATH\"",
-            posix_quote(&layout.shim_dir.to_string_lossy())
-        );
     }
 }
 
@@ -247,11 +261,14 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
     if layout.shim_dir.is_dir() {
         for entry in fs::read_dir(&layout.shim_dir)
             .with_context(|| format!("read {}", layout.shim_dir.display()))?
-            .flatten()
         {
+            let entry = entry.with_context(|| {
+                format!("read directory entry in {}", layout.shim_dir.display())
+            })?;
             let path = entry.path();
-            if is_hood_shim(&path) {
-                fs::remove_file(&path).ok();
+            if is_shim_name(&path) && is_hood_shim(&path) {
+                fs::remove_file(&path)
+                    .with_context(|| format!("remove shim {}", path.display()))?;
                 report.removed_shims = report.removed_shims.saturating_add(1);
             }
         }
@@ -268,13 +285,21 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
     Ok(report)
 }
 
-/// Probe whether a tool binary exists somewhere on `PATH` *other than* our
-/// own shim directory (to avoid claiming success based on stale shims).
-fn is_tool_present(name: &str, skip_dir: &Path) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+/// Restrict uninstall to names hood actually installs. A user may keep other
+/// links in the same directory; their target being named `hood` is not enough
+/// to make them ours.
+fn is_shim_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    for entry in std::env::split_paths(&path) {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    Tool::SHIMMABLE.iter().any(|tool| tool.name() == name)
+}
+
+/// Probe whether a tool binary exists somewhere on `PATH` *other than* our
+/// own shim directory (to avoid claiming success based on stale shims).
+fn is_tool_present(name: &str, skip_dir: &Path, search_path: &OsStr) -> bool {
+    for entry in std::env::split_paths(search_path) {
         if entry == skip_dir {
             continue;
         }
@@ -285,10 +310,10 @@ fn is_tool_present(name: &str, skip_dir: &Path) -> bool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = candidate.metadata() {
-                if meta.permissions().mode() & 0o111 != 0 {
-                    return true;
-                }
+            if let Ok(meta) = candidate.metadata()
+                && meta.permissions().mode() & 0o111 != 0
+            {
+                return true;
             }
         }
         #[cfg(not(unix))]
@@ -322,16 +347,25 @@ fn is_hood_shim(path: &Path) -> bool {
 #[cfg(unix)]
 fn install_link(dir: &Path, tool: &str, hood_bin: &Path, force: bool) -> Result<()> {
     let link = dir.join(tool);
-    if link.exists() {
-        // If it's a hood shim already pointing at the right target, leave it.
-        if !force {
-            if let Ok(current) = fs::read_link(&link) {
-                if current == hood_bin {
-                    return Ok(());
-                }
+    match fs::symlink_metadata(&link) {
+        Ok(_) => {
+            // If it's a hood shim already pointing at the right target, leave it.
+            if !force
+                && let Ok(current) = fs::read_link(&link)
+                && current == hood_bin
+            {
+                return Ok(());
             }
+            if !is_hood_shim(&link) {
+                return Err(anyhow::anyhow!(
+                    "refusing to replace unrelated file {}",
+                    link.display(),
+                ));
+            }
+            fs::remove_file(&link).with_context(|| format!("remove stale {}", link.display()))?;
         }
-        fs::remove_file(&link).with_context(|| format!("remove stale {}", link.display()))?;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", link.display())),
     }
     std::os::unix::fs::symlink(hood_bin, &link)
         .with_context(|| format!("symlink {} -> {}", link.display(), hood_bin.display()))
@@ -417,7 +451,11 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("fish"));
 
-    let existing = fs::read_to_string(rc_file).unwrap_or_default();
+    let existing = match fs::read_to_string(rc_file) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", rc_file.display())),
+    };
     let mut filtered = strip_block(&existing);
 
     let block = if is_fish {
@@ -438,7 +476,8 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
     filtered.push_str(&block);
 
     if let Some(parent) = rc_file.parent() {
-        fs::create_dir_all(parent).ok();
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create shell config directory {}", parent.display()))?;
     }
     atomic_write(rc_file, filtered.as_bytes())
         .with_context(|| format!("write {}", rc_file.display()))
@@ -446,8 +485,10 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
 
 /// Remove the hood-marked block, if any. Returns whether anything changed.
 fn remove_shell_block(rc_file: &Path) -> Result<bool> {
-    let Ok(existing) = fs::read_to_string(rc_file) else {
-        return Ok(false);
+    let existing = match fs::read_to_string(rc_file) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("read {}", rc_file.display())),
     };
     let stripped = strip_block(&existing);
     if stripped == existing {
@@ -458,25 +499,36 @@ fn remove_shell_block(rc_file: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Remove everything between MARK_BEGIN and MARK_END (inclusive), supporting
+/// Remove everything between `MARK_BEGIN` and `MARK_END` (inclusive), supporting
 /// multiple blocks (defensive against hand-pasted duplicates).
 fn strip_block(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
+    let mut pending = String::new();
     let mut in_block = false;
     for line in input.lines() {
         let t = line.trim();
         if !in_block && t == MARK_BEGIN {
             in_block = true;
+            pending.push_str(line);
+            pending.push('\n');
             continue;
         }
         if in_block {
+            pending.push_str(line);
+            pending.push('\n');
             if t == MARK_END {
                 in_block = false;
+                pending.clear();
             }
             continue;
         }
         out.push_str(line);
         out.push('\n');
+    }
+    // An unmatched begin marker may be user-authored text or a truncated file.
+    // Never interpret it as permission to discard the remainder of the rc file.
+    if in_block {
+        out.push_str(&pending);
     }
     if !input.ends_with('\n') && out.ends_with('\n') {
         out.pop();
@@ -485,12 +537,42 @@ fn strip_block(input: &str) -> String {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("hood-tmp");
-    let mut f = fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.flush()?;
-    drop(f);
-    fs::rename(&tmp, path)?;
+    // Preserve dotfile-manager symlinks by replacing their target, not the
+    // symlink itself. Canonicalization also makes the destination directory
+    // unambiguous before the temporary file is created.
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
+            .with_context(|| format!("resolve shell config symlink {}", path.display()))?,
+        Ok(_) => path.to_path_buf(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+    };
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let permissions = fs::metadata(&destination)
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    // tempfile uses an unpredictable create-new name, closing the predictable
+    // `<rc>.hood-tmp` symlink-clobber race. Persist is an atomic rename within
+    // the destination directory.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".hood-rc-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary file in {}", parent.display()))?;
+    tmp.write_all(bytes)
+        .context("write temporary shell config")?;
+    tmp.flush().context("flush temporary shell config")?;
+    tmp.as_file()
+        .sync_all()
+        .context("sync temporary shell config")?;
+    if let Some(permissions) = permissions {
+        tmp.as_file()
+            .set_permissions(permissions)
+            .context("preserve shell config permissions")?;
+    }
+    tmp.persist(&destination)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replace {}", destination.display()))?;
     Ok(())
 }
 
@@ -498,10 +580,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn tool_from_argv0_matches_basename() {
         assert_eq!(tool_from_argv0("npm"), Some(Tool::Npm));
+        assert_eq!(tool_from_argv0("npx"), Some(Tool::Npx));
+        assert_eq!(tool_from_argv0("pip3"), Some(Tool::Pip3));
+        assert_eq!(tool_from_argv0("uvx"), Some(Tool::Uvx));
+        assert_eq!(tool_from_argv0("pdm"), Some(Tool::Pdm));
         assert_eq!(tool_from_argv0("/usr/local/bin/cargo"), Some(Tool::Cargo));
         assert_eq!(tool_from_argv0("./brew"), Some(Tool::Brew));
         assert_eq!(tool_from_argv0("npm.exe"), Some(Tool::Npm));
@@ -528,12 +616,14 @@ mod tests {
 
     #[test]
     fn strip_block_removes_multiple_marked_sections() {
-        let input = format!(
-            "a\n{begin}\nx\n{end}\nb\n{begin}\ny\n{end}\nc\n",
-            begin = MARK_BEGIN,
-            end = MARK_END
-        );
+        let input = format!("a\n{MARK_BEGIN}\nx\n{MARK_END}\nb\n{MARK_BEGIN}\ny\n{MARK_END}\nc\n");
         assert_eq!(strip_block(&input), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn strip_block_preserves_unterminated_marker_and_trailing_content() {
+        let input = format!("before\n{MARK_BEGIN}\nuser data\n");
+        assert_eq!(strip_block(&input), input);
     }
 
     #[test]
@@ -676,7 +766,6 @@ mod tests {
     fn fake_hood_binary(dir: &Path) -> PathBuf {
         let p = dir.join("hood");
         fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
@@ -685,51 +774,19 @@ mod tests {
     fn fake_tool_binary(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
         fs::write(&p, b"#!/bin/sh\nexit 0\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
 
-    /// Hold an env var override that is restored when dropped. Tests must
-    /// avoid leaking PATH/HOME mutations into other tests in the same
-    /// process; using #[serial] would be cleaner but adds a dep — instead
-    /// we scope each env mutation to a single test.
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            let original = std::env::var_os(key);
-            // SAFETY: tests in this module run serially via the mutex below.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: same as above.
-            unsafe {
-                match self.original.take() {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[cfg(unix)]
     #[test]
     fn install_creates_symlinks_for_tools_on_path() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         // Stage a fake PATH containing only a `cargo` binary, then run install.
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fake_tool_binary(&bin, "cargo");
 
-        let path_guard = EnvGuard::set("PATH", bin.as_os_str());
         let hood = fake_hood_binary(tmp.path());
 
         let home = tmp.path().join("home");
@@ -737,7 +794,7 @@ mod tests {
         fs::write(home.join(".zshrc"), "echo hi\n").unwrap();
         let layout = Layout::at_home(&home);
 
-        let report = install_at(&layout, &hood, false, "linux").unwrap();
+        let report = install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
         assert!(report.installed.contains(&"cargo"));
         assert!(report.skipped.contains(&"npm")); // not on staged PATH
         assert!(report.touched_files.iter().any(|p| p.ends_with(".zshrc")));
@@ -752,25 +809,22 @@ mod tests {
         let zshrc = fs::read_to_string(home.join(".zshrc")).unwrap();
         assert!(zshrc.contains(MARK_BEGIN));
         assert!(zshrc.contains(layout.shim_dir.to_str().unwrap()));
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
     #[test]
     fn install_omits_platform_inappropriate_tools() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         // Empty PATH: nothing is present, so the skipped list is purely the set
         // of tools plausible for the OS we pass.
-        let path_guard = EnvGuard::set("PATH", std::ffi::OsStr::new(""));
+        let empty_path = std::ffi::OsStr::new("");
         let hood = fake_hood_binary(tmp.path());
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let layout = Layout::at_home(&home);
 
         // On macOS, Linux/BSD system managers are not candidates at all.
-        let mac = install_at(&layout, &hood, false, "macos").unwrap();
+        let mac = install_at_with_path(&layout, &hood, false, "macos", empty_path).unwrap();
         for absent in ["pacman", "yay", "makepkg", "dnf", "rpm", "apk", "pkg"] {
             assert!(
                 !mac.skipped.contains(&absent),
@@ -782,7 +836,7 @@ mod tests {
 
         // On Linux the Arch/RPM/Alpine managers are candidates; FreeBSD's pkg
         // is not.
-        let linux = install_at(&layout, &hood, false, "linux").unwrap();
+        let linux = install_at_with_path(&layout, &hood, false, "linux", empty_path).unwrap();
         for present in ["pacman", "dnf", "rpm", "apk", "brew"] {
             assert!(
                 linux.skipped.contains(&present),
@@ -790,8 +844,6 @@ mod tests {
             );
         }
         assert!(!linux.skipped.contains(&"pkg"), "pkg is BSD-only");
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
@@ -799,37 +851,31 @@ mod tests {
     fn install_shims_present_tool_even_when_implausible() {
         // "if they exist" wins over platform plausibility: a binary actually on
         // PATH gets shimmed regardless of the OS gate.
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fake_tool_binary(&bin, "pacman");
 
-        let path_guard = EnvGuard::set("PATH", bin.as_os_str());
         let hood = fake_hood_binary(tmp.path());
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let layout = Layout::at_home(&home);
 
         // pacman is implausible on macOS, but it's present, so it's installed.
-        let report = install_at(&layout, &hood, false, "macos").unwrap();
+        let report = install_at_with_path(&layout, &hood, false, "macos", bin.as_os_str()).unwrap();
         assert!(report.installed.contains(&"pacman"));
         assert!(!report.skipped.contains(&"pacman"));
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
     #[test]
     fn install_then_uninstall_round_trip() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fake_tool_binary(&bin, "go");
         fake_tool_binary(&bin, "curl");
 
-        let path_guard = EnvGuard::set("PATH", bin.as_os_str());
         let hood = fake_hood_binary(tmp.path());
 
         let home = tmp.path().join("home");
@@ -839,8 +885,8 @@ mod tests {
         let layout = Layout::at_home(&home);
 
         // Install twice — second call should be idempotent.
-        install_at(&layout, &hood, false, "linux").unwrap();
-        install_at(&layout, &hood, false, "linux").unwrap();
+        install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
+        install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
         let after_install = fs::read_to_string(&zshrc).unwrap();
         assert_eq!(after_install.matches(MARK_BEGIN).count(), 1);
         assert!(layout.shim_dir.join("go").exists());
@@ -854,16 +900,13 @@ mod tests {
 
         let report2 = uninstall_at(&layout).unwrap();
         assert_eq!(report2.removed_shims, 0);
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
     #[test]
     fn install_writes_fish_block_when_fish_dir_exists() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let path_guard = EnvGuard::set("PATH", std::ffi::OsStr::new(""));
+        let empty_path = std::ffi::OsStr::new("");
         let hood = fake_hood_binary(tmp.path());
 
         let home = tmp.path().join("home");
@@ -871,25 +914,21 @@ mod tests {
         fs::create_dir_all(&fish_dir).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at(&layout, &hood, false, "linux").unwrap();
+        install_at_with_path(&layout, &hood, false, "linux", empty_path).unwrap();
         let fish_cfg = fish_dir.join("config.fish");
         let content = fs::read_to_string(&fish_cfg).unwrap();
         assert!(content.contains("fish_add_path"));
         assert!(content.contains(layout.shim_dir.to_str().unwrap()));
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
     #[test]
     fn install_with_force_replaces_existing_symlink() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).unwrap();
         fake_tool_binary(&bin, "npm");
 
-        let path_guard = EnvGuard::set("PATH", bin.as_os_str());
         let hood1 = fake_hood_binary(tmp.path());
         let hood2 = {
             let p = tmp.path().join("hood2");
@@ -901,21 +940,18 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at(&layout, &hood1, false, "linux").unwrap();
+        install_at_with_path(&layout, &hood1, false, "linux", bin.as_os_str()).unwrap();
         let target1 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target1, hood1);
 
-        install_at(&layout, &hood2, true, "linux").unwrap();
+        install_at_with_path(&layout, &hood2, true, "linux", bin.as_os_str()).unwrap();
         let target2 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target2, hood2);
-
-        drop(path_guard);
     }
 
     #[cfg(unix)]
     #[test]
     fn uninstall_leaves_unrelated_files_alone() {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::at_home(tmp.path());
         fs::create_dir_all(&layout.shim_dir).unwrap();

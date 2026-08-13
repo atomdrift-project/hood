@@ -10,6 +10,7 @@
 //! Output only colorizes when stderr is a real terminal — when redirected to a
 //! file, we collapse to a single structured line that's grep-friendly.
 
+use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 
 use scan::engine::TopFinding;
@@ -66,12 +67,63 @@ impl Palette {
 
 /// Disposition the panel describes. Drives the header word and the action
 /// hint at the bottom.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
     /// Verdict was Block; the body was withheld from the caller.
     Blocked,
-    /// Verdict was non-benign but policy let it through (HOOD_BYPASS active).
+    /// Verdict was non-benign but policy let it through (`HOOD_BYPASS` active).
     Forwarded,
+}
+
+/// Emit the compact successful-scan record requested by verbose mode.
+///
+/// The score is the model's raw malice probability, not a calibrated posterior;
+/// call it a model risk score to avoid overstating what it means.
+pub fn emit_pass(url: &str, probability: f32) {
+    let risk = probability.clamp(0.0, 1.0) * 100.0;
+    let artifact = artifact_label(url);
+    let mut stderr = std::io::stderr().lock();
+    drop(writeln!(
+        stderr,
+        "✅ Atomdrift Hood scan passed — {risk:.1}% risk score — {artifact}",
+    ));
+}
+
+/// Emit one aggregate line when a verbose invocation scanned multiple downloads.
+pub fn emit_scan_summary(summary: crate::scanner::ScanSummary) {
+    let Some(line) = format_scan_summary(summary) else {
+        return;
+    };
+    let mut stderr = std::io::stderr().lock();
+    drop(writeln!(stderr, "{line}"));
+}
+
+fn format_scan_summary(summary: crate::scanner::ScanSummary) -> Option<String> {
+    if summary.total() <= 1 {
+        return None;
+    }
+    let suspicious = summary.suspicious_blocked + summary.suspicious_forwarded;
+    let hostile = summary.hostile_blocked + summary.hostile_forwarded;
+    let errors = summary.errors_blocked + summary.errors_forwarded;
+    let marker = if summary.blocked() > 0 || hostile > 0 {
+        "🛑"
+    } else if suspicious > 0 || errors > 0 {
+        "⚠️"
+    } else {
+        "✅"
+    };
+    let mut line = format!(
+        "{marker} Atomdrift Hood scanned {} downloads — {} passed, {suspicious} suspicious, {hostile} high risk",
+        summary.total(),
+        summary.passed,
+    );
+    if errors > 0 {
+        let _ = write!(line, ", {errors} scan errors");
+    }
+    if summary.blocked() > 0 {
+        let _ = write!(line, " — {} blocked", summary.blocked());
+    }
+    Some(line)
 }
 
 /// Bundle of everything the panel needs to render. Pulled out of the scan
@@ -87,7 +139,7 @@ pub struct Panel<'a> {
     pub disposition: Disposition,
     /// Effective policy in force, used to choose the bypass hint.
     pub policy: ScanPolicy,
-    /// Raw model probability in `[0, 1]`. Drives the indicator length.
+    /// Raw model probability in `[0, 1]`. Displayed as the risk score.
     pub probability: f32,
     /// URL the tool was about to fetch.
     pub url: &'a str,
@@ -127,8 +179,6 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
         Disposition::Blocked => "BLOCKED",
         Disposition::Forwarded => "FORWARDED",
     };
-    let verdict_label = classification_label(p.classification);
-
     writeln!(w)?;
     writeln!(
         w,
@@ -137,24 +187,18 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
         fg_bold(verdict_color, header_word),
         fg(c.chrome, &"─".repeat(64)),
     )?;
-    writeln!(
-        w,
-        "  {}  {}  {}",
-        confidence_blocks(p.probability, verdict_color, c.dim),
-        fg_bold(verdict_color, verdict_label),
-        fg(c.dim, &format!("{:>3}%", percent(p.probability))),
-    )?;
+    writeln!(w, "  {}", fg_bold(verdict_color, &friendly_status(p)))?;
     writeln!(w, "  {}", fg_bold(c.text, sanitize(p.url).as_ref()))?;
 
-    if let Some(orig) = p.original {
-        if orig != p.classification {
-            writeln!(
-                w,
-                "  {} {}",
-                fg(c.dim, "upgraded from"),
-                fg(c.dim, classification_label(orig)),
-            )?;
-        }
+    if let Some(orig) = p.original
+        && orig != p.classification
+    {
+        writeln!(
+            w,
+            "  {} {}",
+            fg(c.dim, "upgraded from"),
+            fg(c.dim, classification_label(orig)),
+        )?;
     }
 
     if !p.traits.is_empty() {
@@ -207,7 +251,7 @@ fn write_bypass_hint<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io:
     }
 }
 
-/// Render one "label: HOOD_BYPASS=N <command>" line. If no command was
+/// Render one "label: `HOOD_BYPASS=N` <command>" line. If no command was
 /// supplied (e.g. unit tests), fall back to a descriptive parenthetical.
 fn write_command_hint<W: Write>(
     w: &mut W,
@@ -240,7 +284,8 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
     let reasons: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
     writeln!(
         w,
-        "hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]{}",
+        "{}; hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]{}",
+        friendly_status(p),
         header,
         sanitize(p.url),
         classification_label(p.classification),
@@ -255,7 +300,49 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
     )
 }
 
-/// Context for a scan-error panel: the scanner couldn't reach a verdict on
+fn friendly_status(p: &Panel<'_>) -> String {
+    let risk = p.probability.clamp(0.0, 1.0) * 100.0;
+    match (p.classification, p.disposition) {
+        (Classification::Suspicious, Disposition::Blocked) => format!(
+            "⚠️ Atomdrift Hood flagged this download as suspicious — {risk:.1}% risk score — BLOCKED"
+        ),
+        (Classification::Suspicious, Disposition::Forwarded) => format!(
+            "⚠️ Atomdrift Hood flagged this download as suspicious — {risk:.1}% risk score — allowed by policy"
+        ),
+        (Classification::Hostile, Disposition::Blocked) => {
+            format!("🛑 Atomdrift Hood blocked a high-risk download — {risk:.1}% risk score")
+        }
+        (Classification::Hostile, Disposition::Forwarded) => format!(
+            "🛑 Atomdrift Hood flagged a high-risk download — {risk:.1}% risk score — allowed by policy"
+        ),
+        _ => format!("Atomdrift Hood scan result — {risk:.1}% risk score"),
+    }
+}
+
+fn artifact_label(raw_url: &str) -> String {
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return "download".to_owned();
+    };
+    let encoded = url
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|part| !part.is_empty()));
+    let label = encoded
+        .map(|part| percent_encoding::percent_decode_str(part).decode_utf8_lossy())
+        .or_else(|| url.host_str().map(std::borrow::Cow::Borrowed))
+        .unwrap_or(std::borrow::Cow::Borrowed("download"));
+    let clean = sanitize(&label);
+    let mut chars = clean.chars();
+    let short: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+/// Context for a scan-error panel.
+///
+/// The scanner couldn't reach a verdict on
 /// *this specific payload* (trait load failed, cleave crashed, etc.). Separate
 /// from `Panel` because we have no classification, no probability, no traits.
 #[derive(Debug)]
@@ -351,7 +438,9 @@ fn write_scan_error_pretty<W: Write>(
 /// known-bad block.
 const LAB_FILE_URL: &str = "https://lab.atomdrift.org/file/";
 
-/// Context for a known-bad panel: the payload matched the known-bad bloom
+/// Context for a known-bad panel.
+///
+/// The payload matched the known-bad bloom
 /// filter (by content hash or PURL) and was blocked without an ML scan. Distinct
 /// from [`Panel`] because there is no classification, probability, or trait
 /// evidence — the verdict is the match itself.
@@ -491,8 +580,8 @@ pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
             stderr,
             "hood unscanned policy={} reason={} invocation={}",
             policy_tag(policy),
-            reason,
-            invocation,
+            sanitize(reason),
+            sanitize(invocation),
         ));
     }
 }
@@ -516,10 +605,15 @@ fn write_failsafe_pretty<W: Write>(
         w,
         "  {} {}",
         fg(c.dim, "proxy unavailable:"),
-        fg(c.text, reason),
+        fg(c.text, sanitize(reason).as_ref()),
     )?;
     if !invocation.is_empty() {
-        writeln!(w, "  {} {}", fg(c.dim, "running:"), fg(c.text, invocation))?;
+        writeln!(
+            w,
+            "  {} {}",
+            fg(c.dim, "running:"),
+            fg(c.text, sanitize(invocation).as_ref()),
+        )?;
     }
     writeln!(
         w,
@@ -561,12 +655,14 @@ const fn classification_label(c: Classification) -> &'static str {
 ///
 /// The fill count tracks probability, the color tracks the classification —
 /// same idiom atomscan uses, expanded from two cells to five for a finer read.
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
     const CELLS: usize = 5;
+    const CELLS_F32: f32 = 5.0;
     // probability is clamped to [0, 1] and CELLS is 5, so the rounded product
     // fits in usize on every platform — no truncation or sign loss possible.
-    let filled = (probability.clamp(0.0, 1.0) * CELLS as f32).round() as usize;
+    let filled = (probability.clamp(0.0, 1.0) * CELLS_F32).round() as usize;
     let filled = filled.min(CELLS);
     let empty = CELLS - filled;
     let mut s = String::with_capacity(64);
@@ -577,11 +673,6 @@ fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
         s.push_str(&fg(dim, "▱"));
     }
     s
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn percent(p: f32) -> u32 {
-    (p.clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
 /// Neutralize control characters in an attacker-influenced string before it is
@@ -693,6 +784,63 @@ mod tests {
         assert!(s.contains("https://example.com/foo.sh"));
         assert!(s.contains("exec/shell::bash"));
         assert!(s.contains("crit_count:suspicious"));
+        assert!(s.contains("Atomdrift Hood blocked a high-risk download"));
+    }
+
+    #[test]
+    fn friendly_status_distinguishes_suspicious_policy_action() {
+        let blocked = panel(
+            &[],
+            &[],
+            Classification::Suspicious,
+            Disposition::Blocked,
+            ScanPolicy::Strict,
+        );
+        assert_eq!(
+            friendly_status(&blocked),
+            "⚠️ Atomdrift Hood flagged this download as suspicious — 70.0% risk score — BLOCKED"
+        );
+
+        let forwarded = panel(
+            &[],
+            &[],
+            Classification::Suspicious,
+            Disposition::Forwarded,
+            ScanPolicy::AllowSuspicious,
+        );
+        assert!(friendly_status(&forwarded).contains("allowed by policy"));
+    }
+
+    #[test]
+    fn artifact_label_is_short_and_drops_secret_query() {
+        assert_eq!(
+            artifact_label("https://registry.example/pkg%20name.tgz?token=secret"),
+            "pkg name.tgz"
+        );
+    }
+
+    #[test]
+    fn multi_download_summary_reports_outcomes_and_blocks() {
+        let summary = crate::scanner::ScanSummary {
+            passed: 8,
+            suspicious_blocked: 1,
+            suspicious_forwarded: 1,
+            hostile_blocked: 1,
+            ..crate::scanner::ScanSummary::default()
+        };
+        assert_eq!(
+            format_scan_summary(summary).as_deref(),
+            Some(
+                "🛑 Atomdrift Hood scanned 11 downloads — 8 passed, 2 suspicious, 1 high risk — 2 blocked"
+            )
+        );
+        assert!(
+            format_scan_summary(crate::scanner::ScanSummary {
+                passed: 1,
+                ..crate::scanner::ScanSummary::default()
+            })
+            .is_none()
+        );
     }
 
     #[test]

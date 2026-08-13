@@ -2,7 +2,7 @@
 //!
 //! Each [`Tool`] knows three things:
 //!
-//! 1. Its default binary name (and on `Tool::Exec`, takes one from the caller).
+//! 1. Its binary name.
 //! 2. Which env vars to set in the child so it routes traffic through hood
 //!    *and* trusts hood's ephemeral CA.
 //! 3. Which subcommands warrant interception. `go run` / `npm test` /
@@ -14,8 +14,9 @@
 //! to a tempfile under the OS temp dir, runs the command, and cleans up on
 //! exit (success or panic).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -98,48 +99,44 @@ pub enum Tool {
     Pkg,
     /// `apk <args...>` — Alpine. apk-tools' libfetch honors `SSL_CA_CERT_FILE`.
     Apk,
-    /// `exec -- <cmd...>` — open-ended: sets every known env var.
-    Exec,
 }
 
 impl Tool {
     /// Binary to invoke on the host, before any user-supplied first arg.
     #[must_use]
-    pub const fn default_binary(self) -> Option<&'static str> {
+    pub const fn default_binary(self) -> &'static str {
         match self {
-            Self::Curl => Some("curl"),
-            Self::Wget => Some("wget"),
-            Self::Npm => Some("npm"),
-            Self::Npx => Some("npx"),
-            Self::Pnpm => Some("pnpm"),
-            Self::Pnpx => Some("pnpx"),
-            Self::Yarn => Some("yarn"),
-            Self::Rush => Some("rush"),
-            Self::Rushx => Some("rushx"),
-            Self::Bun => Some("bun"),
-            Self::Bunx => Some("bunx"),
-            Self::Pip => Some("pip"),
-            Self::Pip3 => Some("pip3"),
-            Self::Pipx => Some("pipx"),
-            Self::Uv => Some("uv"),
-            Self::Uvx => Some("uvx"),
-            Self::Poetry => Some("poetry"),
-            Self::Pdm => Some("pdm"),
-            Self::Go => Some("go"),
-            Self::Cargo => Some("cargo"),
-            Self::Brew => Some("brew"),
-            Self::Pacman => Some("pacman"),
-            Self::Yay => Some("yay"),
-            Self::Paru => Some("paru"),
-            Self::Makepkg => Some("makepkg"),
-            Self::Dnf => Some("dnf"),
-            Self::Yum => Some("yum"),
-            Self::Zypper => Some("zypper"),
-            Self::Rpm => Some("rpm"),
-            Self::Pkg => Some("pkg"),
-            Self::Apk => Some("apk"),
-            // exec uses argv[0] supplied by the user.
-            Self::Exec => None,
+            Self::Curl => "curl",
+            Self::Wget => "wget",
+            Self::Npm => "npm",
+            Self::Npx => "npx",
+            Self::Pnpm => "pnpm",
+            Self::Pnpx => "pnpx",
+            Self::Yarn => "yarn",
+            Self::Rush => "rush",
+            Self::Rushx => "rushx",
+            Self::Bun => "bun",
+            Self::Bunx => "bunx",
+            Self::Pip => "pip",
+            Self::Pip3 => "pip3",
+            Self::Pipx => "pipx",
+            Self::Uv => "uv",
+            Self::Uvx => "uvx",
+            Self::Poetry => "poetry",
+            Self::Pdm => "pdm",
+            Self::Go => "go",
+            Self::Cargo => "cargo",
+            Self::Brew => "brew",
+            Self::Pacman => "pacman",
+            Self::Yay => "yay",
+            Self::Paru => "paru",
+            Self::Makepkg => "makepkg",
+            Self::Dnf => "dnf",
+            Self::Yum => "yum",
+            Self::Zypper => "zypper",
+            Self::Rpm => "rpm",
+            Self::Pkg => "pkg",
+            Self::Apk => "apk",
         }
     }
 
@@ -179,7 +176,6 @@ impl Tool {
             Self::Rpm => "rpm",
             Self::Pkg => "pkg",
             Self::Apk => "apk",
-            Self::Exec => "exec",
         }
     }
 
@@ -214,8 +210,7 @@ impl Tool {
             | Self::Poetry
             | Self::Pdm
             | Self::Go
-            | Self::Cargo
-            | Self::Exec => true,
+            | Self::Cargo => true,
             // Homebrew targets macOS and Linux (Linuxbrew).
             Self::Brew => matches!(os, "macos" | "linux"),
             // Arch (pacman/AUR), RPM (dnf/yum/zypper/rpm), and Alpine (apk) system
@@ -234,7 +229,7 @@ impl Tool {
         }
     }
 
-    /// Tools eligible for shell-shim installation (everything except `Exec`).
+    /// Tools eligible for shell-shim installation.
     pub const SHIMMABLE: &'static [Self] = &[
         Self::Curl,
         Self::Wget,
@@ -270,6 +265,109 @@ impl Tool {
     ];
 }
 
+impl std::fmt::Display for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A validated path supplied to `hood exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutablePath(PathBuf);
+
+impl ExecutablePath {
+    /// Borrow the executable path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl TryFrom<PathBuf> for ExecutablePath {
+    type Error = anyhow::Error;
+
+    fn try_from(path: PathBuf) -> Result<Self> {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("hood exec requires a non-empty command");
+        }
+        Ok(Self(path))
+    }
+}
+
+impl AsRef<Path> for ExecutablePath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl std::fmt::Display for ExecutablePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
+/// A process Hood can launch.
+///
+/// Known tools resolve through `PATH`; arbitrary commands carry the path from
+/// `hood exec`. This cannot represent a missing command or attach an override
+/// to a known tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Program {
+    /// A package manager or downloader known to Hood.
+    Tool(Tool),
+    /// An arbitrary command supplied to `hood exec`.
+    Command(ExecutablePath),
+}
+
+impl Program {
+    /// Construct an arbitrary command target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` is empty.
+    pub fn command(path: impl Into<PathBuf>) -> Result<Self> {
+        ExecutablePath::try_from(path.into()).map(Self::Command)
+    }
+
+    /// Return the known tool, if this is not an arbitrary command.
+    #[must_use]
+    pub const fn tool(&self) -> Option<Tool> {
+        match self {
+            Self::Tool(tool) => Some(*tool),
+            Self::Command(_) => None,
+        }
+    }
+
+    const fn trust_profile(&self) -> TrustProfile {
+        match self {
+            Self::Tool(tool) => tool.trust_profile(),
+            Self::Command(_) => TrustProfile::Exec,
+        }
+    }
+
+    fn resolve<'a>(&'a self, shim_dir: Option<&Path>) -> Result<Cow<'a, Path>> {
+        match self {
+            Self::Tool(tool) => {
+                let name = tool.default_binary();
+                resolve_real_binary(name, shim_dir)
+                    .map(Cow::Owned)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no real `{name}` found on PATH (only the hood shim); refusing to re-exec the shim",
+                        )
+                    })
+            }
+            Self::Command(path) => Ok(Cow::Borrowed(path.as_path())),
+        }
+    }
+}
+
+impl From<Tool> for Program {
+    fn from(tool: Tool) -> Self {
+        Self::Tool(tool)
+    }
+}
+
 /// Decision on whether to route a tool invocation through hood's proxy.
 #[derive(Debug)]
 pub enum Dispatch {
@@ -290,8 +388,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
     // startup and preserve their original argv exactly.
     if matches!(
         tool,
-        Tool::Exec
-            | Tool::Curl
+        Tool::Curl
             | Tool::Wget
             | Tool::Npx
             | Tool::Pnpx
@@ -381,8 +478,7 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
         | Tool::Rush
         | Tool::Rushx
         | Tool::Bunx
-        | Tool::Uvx
-        | Tool::Exec => true, // handled before this fn
+        | Tool::Uvx => true, // handled before this fn
 
         Tool::Npm | Tool::Pnpm | Tool::Yarn => matches!(
             sub,
@@ -658,7 +754,6 @@ impl Tool {
             | Self::Pkg
             | Self::Apk => TrustProfile::SystemCurl,
             Self::Yay => TrustProfile::Yay,
-            Self::Exec => TrustProfile::Exec,
         }
     }
 }
@@ -667,17 +762,46 @@ impl Tool {
 #[derive(Debug)]
 pub struct ChildEnv {
     /// Proxy listen address as `http://host:port`.
-    pub proxy_url: String,
+    proxy_url: String,
     /// Path the child process can pass to its TLS verifier.
-    pub ca_pem_path: PathBuf,
+    ca_pem_path: PathBuf,
     /// macOS Go module/sumdb bridge settings, when enabled for this run.
-    pub go: Option<GoChildEnv>,
+    go: Option<GoChildEnv>,
+}
+
+/// Child environment coupled to the temporary CA file it references.
+///
+/// Keeping both values under one owner prevents the CA file from being
+/// deleted while a child still depends on it.
+#[derive(Debug)]
+pub struct PreparedChildEnv {
+    env: ChildEnv,
+    _ca_dir: TempDir,
+}
+
+impl PreparedChildEnv {
+    /// Add macOS Go bridge settings to the environment.
+    pub fn set_go_bridge(&mut self, go: GoChildEnv) {
+        self.env.go = Some(go);
+    }
+
+    const fn env(&self) -> &ChildEnv {
+        &self.env
+    }
 }
 
 impl ChildEnv {
     /// Build the env-var overlay for a given tool.
     #[must_use]
     pub fn vars_for(&self, tool: Tool) -> BTreeMap<&'static str, OsString> {
+        self.vars_for_profile(tool.trust_profile())
+    }
+
+    fn vars_for_program(&self, program: &Program) -> BTreeMap<&'static str, OsString> {
+        self.vars_for_profile(program.trust_profile())
+    }
+
+    fn vars_for_profile(&self, profile: TrustProfile) -> BTreeMap<&'static str, OsString> {
         let mut out = BTreeMap::new();
         let proxy = OsString::from(&self.proxy_url);
         let ca = OsString::from(&self.ca_pem_path);
@@ -705,7 +829,7 @@ impl ChildEnv {
             out.insert(k, OsString::new());
         }
 
-        match tool.trust_profile() {
+        match profile {
             TrustProfile::Curl => {
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
@@ -816,11 +940,12 @@ impl ChildEnv {
     }
 }
 
-/// Build a `ChildEnv` from a proxy address + CA pem written to a tempdir.
+/// Build a child environment whose owner keeps its temporary CA file alive.
 ///
-/// The returned [`TempDir`] must outlive the child process — drop it after the
-/// child exits to remove the PEM file.
-pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<(ChildEnv, TempDir)> {
+/// # Errors
+///
+/// Returns an error if the CA file cannot be created, secured, or written.
+pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<PreparedChildEnv> {
     let dir = tempfile::Builder::new()
         .prefix("hood-ca-")
         .tempdir()
@@ -833,35 +958,55 @@ pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<(ChildE
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = f.metadata().context("stat CA pem")?.permissions();
-        perms.set_mode(0o644);
+        perms.set_mode(0o600);
         std::fs::set_permissions(&pem_path, perms).context("chmod CA pem")?;
     }
     drop(f);
 
     let proxy_url = format!("http://{proxy_addr}");
-    Ok((
-        ChildEnv {
+    Ok(PreparedChildEnv {
+        env: ChildEnv {
             proxy_url,
             ca_pem_path: pem_path,
             go: None,
         },
-        dir,
-    ))
+        _ca_dir: dir,
+    })
 }
 
 /// Resolve the real binary for `tool`, skipping any directory matching
 /// `skip_dir` during PATH search. This prevents the `hood`-installed PATH shim
 /// from being invoked recursively.
+#[must_use]
 pub fn resolve_real_binary(name: &str, skip_dir: Option<&Path>) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for entry in std::env::split_paths(&path) {
-        if let Some(skip) = skip_dir {
-            if entry == skip {
-                continue;
-            }
+    let search_path = std::env::var_os("PATH")?;
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    resolve_binary_in_path(name, &search_path, skip_dir, current_exe.as_deref())
+}
+
+fn resolve_binary_in_path(
+    name: &str,
+    search_path: &OsStr,
+    skip_dir: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Option<PathBuf> {
+    let canonical_skip = skip_dir.and_then(|path| path.canonicalize().ok());
+    for entry in std::env::split_paths(search_path) {
+        if let Some(skip) = skip_dir
+            && (entry == skip
+                || canonical_skip
+                    .as_ref()
+                    .is_some_and(|canonical| entry.canonicalize().ok().as_ref() == Some(canonical)))
+        {
+            continue;
         }
         let candidate = entry.join(name);
-        if is_executable(&candidate) {
+        if is_executable(&candidate)
+            && current_exe
+                .is_none_or(|current| candidate.canonicalize().ok().as_deref() != Some(current))
+        {
             return Some(candidate);
         }
     }
@@ -882,84 +1027,58 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Spawn the child with the chosen tool's env overlay, wait for it, and return
-/// the exit code (or `1` if it was terminated by a signal).
+/// Spawn a child with Hood's environment, then return its exit code.
 ///
-/// `bin_override` lets `Tool::Exec` supply argv[0]. For named tools, pass
-/// `None`. `shim_dir`, when supplied, is excluded from PATH search so the
-/// installed `~/.hood/bin/<tool>` shim doesn't re-enter hood.
+/// `shim_dir`, when supplied, is excluded from `PATH` resolution so an
+/// installed Hood shim cannot recursively invoke itself.
+///
+/// # Errors
+///
+/// Returns an error if the real program cannot be found, spawned, or awaited.
 pub async fn run_child(
-    tool: Tool,
-    bin_override: Option<&Path>,
+    program: &Program,
     args: Vec<OsString>,
-    env: &ChildEnv,
+    env: &PreparedChildEnv,
     shim_dir: Option<&Path>,
 ) -> Result<i32> {
-    let bin: PathBuf = match (bin_override, tool.default_binary()) {
-        (Some(p), _) => p.to_path_buf(),
-        (None, Some(name)) => resolve_real_binary(name, shim_dir).ok_or_else(|| {
-            // Falling back to a bare name would re-resolve through the child's
-            // PATH — which still contains the shim dir — and re-exec the hood
-            // shim endlessly. Fail instead.
-            anyhow::anyhow!(
-                "no real `{name}` found on PATH (only the hood shim); refusing to re-exec the shim",
-            )
-        })?,
-        (None, None) => {
-            return Err(anyhow::anyhow!(
-                "hood exec requires a command to run (use `hood exec -- <cmd> [args]`)",
-            ));
-        }
-    };
-
-    let mut cmd = Command::new(&bin);
-    cmd.args(&args);
-    for (k, v) in env.vars_for(tool) {
-        cmd.env(k, v);
-    }
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = cmd
-        .spawn()
-        .with_context(|| format!("spawn {}", bin.display()))?
-        .wait()
-        .await
-        .with_context(|| format!("wait {}", bin.display()))?;
-
-    Ok(status.code().unwrap_or(1))
+    execute(program, args, Some(env.env()), shim_dir).await
 }
 
 /// Pass through to the real binary without setting up the proxy. Used when
 /// [`dispatch`] decides the subcommand doesn't fetch network content.
+///
+/// # Errors
+///
+/// Returns an error if the real program cannot be found, spawned, or awaited.
 pub async fn run_passthrough(
-    tool: Tool,
-    bin_override: Option<&Path>,
+    program: &Program,
     args: Vec<OsString>,
     shim_dir: Option<&Path>,
 ) -> Result<i32> {
-    let bin: PathBuf = match (bin_override, tool.default_binary()) {
-        (Some(p), _) => p.to_path_buf(),
-        (None, Some(name)) => resolve_real_binary(name, shim_dir).ok_or_else(|| {
-            // See run_child: a bare-name fallback re-execs the shim endlessly.
-            anyhow::anyhow!(
-                "no real `{name}` found on PATH (only the hood shim); refusing to re-exec the shim",
-            )
-        })?,
-        (None, None) => return Err(anyhow::anyhow!("missing binary for passthrough")),
-    };
+    execute(program, args, None, shim_dir).await
+}
 
-    let status = Command::new(&bin)
-        .args(&args)
+async fn execute(
+    program: &Program,
+    args: Vec<OsString>,
+    env: Option<&ChildEnv>,
+    shim_dir: Option<&Path>,
+) -> Result<i32> {
+    let binary = program.resolve(shim_dir)?;
+    let mut command = Command::new(&*binary);
+    command.args(args);
+    if let Some(env) = env {
+        command.envs(env.vars_for_program(program));
+    }
+    let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("spawn {}", bin.display()))?
+        .with_context(|| format!("spawn {}", binary.display()))?
         .wait()
         .await
-        .with_context(|| format!("wait {}", bin.display()))?;
+        .with_context(|| format!("wait {}", binary.display()))?;
 
     Ok(status.code().unwrap_or(1))
 }
@@ -996,6 +1115,31 @@ mod tests {
         let v = fake_env().vars_for(Tool::Npm);
         assert!(v.contains_key("NODE_EXTRA_CA_CERTS"));
         assert!(v.contains_key("npm_config_https_proxy"));
+    }
+
+    #[test]
+    fn command_aliases_share_their_ecosystem_trust_profile() {
+        let node = fake_env().vars_for(Tool::Npm);
+        for tool in [Tool::Npx, Tool::Pnpx, Tool::Rush, Tool::Rushx, Tool::Bunx] {
+            assert_eq!(fake_env().vars_for(tool), node, "{tool:?}");
+        }
+
+        assert_eq!(
+            fake_env().vars_for(Tool::Pip3),
+            fake_env().vars_for(Tool::Pip)
+        );
+        assert_eq!(
+            fake_env().vars_for(Tool::Uvx),
+            fake_env().vars_for(Tool::Uv)
+        );
+    }
+
+    #[test]
+    fn pdm_env_uses_documented_ca_bundle_overrides() {
+        let v = fake_env().vars_for(Tool::Pdm);
+        assert!(v.contains_key("REQUESTS_CA_BUNDLE"));
+        assert!(v.contains_key("CURL_CA_BUNDLE"));
+        assert!(v.contains_key("SSL_CERT_FILE"));
     }
 
     #[test]
@@ -1050,7 +1194,8 @@ mod tests {
 
     #[test]
     fn exec_env_is_superset() {
-        let v = fake_env().vars_for(Tool::Exec);
+        let program = Program::command("/tmp/example").unwrap();
+        let v = fake_env().vars_for_program(&program);
         for key in [
             "CURL_CA_BUNDLE",
             "SSL_CERT_FILE",
@@ -1136,6 +1281,40 @@ mod tests {
     }
 
     #[test]
+    fn executable_runners_and_rush_always_intercept_without_rewriting() {
+        for tool in [
+            Tool::Npx,
+            Tool::Pnpx,
+            Tool::Rush,
+            Tool::Rushx,
+            Tool::Bunx,
+            Tool::Uvx,
+        ] {
+            let args = vec![os("--flag"), os("package")];
+            assert_eq!(intercept_args(dispatch(tool, args.clone(), false)), args);
+        }
+    }
+
+    #[test]
+    fn pip3_matches_pip_dispatch() {
+        let install = vec![os("install"), os("example")];
+        assert_eq!(
+            intercept_args(dispatch(Tool::Pip3, install.clone(), false)),
+            install,
+        );
+        let _v = passthrough_args(dispatch(Tool::Pip3, vec![os("list")], false));
+    }
+
+    #[test]
+    fn pdm_fetching_commands_intercept_and_local_commands_pass_through() {
+        for command in ["add", "install", "update", "sync", "lock", "run", "self"] {
+            let _v = intercept_args(dispatch(Tool::Pdm, vec![os(command)], false));
+        }
+        let _v = passthrough_args(dispatch(Tool::Pdm, vec![os("info")], false));
+        let _v = passthrough_args(dispatch(Tool::Pdm, vec![os("config")], false));
+    }
+
+    #[test]
     fn brew_install_intercepted_brew_list_passthrough() {
         let _v = intercept_args(dispatch(Tool::Brew, vec![os("install"), os("jq")], false));
         let _v = passthrough_args(dispatch(Tool::Brew, vec![os("list")], false));
@@ -1191,11 +1370,6 @@ mod tests {
     fn bare_invocation_is_passthrough() {
         let _v = passthrough_args(dispatch(Tool::Npm, vec![], false));
         let _v = passthrough_args(dispatch(Tool::Cargo, vec![], false));
-    }
-
-    #[test]
-    fn exec_always_intercepted() {
-        let _v = intercept_args(dispatch(Tool::Exec, vec![os("any"), os("args")], false));
     }
 
     // ----- expanded env-var coverage --------------------------------------
@@ -1385,14 +1559,16 @@ mod tests {
         assert!(v.contains_key("SSL_CERT_FILE"));
         assert!(v.contains_key("CURL_CA_BUNDLE"));
         assert!(v.contains_key("SSL_CA_CERT_FILE"));
-        assert!(v
-            .get("GODEBUG")
-            .is_some_and(|g| g.to_string_lossy().contains("x509usefallbackroots=1")));
+        assert!(
+            v.get("GODEBUG")
+                .is_some_and(|g| g.to_string_lossy().contains("x509usefallbackroots=1"))
+        );
     }
 
     #[test]
     fn exec_superset_includes_libfetch_ca() {
-        let v = fake_env().vars_for(Tool::Exec);
+        let program = Program::command("/tmp/example").unwrap();
+        let v = fake_env().vars_for_program(&program);
         assert!(v.contains_key("SSL_CA_CERT_FILE"));
     }
 
@@ -1498,18 +1674,14 @@ mod tests {
     #[test]
     fn every_shimmable_tool_has_a_default_binary() {
         for tool in Tool::SHIMMABLE {
-            assert!(
-                tool.default_binary().is_some(),
-                "{} has no default binary",
-                tool.name()
-            );
+            assert!(!tool.default_binary().is_empty());
             assert!(!tool.name().is_empty());
         }
     }
 
     #[test]
-    fn exec_has_no_default_binary() {
-        assert!(Tool::Exec.default_binary().is_none());
+    fn empty_explicit_command_is_rejected() {
+        assert!(Program::command(OsString::new()).is_err());
     }
 
     #[test]
@@ -1563,23 +1735,7 @@ mod tests {
 
         // PATH: shim_dir first, then real_dir.
         let path = std::env::join_paths([shim_dir.path(), real_dir.path()]).unwrap();
-        // We can't safely toggle process env in parallel tests; instead, exercise
-        // the function directly with a temporary scope.
-        let prev = std::env::var_os("PATH");
-        // SAFETY: only this thread should consult PATH during this test; resolved
-        // immediately and restored before returning.
-        unsafe {
-            std::env::set_var("PATH", &path);
-        }
-        let found = resolve_real_binary("npm", Some(shim_dir.path()));
-        unsafe {
-            match prev {
-                Some(p) => std::env::set_var("PATH", p),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let found = found.unwrap();
+        let found = resolve_binary_in_path("npm", &path, Some(shim_dir.path()), None).unwrap();
         // Must have skipped shim_dir and found real_dir's copy.
         assert!(
             found.starts_with(real_dir.path()),

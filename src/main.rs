@@ -2,7 +2,7 @@
 //! scans every downloaded payload before it reaches the tool.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -10,9 +10,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AllowAll, AtomScanner, ScanPolicy, Scanner};
+use hood::scanner::{AllowAll, AtomScanner, ScanPolicy, ScanStats, Scanner};
 use hood::tools::{
-    dispatch, prepare_child_env, resolve_real_binary, run_child, run_passthrough, Dispatch, Tool,
+    Dispatch, PreparedChildEnv, Program, Tool, dispatch, prepare_child_env, resolve_real_binary,
+    run_child, run_passthrough,
 };
 
 #[derive(Parser, Debug)]
@@ -211,7 +212,8 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let cli = parse_cli_with_argv0_dispatch();
+    let mut cli = parse_cli_with_argv0_dispatch();
+    cli.verbose = resolve_verbose(cli.verbose);
     init_logging(cli.verbose);
 
     // Install the ring crypto provider for rustls. Without this rustls panics
@@ -276,24 +278,31 @@ fn rewrite_argv_for_shim(argv: Vec<OsString>) -> Vec<OsString> {
 }
 
 async fn run(cli: Cli) -> Result<i32> {
-    // Install/uninstall don't touch the proxy or scanner.
-    match cli.command {
-        Command::Install { force } => return hood::install::install(force),
-        Command::Uninstall => return hood::install::uninstall(),
-        _ => {}
-    }
-
-    let (tool, argv, bin_override) = command_to_tool(cli.command);
+    let Cli {
+        model_dir,
+        verbose,
+        enable_scripts,
+        command,
+    } = cli;
+    let (program, initial_args) = match Action::try_from(command)? {
+        Action::Run { program, argv } => (program, argv),
+        Action::Install { force } => return hood::install::install(force),
+        Action::Uninstall => return hood::install::uninstall(),
+    };
     let shim_dir = hood::install::shim_dir().ok();
-    let invocation = format_invocation(tool, &argv, bin_override.as_deref());
+    let invocation = format_invocation(&program, &initial_args);
 
     // Pass-through: skip proxy startup entirely for `npm test`, `cargo build`,
     // `go run`, etc. Hot path; no model load, no listener, no env injection.
-    let args = match dispatch(tool, argv, cli.enable_scripts) {
-        Dispatch::Passthrough(args) => {
-            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref()).await;
+    let dispatched = match program.tool() {
+        Some(tool) => dispatch(tool, initial_args, enable_scripts),
+        None => Dispatch::Intercept(initial_args),
+    };
+    let child_args = match dispatched {
+        Dispatch::Passthrough(child_args) => {
+            return run_passthrough(&program, child_args, shim_dir.as_deref()).await;
         }
-        Dispatch::Intercept(args) => args,
+        Dispatch::Intercept(child_args) => child_args,
     };
 
     let policy = resolve_policy();
@@ -304,7 +313,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // *blocking* hostile/suspicious payloads; the scanner being down makes that
     // impossible, so an infrastructure failure fails closed like Strict rather
     // than silently downgrading to "download everything unscanned."
-    let go_bridge = if cfg!(target_os = "macos") && tool == Tool::Go {
+    let go_bridge = if cfg!(target_os = "macos") && program.tool() == Some(Tool::Go) {
         let go = resolve_real_binary("go", shim_dir.as_deref())
             .ok_or_else(|| anyhow::anyhow!("no real `go` found on PATH (only the hood shim)"))?;
         Some(
@@ -316,36 +325,29 @@ async fn run(cli: Cli) -> Result<i32> {
         None
     };
 
-    let setup_result =
-        setup_proxy(cli.model_dir.clone(), policy, invocation.clone(), go_bridge).await;
+    let setup_result = setup_proxy(model_dir, policy, invocation.clone(), go_bridge, verbose).await;
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
         Err(e) if matches!(policy, ScanPolicy::Bypass) => {
             hood::output::emit_failsafe(&invocation, policy, &format!("{e:#}"));
-            return run_passthrough(tool, bin_override.as_deref(), args, shim_dir.as_deref()).await;
+            return run_passthrough(&program, child_args, shim_dir.as_deref()).await;
         }
         Err(e) => return Err(e),
     };
 
-    let exit_code = run_child(
-        tool,
-        bin_override.as_deref(),
-        args,
-        &proxy_setup.env,
-        shim_dir.as_deref(),
-    )
-    .await?;
+    let exit_code = run_child(&program, child_args, &proxy_setup.env, shim_dir.as_deref()).await?;
     proxy_setup.handle.stop().await;
-    drop(proxy_setup.ca_tempdir);
+    if let Some(stats) = &proxy_setup.stats {
+        hood::output::emit_scan_summary(stats.snapshot());
+    }
     Ok(exit_code)
 }
 
-/// Everything `run` needs once the proxy is up. `ca_tempdir` must outlive the
-/// child process — drop it after the child exits to remove the CA PEM file.
+/// Everything `run` needs once the proxy is up.
 struct ProxySetup {
     handle: hood::proxy::Handle,
-    env: hood::tools::ChildEnv,
-    ca_tempdir: tempfile::TempDir,
+    env: PreparedChildEnv,
+    stats: Option<Arc<ScanStats>>,
 }
 
 /// Build the scanner, construct the proxy, spawn it, and prepare the child
@@ -355,46 +357,153 @@ async fn setup_proxy(
     policy: ScanPolicy,
     invocation: String,
     go_bridge: Option<GoBridge>,
+    show_passes: bool,
 ) -> Result<ProxySetup> {
-    let scanner = build_scanner(model_dir, policy, invocation)?;
-    let proxy = Proxy::new(scanner, Config::default()).context("build proxy")?;
+    let stats = show_passes.then(|| Arc::new(ScanStats::default()));
+    let scanner = build_scanner(model_dir, policy, invocation, stats.clone())?;
+    let config = Config::from_env().context("read proxy configuration")?;
+    let proxy = Proxy::new(scanner, config).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let go_bridge_token = proxy.go_bridge_token().to_owned();
     let handle = proxy.spawn().await.context("start proxy")?;
     tracing::debug!(addr = %handle.addr, "hood proxy listening");
-    let (mut env, ca_tempdir) = prepare_child_env(handle.addr, &ca_pem)?;
-    if let Some(go_bridge) = go_bridge {
-        match go_bridge.child_env(handle.addr, &go_bridge_token) {
-            Ok(go) => env.go = Some(go),
-            Err(e) => {
-                handle.stop().await;
-                return Err(e).context("prepare macOS Go loopback bridge");
-            }
+    let mut env = match prepare_child_env(handle.addr, &ca_pem) {
+        Ok(env) => env,
+        Err(error) => {
+            handle.stop().await;
+            return Err(error).context("prepare child trust environment");
         }
+    };
+    if let Some(go_bridge) = go_bridge {
+        env.set_go_bridge(go_bridge.child_env(handle.addr, &go_bridge_token));
     }
-    Ok(ProxySetup {
-        handle,
-        env,
-        ca_tempdir,
-    })
+    Ok(ProxySetup { handle, env, stats })
 }
 
 /// Build a single-line shell command that reproduces what the user typed.
 /// Used inside the bypass hint so the user can copy/paste a working command.
-fn format_invocation(tool: Tool, args: &[OsString], bin_override: Option<&Path>) -> String {
-    let head: String = match (tool, bin_override) {
-        (Tool::Exec, Some(bin)) => sh_quote(&bin.display().to_string()),
-        _ => tool.name().to_owned(),
+fn format_invocation(program: &Program, args: &[OsString]) -> String {
+    let head = match program {
+        Program::Tool(tool) => tool.name().to_owned(),
+        Program::Command(path) => sh_quote(&path.to_string()),
     };
     if args.is_empty() {
         return head;
     }
     let mut out = head;
+    let mut redact_next = false;
     for a in args {
         out.push(' ');
-        out.push_str(&sh_quote(&a.to_string_lossy()));
+        let raw = a.to_string_lossy();
+        if redact_next {
+            out.push_str("'<redacted>'");
+            redact_next = false;
+            continue;
+        }
+        let (safe, takes_secret_value) = redact_invocation_arg(&raw);
+        redact_next = takes_secret_value;
+        out.push_str(&sh_quote(&safe));
     }
     out
+}
+
+/// Redact common credential-bearing command arguments before an invocation is
+/// retained for diagnostics. The real child argv is untouched. This list is
+/// deliberately broad: a less-copyable bypass hint is preferable to placing a
+/// registry token or Authorization header in terminal and CI logs.
+fn redact_invocation_arg(arg: &str) -> (String, bool) {
+    const VALUE_FLAGS: &[&str] = &[
+        "-H",
+        "--header",
+        "-u",
+        "--user",
+        "--proxy-user",
+        "--oauth2-bearer",
+        "--password",
+        "--token",
+        "--secret",
+        "--auth",
+    ];
+    if VALUE_FLAGS.contains(&arg) {
+        return (arg.to_owned(), true);
+    }
+    if (arg.starts_with("-H") || arg.starts_with("-u")) && arg.len() > 2 {
+        return (format!("{}<redacted>", &arg[..2]), false);
+    }
+    if !arg.contains("://")
+        && let Some((key, _)) = arg.split_once('=')
+        && (is_sensitive_name(key) || VALUE_FLAGS.contains(&key))
+    {
+        return (format!("{key}=<redacted>"), false);
+    }
+    if let Ok(mut url) = url::Url::parse(arg)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        let had_userinfo = !url.username().is_empty() || url.password().is_some();
+        let query: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let value = if is_sensitive_name(&key) {
+                    "<redacted>".to_owned()
+                } else {
+                    value.into_owned()
+                };
+                (key.into_owned(), value)
+            })
+            .collect();
+        let had_sensitive_query = query.iter().any(|(key, _)| is_sensitive_name(key));
+        if had_sensitive_query {
+            url.set_query(None);
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        if had_userinfo || had_sensitive_query {
+            // Rebuild from the origin instead of mutating userinfo in place.
+            // This keeps credentials out if setter semantics ever change.
+            let mut safe = format!("{}://", url.scheme());
+            if let Some(host) = url.host_str() {
+                if host.contains(':') {
+                    safe.push('[');
+                    safe.push_str(host);
+                    safe.push(']');
+                } else {
+                    safe.push_str(host);
+                }
+            }
+            if let Some(port) = url.port() {
+                safe.push(':');
+                safe.push_str(&port.to_string());
+            }
+            safe.push_str(url.path());
+            if let Some(query) = url.query() {
+                safe.push('?');
+                safe.push_str(query);
+            }
+            if let Some(fragment) = url.fragment() {
+                safe.push('#');
+                safe.push_str(fragment);
+            }
+            return (safe, false);
+        }
+    }
+    (arg.to_owned(), false)
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "authorization",
+        "cookie",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "_auth",
+        "api-key",
+        "api_key",
+        "apikey",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
 }
 
 /// Minimal POSIX-shell quoter: wrap in single quotes when the value contains
@@ -423,52 +532,69 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
-/// Unpack a `Command` into the tool, args, and (for `Exec`) the explicit
-/// binary path the caller supplied.
-fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
-    match cmd {
-        Command::Curl { args } => (Tool::Curl, args, None),
-        Command::Wget { args } => (Tool::Wget, args, None),
-        Command::Npm { args } => (Tool::Npm, args, None),
-        Command::Npx { args } => (Tool::Npx, args, None),
-        Command::Pnpm { args } => (Tool::Pnpm, args, None),
-        Command::Pnpx { args } => (Tool::Pnpx, args, None),
-        Command::Yarn { args } => (Tool::Yarn, args, None),
-        Command::Rush { args } => (Tool::Rush, args, None),
-        Command::Rushx { args } => (Tool::Rushx, args, None),
-        Command::Bun { args } => (Tool::Bun, args, None),
-        Command::Bunx { args } => (Tool::Bunx, args, None),
-        Command::Pip { args } => (Tool::Pip, args, None),
-        Command::Pip3 { args } => (Tool::Pip3, args, None),
-        Command::Pipx { args } => (Tool::Pipx, args, None),
-        Command::Uv { args } => (Tool::Uv, args, None),
-        Command::Uvx { args } => (Tool::Uvx, args, None),
-        Command::Poetry { args } => (Tool::Poetry, args, None),
-        Command::Pdm { args } => (Tool::Pdm, args, None),
-        Command::Go { args } => (Tool::Go, args, None),
-        Command::Cargo { args } => (Tool::Cargo, args, None),
-        Command::Brew { args } => (Tool::Brew, args, None),
-        Command::Pacman { args } => (Tool::Pacman, args, None),
-        Command::Yay { args } => (Tool::Yay, args, None),
-        Command::Paru { args } => (Tool::Paru, args, None),
-        Command::Makepkg { args } => (Tool::Makepkg, args, None),
-        Command::Dnf { args } => (Tool::Dnf, args, None),
-        Command::Yum { args } => (Tool::Yum, args, None),
-        Command::Zypper { args } => (Tool::Zypper, args, None),
-        Command::Rpm { args } => (Tool::Rpm, args, None),
-        Command::Pkg { args } => (Tool::Pkg, args, None),
-        Command::Apk { args } => (Tool::Apk, args, None),
-        Command::Exec { mut argv } => {
-            let bin = PathBuf::from(argv.remove(0));
-            (Tool::Exec, argv, Some(bin))
-        }
-        Command::Install { .. } | Command::Uninstall => {
-            // `run` matches these arms and returns before reaching this
-            // function. Reaching this branch means a future refactor broke
-            // that contract; panic is the right failure mode for a
-            // violated invariant.
-            unreachable!("install/uninstall must be handled before command_to_tool")
-        }
+#[derive(Debug)]
+enum Action {
+    Run {
+        program: Program,
+        argv: Vec<OsString>,
+    },
+    Install {
+        force: bool,
+    },
+    Uninstall,
+}
+
+impl TryFrom<Command> for Action {
+    type Error = anyhow::Error;
+
+    fn try_from(command: Command) -> Result<Self> {
+        let (tool, argv) = match command {
+            Command::Curl { args } => (Tool::Curl, args),
+            Command::Wget { args } => (Tool::Wget, args),
+            Command::Npm { args } => (Tool::Npm, args),
+            Command::Npx { args } => (Tool::Npx, args),
+            Command::Pnpm { args } => (Tool::Pnpm, args),
+            Command::Pnpx { args } => (Tool::Pnpx, args),
+            Command::Yarn { args } => (Tool::Yarn, args),
+            Command::Rush { args } => (Tool::Rush, args),
+            Command::Rushx { args } => (Tool::Rushx, args),
+            Command::Bun { args } => (Tool::Bun, args),
+            Command::Bunx { args } => (Tool::Bunx, args),
+            Command::Pip { args } => (Tool::Pip, args),
+            Command::Pip3 { args } => (Tool::Pip3, args),
+            Command::Pipx { args } => (Tool::Pipx, args),
+            Command::Uv { args } => (Tool::Uv, args),
+            Command::Uvx { args } => (Tool::Uvx, args),
+            Command::Poetry { args } => (Tool::Poetry, args),
+            Command::Pdm { args } => (Tool::Pdm, args),
+            Command::Go { args } => (Tool::Go, args),
+            Command::Cargo { args } => (Tool::Cargo, args),
+            Command::Brew { args } => (Tool::Brew, args),
+            Command::Pacman { args } => (Tool::Pacman, args),
+            Command::Yay { args } => (Tool::Yay, args),
+            Command::Paru { args } => (Tool::Paru, args),
+            Command::Makepkg { args } => (Tool::Makepkg, args),
+            Command::Dnf { args } => (Tool::Dnf, args),
+            Command::Yum { args } => (Tool::Yum, args),
+            Command::Zypper { args } => (Tool::Zypper, args),
+            Command::Rpm { args } => (Tool::Rpm, args),
+            Command::Pkg { args } => (Tool::Pkg, args),
+            Command::Apk { args } => (Tool::Apk, args),
+            Command::Exec { argv } => {
+                let mut argv = argv.into_iter();
+                let program = argv.next().context("hood exec requires a command to run")?;
+                return Ok(Self::Run {
+                    program: Program::command(program)?,
+                    argv: argv.collect(),
+                });
+            }
+            Command::Install { force } => return Ok(Self::Install { force }),
+            Command::Uninstall => return Ok(Self::Uninstall),
+        };
+        Ok(Self::Run {
+            program: tool.into(),
+            argv,
+        })
     }
 }
 
@@ -485,7 +611,7 @@ fn command_to_tool(cmd: Command) -> (Tool, Vec<OsString>, Option<PathBuf>) {
 /// downgrade protection.
 fn resolve_policy() -> ScanPolicy {
     match std::env::var("HOOD_BYPASS").ok().as_deref() {
-        None | Some("") | Some("0") => ScanPolicy::Strict,
+        None | Some("" | "0") => ScanPolicy::Strict,
         Some("1") => ScanPolicy::AllowErrors,
         Some("2") => ScanPolicy::AllowSuspicious,
         Some("3") => ScanPolicy::Bypass,
@@ -505,14 +631,33 @@ fn build_scanner(
     model_dir: Option<PathBuf>,
     policy: ScanPolicy,
     invocation: String,
+    status: Option<Arc<ScanStats>>,
 ) -> Result<Arc<dyn Scanner>> {
-    if std::env::var_os("HOOD_NO_SCAN").is_some_and(|v| !v.is_empty()) {
-        tracing::warn!("HOOD_NO_SCAN set — payloads forwarded without inspection");
-        return Ok(Arc::new(AllowAll));
+    if let Some(value) = std::env::var_os("HOOD_NO_SCAN") {
+        if value == "1" {
+            tracing::warn!("HOOD_NO_SCAN=1 — payloads forwarded without inspection");
+            return Ok(Arc::new(AllowAll));
+        }
+        tracing::warn!("invalid HOOD_NO_SCAN value ignored; scanning remains enabled");
     }
     Ok(Arc::new(
-        AtomScanner::load(model_dir, policy, invocation).context("load scan scanner")?,
+        AtomScanner::load_with_status(model_dir, policy, invocation, status)
+            .context("load scan scanner")?,
     ))
+}
+
+/// `HOOD_VERBOSE=1` is the environment equivalent of `-v/--verbose`. Invalid
+/// values fail closed to normal verbosity rather than treating every non-empty
+/// string (including `0`) as an opt-in.
+fn resolve_verbose(cli_verbose: bool) -> bool {
+    match std::env::var_os("HOOD_VERBOSE") {
+        None => cli_verbose,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            eprintln!("hood: invalid HOOD_VERBOSE value ignored (expected 1)");
+            cli_verbose
+        }
+    }
 }
 
 fn init_logging(verbose: bool) {
@@ -580,6 +725,28 @@ mod tests {
                 assert_eq!(args, vec!["install", "lodash", "--save"]);
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_chain_gap_commands_parse_to_their_distinct_tools() {
+        for (name, expected) in [
+            ("npx", Tool::Npx),
+            ("pnpx", Tool::Pnpx),
+            ("rush", Tool::Rush),
+            ("rushx", Tool::Rushx),
+            ("bunx", Tool::Bunx),
+            ("pip3", Tool::Pip3),
+            ("uvx", Tool::Uvx),
+            ("pdm", Tool::Pdm),
+        ] {
+            let cli = Cli::try_parse_from(["hood", name, "fixture"]).unwrap();
+            let action = Action::try_from(cli.command).unwrap();
+            let Action::Run { program, argv } = action else {
+                panic!("{name} did not produce a run action");
+            };
+            assert_eq!(program, Program::Tool(expected), "{name}");
+            assert_eq!(argv, vec![OsString::from("fixture")], "{name}");
         }
     }
 
@@ -660,18 +827,15 @@ mod tests {
     #[test]
     fn format_invocation_uses_tool_name_for_named_tools() {
         let argv = os_vec(&["-fsSL", "https://example.com"]);
-        let s = format_invocation(hood::tools::Tool::Curl, &argv, None);
+        let s = format_invocation(&Program::Tool(Tool::Curl), &argv);
         assert_eq!(s, "curl -fsSL https://example.com");
     }
 
     #[test]
     fn format_invocation_uses_explicit_binary_for_exec() {
         let argv = os_vec(&["./bootstrap.sh"]);
-        let s = format_invocation(
-            hood::tools::Tool::Exec,
-            &argv,
-            Some(std::path::Path::new("/usr/local/bin/bash")),
-        );
+        let program = Program::command("/usr/local/bin/bash").unwrap();
+        let s = format_invocation(&program, &argv);
         assert!(s.starts_with("/usr/local/bin/bash"));
         assert!(s.contains("./bootstrap.sh"));
     }
@@ -679,8 +843,28 @@ mod tests {
     #[test]
     fn format_invocation_quotes_args_with_spaces() {
         let argv = vec![OsString::from("install"), OsString::from("name with space")];
-        let s = format_invocation(hood::tools::Tool::Npm, &argv, None);
+        let s = format_invocation(&Program::Tool(Tool::Npm), &argv);
         assert_eq!(s, "npm install 'name with space'");
+    }
+
+    #[test]
+    fn format_invocation_redacts_credentials() {
+        let parsed = url::Url::parse("https://user:password@example.com/pkg?token=secret").unwrap();
+        assert_eq!(parsed.host_str(), Some("example.com"));
+        let (safe_url, _) =
+            redact_invocation_arg("https://user:password@example.com/pkg?token=secret");
+        assert!(!safe_url.contains("password"), "{safe_url}");
+        let argv = os_vec(&[
+            "-H",
+            "Authorization: Bearer nation-state",
+            "https://user:password@example.com/pkg?token=secret",
+            "--registry-token=also-secret",
+        ]);
+        let rendered = format_invocation(&Program::Tool(Tool::Curl), &argv);
+        assert!(!rendered.contains("nation-state"));
+        assert!(!rendered.contains("password"), "{rendered}");
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("redacted"));
     }
 
     #[test]

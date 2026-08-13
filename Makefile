@@ -1,6 +1,7 @@
 SHELL := /bin/sh
 BINARY = hood
 OUT_DIR = out
+TOOL ?= go
 
 # Scrub GNU make's jobserver from cargo's environment. Without this, build
 # scripts that spawn their own `make` (e.g. tikv-jemalloc-sys via scan)
@@ -51,10 +52,10 @@ lint:
 test:
 	$(CARGO) test --release
 
-# Command-level tests against real package-manager binaries. Strict mode makes
-# a missing tool a failure instead of a local-development skip.
+# Command-level tests against real package-manager binaries. TOOL accepts one
+# name, a comma-separated list, or `all`; unavailable unselected tools skip.
 test-tools:
-	HOOD_REQUIRE_TOOL_INTEGRATION=1 $(CARGO) test --release --test tool_integration
+	HOOD_REQUIRE_TOOL_INTEGRATION=$(TOOL) $(CARGO) test --release --test tool_integration -- --test-threads=1
 
 clean:
 	$(CARGO) clean

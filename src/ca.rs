@@ -25,6 +25,10 @@ use rustls::sign::CertifiedKey;
 /// Default common name for the in-memory root certificate.
 const ROOT_COMMON_NAME: &str = "hood ephemeral root";
 
+/// Bound attacker-influenced SNI state. Hosts past this point are still served,
+/// but their leaves are not retained for the lifetime of the process.
+const MAX_CACHED_LEAVES: usize = 256;
+
 /// Ephemeral root CA + leaf cert factory.
 ///
 /// Cheap to clone — internally an `Arc` over the keypair and a shared cache.
@@ -54,9 +58,16 @@ impl std::fmt::Debug for Ca {
 
 impl Ca {
     /// Generate a fresh root key + certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key generation or certificate signing fails.
     pub fn generate() -> Result<Self> {
         let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::minutes(5);
+        params.not_after = now + time::Duration::hours(24);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
@@ -89,6 +100,11 @@ impl Ca {
 
     /// Mint (or retrieve from cache) a leaf certificate signed by the root for
     /// the supplied DNS hostname or IP literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid host, a poisoned cache, or a certificate
+    /// generation failure.
     pub fn leaf_for(&self, host: &str) -> Result<Arc<CertifiedKey>> {
         if let Some(hit) = self
             .inner
@@ -108,6 +124,9 @@ impl Ca {
             .lock()
             .map_err(|e| anyhow::anyhow!("ca cache poisoned: {e}"))?;
         // Another thread might have populated it concurrently; prefer their copy.
+        if cache.len() >= MAX_CACHED_LEAVES {
+            return Ok(certified);
+        }
         Ok(Arc::clone(
             cache.entry(host.to_owned()).or_insert(certified),
         ))
@@ -117,14 +136,11 @@ impl Ca {
         let mut params = CertificateParams::default();
         let san = parse_san(host)?;
         params.subject_alt_names = vec![san];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::minutes(5);
+        params.not_after = now + time::Duration::hours(1);
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, host);
         params.distinguished_name = dn;
@@ -153,7 +169,9 @@ fn parse_san(host: &str) -> Result<SanType> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SanType::IpAddress(ip));
     }
-    let dns = Ia5String::try_from(host.to_owned())
+    let validated = rustls::pki_types::DnsName::try_from(host.to_owned())
+        .map_err(|e| anyhow::anyhow!("invalid DNS name {host:?}: {e}"))?;
+    let dns = Ia5String::try_from(validated.as_ref().to_owned())
         .map_err(|e| anyhow::anyhow!("invalid DNS name {host}: {e}"))?;
     Ok(SanType::DnsName(dns))
 }

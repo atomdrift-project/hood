@@ -9,9 +9,9 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tokio::process::Command;
 use url::Url;
 
@@ -21,8 +21,43 @@ pub(crate) const ROUTE_PREFIX: &str = "/__hood_go/";
 /// Effective Go network settings captured from `go env`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoBridge {
-    goproxy: String,
-    gosumdb: String,
+    proxies: Vec<ProxyEntry>,
+    sumdb: SumDb,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyEntry {
+    endpoint: ProxyEndpoint,
+    fallback: Option<Fallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProxyEndpoint {
+    Bridge(Url),
+    Direct,
+    Off,
+    File(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    NotFound,
+    AnyError,
+}
+
+impl Fallback {
+    const fn as_char(self) -> char {
+        match self {
+            Self::NotFound => ',',
+            Self::AnyError => '|',
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SumDb {
+    Off,
+    Verify { identity: String, target: Url },
 }
 
 /// Environment values injected into the child `go` command.
@@ -37,6 +72,10 @@ pub struct GoChildEnv {
 impl GoBridge {
     /// Query the real Go binary for settings that may come from either the
     /// process environment or Go's persistent `go env -w` configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `go env` fails or reports invalid network settings.
     pub async fn query(go_binary: &Path) -> Result<Self> {
         let output = Command::new(go_binary)
             .args(["env", "GOPROXY", "GOSUMDB"])
@@ -58,42 +97,42 @@ impl GoBridge {
         Self::new(goproxy, gosumdb)
     }
 
-    /// Parse effective `GOPROXY` and `GOSUMDB` values.
+    /// Parse effective `GOPROXY` and `GOSUMDB` values into validated state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or unsupported proxy and sumdb URLs.
     pub fn new(goproxy: &str, gosumdb: &str) -> Result<Self> {
-        // Validate now so a malformed persistent Go setting produces a useful
-        // hood startup error instead of an opaque local-proxy failure later.
-        for (entry, _) in split_goproxy(goproxy) {
-            if matches!(entry.as_str(), "direct" | "off") || entry.starts_with("file:") {
-                continue;
-            }
-            drop(normalize_proxy_url(&entry)?);
-        }
-        validate_sumdb(gosumdb)?;
         Ok(Self {
-            goproxy: goproxy.to_owned(),
-            gosumdb: gosumdb.to_owned(),
+            proxies: parse_proxy_chain(goproxy)?,
+            sumdb: parse_sumdb(gosumdb)?,
         })
     }
 
     /// Build child values once the proxy has bound its ephemeral port and its
     /// per-run route token is known.
-    pub fn child_env(&self, addr: SocketAddr, token: &str) -> Result<GoChildEnv> {
+    #[must_use]
+    pub fn child_env(&self, addr: SocketAddr, token: &str) -> GoChildEnv {
         let mut goproxy = String::new();
-        for (entry, separator) in split_goproxy(&self.goproxy) {
-            let bridged =
-                if matches!(entry.as_str(), "direct" | "off") || entry.starts_with("file:") {
-                    entry
-                } else {
-                    bridge_base(addr, token, &normalize_proxy_url(&entry)?)
-                };
-            goproxy.push_str(&bridged);
-            if let Some(separator) = separator {
-                goproxy.push(separator);
+        for entry in &self.proxies {
+            match &entry.endpoint {
+                ProxyEndpoint::Bridge(url) => goproxy.push_str(&bridge_base(addr, token, url)),
+                ProxyEndpoint::Direct => goproxy.push_str("direct"),
+                ProxyEndpoint::Off => goproxy.push_str("off"),
+                ProxyEndpoint::File(url) => goproxy.push_str(url),
+            }
+            if let Some(fallback) = entry.fallback {
+                goproxy.push(fallback.as_char());
             }
         }
 
-        let gosumdb = bridge_sumdb(&self.gosumdb, addr, token)?;
-        Ok(GoChildEnv { goproxy, gosumdb })
+        let gosumdb = match &self.sumdb {
+            SumDb::Off => "off".to_owned(),
+            SumDb::Verify { identity, target } => {
+                format!("{identity} {}", bridge_base(addr, token, target))
+            }
+        };
+        GoChildEnv { goproxy, gosumdb }
     }
 }
 
@@ -161,70 +200,73 @@ fn normalize_proxy_url(entry: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn split_goproxy(value: &str) -> Vec<(String, Option<char>)> {
-    let mut out = Vec::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        let (piece, separator, rest) = match remaining.find([',', '|']) {
-            Some(index) => (
-                &remaining[..index],
-                remaining[index..].chars().next(),
-                &remaining[index + 1..],
-            ),
-            None => (remaining, None, ""),
-        };
-        let piece = piece.trim();
-        if !piece.is_empty() {
-            out.push((piece.to_owned(), separator));
-        }
-        remaining = rest;
+fn parse_proxy_chain(value: &str) -> Result<Vec<ProxyEntry>> {
+    let entries: Vec<_> = value
+        .split_inclusive([',', '|'])
+        .filter_map(|part| {
+            let (endpoint, fallback) = match (part.strip_suffix(','), part.strip_suffix('|')) {
+                (Some(endpoint), _) => (endpoint, Some(Fallback::NotFound)),
+                (_, Some(endpoint)) => (endpoint, Some(Fallback::AnyError)),
+                (None, None) => (part, None),
+            };
+            let endpoint = endpoint.trim();
+            (!endpoint.is_empty()).then_some((endpoint, fallback))
+        })
+        .map(|(endpoint, fallback)| {
+            let endpoint = match endpoint {
+                "direct" => ProxyEndpoint::Direct,
+                "off" => ProxyEndpoint::Off,
+                file if file.starts_with("file:") => ProxyEndpoint::File(file.to_owned()),
+                remote => ProxyEndpoint::Bridge(normalize_proxy_url(remote)?),
+            };
+            Ok(ProxyEntry { endpoint, fallback })
+        })
+        .collect::<Result<_>>()?;
+    if entries.is_empty() {
+        return Err(anyhow!("GOPROXY must contain at least one entry"));
     }
-    out
+    Ok(entries)
 }
 
-fn validate_sumdb(value: &str) -> Result<()> {
+fn parse_sumdb(value: &str) -> Result<SumDb> {
     if value == "off" {
-        return Ok(());
+        return Ok(SumDb::Off);
     }
-    let fields: Vec<&str> = value.split_whitespace().collect();
-    if fields.is_empty() || fields.len() > 2 {
+    let mut fields = value.split_whitespace();
+    let raw_identity = fields
+        .next()
+        .ok_or_else(|| anyhow!("invalid GOSUMDB value {value:?}"))?;
+    let explicit_target = fields.next();
+    if fields.next().is_some() {
         return Err(anyhow!("invalid GOSUMDB value {value:?}"));
     }
-    let target = sumdb_target(&fields)?;
+
+    let identity = if raw_identity == "sum.golang.google.cn" {
+        "sum.golang.org"
+    } else {
+        raw_identity
+    };
+    let target = sumdb_target(raw_identity, explicit_target)?;
     if !matches!(target.scheme(), "http" | "https") {
         return Err(anyhow!(
             "unsupported GOSUMDB URL scheme: {}",
             target.scheme()
         ));
     }
-    Ok(())
+    Ok(SumDb::Verify {
+        identity: identity.to_owned(),
+        target,
+    })
 }
 
-fn bridge_sumdb(value: &str, addr: SocketAddr, token: &str) -> Result<String> {
-    if value == "off" {
-        return Ok(value.to_owned());
-    }
-    let fields: Vec<&str> = value.split_whitespace().collect();
-    validate_sumdb(value)?;
-    let identity = if fields[0] == "sum.golang.google.cn" {
-        "sum.golang.org"
-    } else {
-        fields[0]
-    };
-    let target = sumdb_target(&fields)?;
-    Ok(format!("{identity} {}", bridge_base(addr, token, &target)))
-}
-
-fn sumdb_target(fields: &[&str]) -> Result<Url> {
-    if fields[0] == "sum.golang.google.cn" && fields.len() == 1 {
-        return Url::parse("https://sum.golang.google.cn").context("parse Go sumdb alias URL");
-    }
-    if let Some(explicit) = fields.get(1) {
+fn sumdb_target(identity: &str, explicit: Option<&str>) -> Result<Url> {
+    if let Some(explicit) = explicit {
         return Url::parse(explicit).with_context(|| format!("invalid GOSUMDB URL {explicit:?}"));
     }
-    let name = fields[0]
-        .split_once('+')
-        .map_or(fields[0], |(name, _)| name);
+    if identity == "sum.golang.google.cn" {
+        return Url::parse("https://sum.golang.google.cn").context("parse Go sumdb alias URL");
+    }
+    let name = identity.split_once('+').map_or(identity, |(name, _)| name);
     Url::parse(&format!("https://{name}")).with_context(|| format!("invalid GOSUMDB name {name:?}"))
 }
 
@@ -246,7 +288,7 @@ mod tests {
             "sum.golang.org",
         )
         .unwrap();
-        let child = bridge.child_env(addr(), TOKEN).unwrap();
+        let child = bridge.child_env(addr(), TOKEN);
         assert!(child.goproxy.starts_with("http://127.0.0.1:43210/"));
         assert!(child.goproxy.contains('|'));
         assert!(child.goproxy.contains(",direct"));
@@ -256,7 +298,7 @@ mod tests {
     #[test]
     fn bridge_route_restores_proxy_base_and_raw_module_path() {
         let bridge = GoBridge::new("https://proxy.example/base", "off").unwrap();
-        let child = bridge.child_env(addr(), TOKEN).unwrap();
+        let child = bridge.child_env(addr(), TOKEN);
         let uri: hyper::Uri = format!("{}/golang.org/x/text/@v/v0.3.2.mod", child.goproxy)
             .parse()
             .unwrap();
@@ -275,17 +317,19 @@ mod tests {
             &format!("{identity} https://sum.corp.example/base"),
         )
         .unwrap();
-        let child = bridge.child_env(addr(), TOKEN).unwrap();
-        assert!(child
-            .gosumdb
-            .starts_with(&format!("{identity} http://127.0.0.1:")));
+        let child = bridge.child_env(addr(), TOKEN);
+        assert!(
+            child
+                .gosumdb
+                .starts_with(&format!("{identity} http://127.0.0.1:"))
+        );
         assert!(!child.gosumdb.contains("https://sum.corp.example"));
     }
 
     #[test]
     fn sumdb_off_stays_off() {
         let bridge = GoBridge::new("https://proxy.golang.org", "off").unwrap();
-        assert_eq!(bridge.child_env(addr(), TOKEN).unwrap().gosumdb, "off");
+        assert_eq!(bridge.child_env(addr(), TOKEN).gosumdb, "off");
     }
 
     #[test]
@@ -300,5 +344,13 @@ mod tests {
     fn wrong_token_does_not_resolve() {
         let uri: hyper::Uri = "/__hood_go/not-the-token/abc".parse().unwrap();
         assert_eq!(resolve_request(&uri, TOKEN).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_network_settings_are_rejected_at_construction() {
+        assert!(GoBridge::new("", "sum.golang.org").is_err());
+        assert!(GoBridge::new("ftp://proxy.example", "sum.golang.org").is_err());
+        assert!(GoBridge::new("https://proxy.example", "").is_err());
+        assert!(GoBridge::new("https://proxy.example", "name one two").is_err());
     }
 }

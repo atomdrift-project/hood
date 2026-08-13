@@ -52,7 +52,7 @@ const PAYLOAD: &[u8] = b"hello from origin\n";
 /// oversized-passthrough paths. 256 KiB so a small `max_body_bytes` forces a
 /// spill and a small `max_scan_bytes` forces an unscanned forward.
 fn big_payload() -> Vec<u8> {
-    (0..256 * 1024).map(|i| (i % 251) as u8).collect()
+    (0_u8..=250).cycle().take(256 * 1024).collect()
 }
 
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -215,10 +215,7 @@ async fn https_mitm_round_trip_with_allow_all() -> Result<()> {
     let (origin_addr, origin_ca_pem) = start_https_origin().await?;
     let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
 
-    let cfg = Config {
-        extra_upstream_roots: roots_from_pem(&origin_ca_pem),
-        ..Config::default()
-    };
+    let cfg = Config::default().with_extra_upstream_roots(roots_from_pem(&origin_ca_pem));
     let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
     let handle = proxy.spawn().await?;
@@ -243,15 +240,12 @@ async fn go_loopback_bridge_verifies_https_and_contains_redirects() -> Result<()
 
     let (origin_addr, origin_ca_pem) = start_https_origin().await?;
     let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
-    let cfg = Config {
-        extra_upstream_roots: roots_from_pem(&origin_ca_pem),
-        ..Config::default()
-    };
+    let cfg = Config::default().with_extra_upstream_roots(roots_from_pem(&origin_ca_pem));
     let proxy = Proxy::new(scanner, cfg)?;
     let token = proxy.go_bridge_token().to_owned();
     let handle = proxy.spawn().await?;
     let bridge = GoBridge::new(&format!("https://localhost:{}", origin_addr.port()), "off")?;
-    let child = bridge.child_env(handle.addr, &token)?;
+    let child = bridge.child_env(handle.addr, &token);
 
     // This client trusts no hood CA: like Go on macOS, it only speaks plain
     // HTTP to loopback. Hood verifies HTTPS on the upstream leg. The origin's
@@ -286,11 +280,7 @@ async fn large_body_spills_to_disk_and_forwards_intact() -> Result<()> {
     // RAM cap far below the 256 KiB body → spill to disk and scan from there
     // (AllowAll → allow); disk-scan cap generous so it's the scanned-from-disk
     // path, not the unscanned one.
-    let cfg = Config {
-        max_body_bytes: 4096,
-        max_scan_bytes: 8 * 1024 * 1024,
-        ..Config::default()
-    };
+    let cfg = Config::default().with_scan_limits(4096, 8 * 1024 * 1024)?;
     let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
     let handle = proxy.spawn().await?;
@@ -315,11 +305,8 @@ async fn oversized_body_forwards_unscanned_intact() -> Result<()> {
     // comes back whole, it proves the body was forwarded *without* scanning
     // because it exceeded the disk-scan cap.
     let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
-    let cfg = Config {
-        max_body_bytes: 4096,
-        max_scan_bytes: 16 * 1024, // 256 KiB body exceeds this → unscanned
-        ..Config::default()
-    };
+    // The 256 KiB body exceeds this scan limit and is forwarded unscanned.
+    let cfg = Config::default().with_scan_limits(4096, 16 * 1024)?;
     let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
     let handle = proxy.spawn().await?;

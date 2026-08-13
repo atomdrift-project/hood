@@ -19,19 +19,19 @@
 //!
 //! Response bodies are handled by size to bound memory. First a pre-fetch PURL
 //! gate can skip (known-good) or block (known-bad) before a byte is downloaded.
-//! Otherwise: a body within [`Config::max_body_bytes`] is buffered in RAM and
-//! scanned in memory; a larger one spills to a temp file and is scanned from
-//! disk (cleave memory-maps it) up to [`Config::max_scan_bytes`]; past that it
-//! is forwarded unscanned. Forwarded large bodies stream back from the spill
-//! file, so a multi-gigabyte transfer never materializes whole in RAM.
+//! Otherwise: a body within the configured in-memory limit is buffered and
+//! scanned in RAM; a larger one spills to a temp file and is scanned from disk
+//! (cleave memory-maps it) up to the configured scan limit; past that it is
+//! forwarded unscanned. Forwarded large bodies stream back from the spill file,
+//! so a multi-gigabyte transfer never materializes whole in RAM.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::combinators::BoxBody;
@@ -39,7 +39,8 @@ use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{
-    HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HOST, LOCATION,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName,
+    HeaderValue, LOCATION,
 };
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -98,36 +99,49 @@ const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 /// pre-fetch PURL gate. Tunable via `HOOD_MAX_SCAN_MB`.
 const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Derive a 128-bit route token from the freshly generated ephemeral CA. The
-/// CA is random per process, so the token cannot be guessed by another local
-/// process probing the loopback listener.
-fn bridge_token(ca_pem: &str) -> String {
+/// Generate an independent 128-bit route token for the loopback Go bridge.
+/// This must not be derived from the public CA certificate: the certificate is
+/// deliberately shared with the child process and is not secret key material.
+fn bridge_token() -> Result<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(ca_pem.as_bytes());
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).context("generate Go bridge route token")?;
     let mut out = String::with_capacity(32);
-    for byte in &digest[..16] {
+    for byte in random {
         out.push(char::from(HEX[usize::from(byte >> 4)]));
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    out
+    Ok(out)
 }
 
 /// Resolve the in-memory body cap from the environment, falling back to the default.
-fn max_body_bytes_from_env() -> u64 {
-    mb_env("HOOD_MAX_BODY_MB").unwrap_or(MAX_BODY_BYTES_DEFAULT)
+fn max_body_bytes_from_env() -> Result<u64> {
+    Ok(mb_env("HOOD_MAX_BODY_MB")?.unwrap_or(MAX_BODY_BYTES_DEFAULT))
 }
 
 /// Resolve the disk-scan cap from the environment, falling back to the default.
-fn max_scan_bytes_from_env() -> u64 {
-    mb_env("HOOD_MAX_SCAN_MB").unwrap_or(MAX_SCAN_BYTES_DEFAULT)
+fn max_scan_bytes_from_env() -> Result<u64> {
+    Ok(mb_env("HOOD_MAX_SCAN_MB")?.unwrap_or(MAX_SCAN_BYTES_DEFAULT))
 }
 
 /// Read a megabyte-valued env var and convert it to bytes.
-fn mb_env(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|mb| mb.saturating_mul(1024 * 1024))
+fn mb_env(name: &str) -> Result<Option<u64>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("{name} is not valid UTF-8"))?;
+    Ok(Some(megabytes_to_bytes(name, value)?))
+}
+
+fn megabytes_to_bytes(name: &str, value: &str) -> Result<u64> {
+    let megabytes = value
+        .parse::<u64>()
+        .with_context(|| format!("parse {name}={value:?} as megabytes"))?;
+    megabytes
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("{name}={value:?} exceeds the supported byte range"))
 }
 
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
@@ -148,26 +162,83 @@ const HOP_BY_HOP: &[&str] = &[
 pub struct Config {
     /// Maximum response body buffered in RAM for scanning. Larger responses
     /// spill to disk and are scanned from there.
-    pub max_body_bytes: u64,
+    max_body_bytes: u64,
     /// Maximum response body scanned from disk. Larger responses are forwarded
     /// unscanned (bounded only by the pre-fetch PURL gate).
-    pub max_scan_bytes: u64,
+    max_scan_bytes: u64,
     /// Bind address. Forced to a loopback address for safety.
-    pub bind: SocketAddr,
+    bind: SocketAddr,
     /// Additional roots used to verify upstream TLS. Intended for private PKI
     /// and deterministic tests; native platform roots are always loaded too.
-    pub extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_body_bytes: max_body_bytes_from_env(),
-            max_scan_bytes: max_scan_bytes_from_env(),
+            max_body_bytes: MAX_BODY_BYTES_DEFAULT,
+            max_scan_bytes: MAX_SCAN_BYTES_DEFAULT,
             // 127.0.0.1:0 → kernel-assigned ephemeral port.
             bind: ([127, 0, 0, 1], 0).into(),
             extra_upstream_roots: Vec::new(),
         }
+    }
+}
+
+impl Config {
+    /// Build configuration using Hood's environment overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured limits are zero or out of order.
+    pub fn from_env() -> Result<Self> {
+        Self::default().with_scan_limits(max_body_bytes_from_env()?, max_scan_bytes_from_env()?)
+    }
+
+    /// Set the in-memory and total scan limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_body_bytes` is zero or exceeds
+    /// `max_scan_bytes`.
+    pub fn with_scan_limits(mut self, max_body_bytes: u64, max_scan_bytes: u64) -> Result<Self> {
+        if max_body_bytes == 0 {
+            return Err(anyhow!("max_body_bytes must be greater than zero"));
+        }
+        if max_scan_bytes < max_body_bytes {
+            return Err(anyhow!(
+                "max_scan_bytes ({max_scan_bytes}) must be at least max_body_bytes ({max_body_bytes})",
+            ));
+        }
+        self.max_body_bytes = max_body_bytes;
+        self.max_scan_bytes = max_scan_bytes;
+        Ok(self)
+    }
+
+    /// Set the listener address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `bind` is loopback-only.
+    pub fn with_bind(mut self, bind: SocketAddr) -> Result<Self> {
+        if !bind.ip().is_loopback() {
+            return Err(anyhow!(
+                "refusing to bind on non-loopback address: {}",
+                bind.ip(),
+            ));
+        }
+        self.bind = bind;
+        Ok(self)
+    }
+
+    /// Add roots used to verify private upstream TLS endpoints.
+    #[must_use]
+    pub fn with_extra_upstream_roots(
+        mut self,
+        roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Self {
+        self.extra_upstream_roots = roots;
+        self
     }
 }
 
@@ -198,15 +269,13 @@ impl std::fmt::Debug for Proxy {
 impl Proxy {
     /// Build a proxy. Generates an ephemeral CA and loads native TLS roots
     /// for verifying upstream servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if certificate generation or TLS setup fails.
     pub fn new(scanner: Arc<dyn Scanner>, config: Config) -> Result<Self> {
-        if !config.bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "refusing to bind on non-loopback address: {}",
-                config.bind.ip(),
-            ));
-        }
         let ca = Ca::generate()?;
-        let go_bridge_token = bridge_token(ca.root_pem());
+        let go_bridge_token = bridge_token()?;
         let resolver = Arc::new(CaResolver::new(ca.clone()));
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
@@ -260,6 +329,10 @@ impl Proxy {
     }
 
     /// Bind the listener and start accepting. Returns a handle for shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listener cannot bind or report its address.
     pub async fn spawn(self) -> Result<Handle> {
         let listener = TcpListener::bind(self.inner.config.bind)
             .await
@@ -272,7 +345,7 @@ impl Proxy {
         Ok(Handle {
             addr,
             shutdown,
-            task,
+            task: Some(task),
         })
     }
 }
@@ -283,15 +356,26 @@ pub struct Handle {
     /// Bound address (with the kernel-assigned port resolved).
     pub addr: SocketAddr,
     shutdown: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Handle {
     /// Signal shutdown and wait for the accept loop to exit.
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.shutdown.notify_waiters();
-        // Best-effort: a panicked accept loop is logged elsewhere.
-        drop(self.task.await);
+        if let Some(task) = self.task.take() {
+            // Best-effort: connection failures are logged at their source.
+            drop(task.await);
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.shutdown.notify_waiters();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -299,7 +383,7 @@ async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: Arc<Notify>)
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.notified() => {
+            () = shutdown.notified() => {
                 tracing::debug!("proxy shutdown");
                 return;
             }
@@ -486,7 +570,7 @@ impl Proxy {
         *req.uri_mut() = new_uri;
 
         let headers = req.headers_mut();
-        strip_hop_by_hop(headers);
+        strip_hop_by_hop(headers)?;
         // Some clients send Proxy-Connection; hop-by-hop strip covers it. Reset Host.
         headers.insert(HOST, HeaderValue::try_from(host_header.as_str())?);
         if let Some(authorization) = url_authorization {
@@ -550,20 +634,29 @@ impl Proxy {
             return build_response(parts.status, &parts.headers, passthrough_body(body), None);
         }
 
-        match collect_or_spill(body, &scan_url, ram_cap, disk_cap).await? {
-            // Small enough to scan in RAM.
+        let buffered = collect_or_spill(body, &scan_url, ram_cap, disk_cap).await?;
+        self.finish_scanned_response(buffered, &scan_url, parts.status, &parts.headers)
+            .await
+    }
+
+    async fn finish_scanned_response(
+        &self,
+        buffered: Buffered,
+        scan_url: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+    ) -> Result<Response<ProxyBody>> {
+        match buffered {
+            Buffered::Memory(bytes) if bytes.is_empty() => {
+                tracing::debug!(url = scan_url, "forward (empty body)");
+                build_response(status, headers, full_body(bytes), Some(0))
+            }
             Buffered::Memory(bytes) => {
-                // An empty body (no Content-Length, so `is_bodyless` couldn't
-                // catch it above) has nothing to scan and chokes the analyzer.
-                if bytes.is_empty() {
-                    tracing::debug!(url = %scan_url, "forward (empty body)");
-                    return build_response(parts.status, &parts.headers, full_body(bytes), Some(0));
-                }
                 let verdict = self
                     .inner
                     .scanner
                     .scan(ScanRequest {
-                        url: scan_url.clone(),
+                        url: scan_url.to_owned(),
                         body: bytes.to_vec(),
                     })
                     .await
@@ -571,18 +664,20 @@ impl Proxy {
                 match verdict {
                     Verdict::Allow => {
                         let len = bytes.len() as u64;
-                        tracing::debug!(url = %scan_url, status = parts.status.as_u16(), bytes = len, "forward");
-                        build_response(parts.status, &parts.headers, full_body(bytes), Some(len))
+                        tracing::debug!(
+                            url = scan_url,
+                            status = status.as_u16(),
+                            bytes = len,
+                            "forward"
+                        );
+                        build_response(status, headers, full_body(bytes), Some(len))
                     }
                     Verdict::Block(reason) => {
-                        tracing::warn!(url = %scan_url, verdict = reason.label(), "block");
-                        Ok(blocked_response(&scan_url, &reason))
+                        tracing::warn!(url = scan_url, verdict = reason.label(), "block");
+                        Ok(blocked_response(scan_url, &reason))
                     }
                 }
             }
-            // Spilled to disk. `tmp` unlinks the spill file when it drops at the
-            // end of this function; any `File` opened from its path before then
-            // keeps the bytes alive until the response body is fully sent.
             Buffered::Spilled {
                 tmp,
                 path,
@@ -594,16 +689,18 @@ impl Proxy {
                     self.inner
                         .scanner
                         .scan_disk(DiskScanRequest {
-                            url: scan_url.clone(),
+                            url: scan_url.to_owned(),
                             path: path.clone(),
                             sha256,
                         })
                         .await
                         .context("disk scanner")?
                 } else {
-                    // Past the disk-scan cap (Content-Length was absent or wrong):
-                    // deliver the full body but do not scan it.
-                    tracing::debug!(url = %scan_url, len, "forward (spilled >scan cap, unscanned)");
+                    tracing::debug!(
+                        url = scan_url,
+                        len,
+                        "forward (spilled >scan cap, unscanned)"
+                    );
                     Verdict::Allow
                 };
                 match verdict {
@@ -611,19 +708,24 @@ impl Proxy {
                         let file = tokio::fs::File::open(&path)
                             .await
                             .context("reopen spill file for forwarding")?;
-                        tracing::debug!(url = %scan_url, status = parts.status.as_u16(), bytes = len, "forward (from disk)");
-                        let resp = build_response(
-                            parts.status,
-                            &parts.headers,
-                            file_body(file),
-                            Some(len),
+                        tracing::debug!(
+                            url = scan_url,
+                            status = status.as_u16(),
+                            bytes = len,
+                            "forward (from disk)"
                         );
-                        drop(tmp); // unlink now; the open fd above keeps the data live
-                        resp
+                        let response = build_response(status, headers, file_body(file), Some(len));
+                        drop(tmp);
+                        response
                     }
                     Verdict::Block(reason) => {
-                        tracing::warn!(url = %scan_url, bytes = len, verdict = reason.label(), "block");
-                        Ok(blocked_response(&scan_url, &reason))
+                        tracing::warn!(
+                            url = scan_url,
+                            bytes = len,
+                            verdict = reason.label(),
+                            "block"
+                        );
+                        Ok(blocked_response(scan_url, &reason))
                     }
                 }
             }
@@ -650,13 +752,7 @@ fn resolve_target(
         let url =
             url::Url::parse(&format!("https://{authority}{path}")).context("build mitm url")?;
         // RFC 7230 §5.4: the Host header should match the request target.
-        let host_header = url.host_str().map_or_else(
-            || authority.to_owned(),
-            |h| match url.port() {
-                Some(p) => format!("{h}:{p}"),
-                None => h.to_owned(),
-            },
-        );
+        let host_header = authority_header(&url).unwrap_or_else(|_| authority.to_owned());
         return Ok((url, host_header));
     }
     let uri = req.uri();
@@ -669,14 +765,19 @@ fn resolve_target(
         ));
     }
     let url = url::Url::parse(&uri.to_string()).context("parse absolute uri")?;
-    let host_header = url
-        .host_str()
-        .map(|h| match url.port() {
-            Some(p) => format!("{h}:{p}"),
-            None => h.to_owned(),
-        })
-        .ok_or_else(|| anyhow!("absolute URI missing host"))?;
+    let host_header = authority_header(&url)?;
     Ok((url, host_header))
+}
+
+/// Render an HTTP Host value, retaining the brackets required around IPv6
+/// literals. `Url::host_str()` intentionally omits those brackets.
+fn authority_header(url: &url::Url) -> Result<String> {
+    let host = url
+        .host()
+        .ok_or_else(|| anyhow!("absolute URI missing host"))?;
+    Ok(url
+        .port()
+        .map_or_else(|| host.to_string(), |port| format!("{host}:{port}")))
 }
 
 async fn upstream_request(
@@ -861,10 +962,9 @@ fn build_response(
     content_length: Option<u64>,
 ) -> Result<Response<ProxyBody>> {
     let mut builder = Response::builder().status(status);
-    for (k, v) in headers.iter() {
-        if is_hop_by_hop(k) {
-            continue;
-        }
+    let mut headers = headers.clone();
+    strip_hop_by_hop(&mut headers).context("sanitize upstream response headers")?;
+    for (k, v) in &headers {
         // When we set our own length, drop the inherited one to avoid duplicates.
         if content_length.is_some() && *k == CONTENT_LENGTH {
             continue;
@@ -934,19 +1034,27 @@ fn rewrite_go_bridge_location(headers: &mut hyper::HeaderMap, request_url: &url:
     }
 }
 
-fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
-    let to_remove: Vec<HeaderName> = headers
-        .keys()
-        .filter(|k| {
-            HOP_BY_HOP
-                .iter()
-                .any(|h| k.as_str().eq_ignore_ascii_case(h))
-        })
-        .cloned()
-        .collect();
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) -> Result<()> {
+    // RFC 7230 also makes every field named by `Connection` hop-by-hop. Merely
+    // removing the standard list can forward attacker-selected connection
+    // metadata and enables request-smuggling differentials between hops.
+    let mut to_remove = Vec::<HeaderName>::new();
+    for value in headers.get_all(CONNECTION) {
+        let value = value
+            .to_str()
+            .context("Connection header contains non-ASCII bytes")?;
+        for token in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            to_remove.push(
+                HeaderName::from_bytes(token.as_bytes())
+                    .with_context(|| format!("invalid Connection header token {token:?}"))?,
+            );
+        }
+    }
+    to_remove.extend(headers.keys().filter(|k| is_hop_by_hop(k)).cloned());
     for k in to_remove {
         headers.remove(k);
     }
+    Ok(())
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -996,12 +1104,23 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_bind() {
-        let scanner = Arc::new(crate::scanner::AllowAll) as Arc<dyn Scanner>;
-        let cfg = Config {
-            bind: ([0, 0, 0, 0], 0).into(),
-            ..Config::default()
-        };
-        assert!(Proxy::new(scanner, cfg).is_err());
+        assert!(
+            Config::default()
+                .with_bind(([0, 0, 0, 0], 0).into())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_scan_limits() {
+        assert!(Config::default().with_scan_limits(0, 1).is_err());
+        assert!(Config::default().with_scan_limits(2, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_environment_limits() {
+        assert!(megabytes_to_bytes("LIMIT", "not-a-number").is_err());
+        assert!(megabytes_to_bytes("LIMIT", &u64::MAX.to_string()).is_err());
     }
 
     #[test]
@@ -1010,9 +1129,21 @@ mod tests {
         headers.insert("connection", "close".parse().unwrap());
         headers.insert("keep-alive", "timeout=5".parse().unwrap());
         headers.insert("content-type", "text/plain".parse().unwrap());
-        strip_hop_by_hop(&mut headers);
+        strip_hop_by_hop(&mut headers).unwrap();
         assert!(!headers.contains_key("connection"));
         assert!(!headers.contains_key("keep-alive"));
+        assert!(headers.contains_key("content-type"));
+    }
+
+    #[test]
+    fn strip_hop_by_hop_removes_connection_nominated_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "x-internal, keep-alive".parse().unwrap());
+        headers.insert("x-internal", "do-not-forward".parse().unwrap());
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        strip_hop_by_hop(&mut headers).unwrap();
+        assert!(!headers.contains_key("x-internal"));
+        assert!(!headers.contains_key("connection"));
         assert!(headers.contains_key("content-type"));
     }
 

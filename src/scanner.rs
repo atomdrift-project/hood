@@ -15,13 +15,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use scan::Analyzer;
 use scan::bloom_repo::{Decision, Lookup};
 use scan::engine::ScanResult;
 use scan::model::Classification;
-use scan::Analyzer;
 use sha2::{Digest, Sha256};
+
+const HOOD_SCAN_LEVEL: u16 = 25;
 
 /// Outcome of scanning a single payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +52,7 @@ pub enum BlockReason {
 impl BlockReason {
     /// Short human-readable label for log and error messages.
     #[must_use]
-    pub fn label(&self) -> &str {
+    pub const fn label(&self) -> &str {
         match self {
             Self::KnownBad(_) => "known-bad",
             Self::Hostile => "hostile",
@@ -70,8 +73,9 @@ pub struct ScanRequest {
     pub body: Vec<u8>,
 }
 
-/// A payload too large to buffer in RAM, spilled to a temporary file. The
-/// SHA-256 is computed incrementally as the body streams to disk, so the bloom
+/// A payload too large to buffer in RAM, spilled to a temporary file.
+///
+/// The SHA-256 is computed incrementally as the body streams to disk, so the bloom
 /// gate runs without re-reading the file, and cleave memory-maps the path so the
 /// ML scan's resident memory stays bounded regardless of payload size.
 #[derive(Debug)]
@@ -156,30 +160,119 @@ pub enum ScanPolicy {
 /// In-process atomscan scanner.
 ///
 /// Construct with [`AtomScanner::load`], which loads model artifacts and
-/// warms cleave's shared resources via [`Analyzer::load`]. The struct is
-/// cheap to clone (everything is held behind `Arc`) and is `Send + Sync` so
-/// the proxy can share it across all concurrent connections.
-#[derive(Clone)]
+/// warms cleave's shared resources via [`Analyzer::load`]. Only the analyzer
+/// is reference-counted because blocking scan jobs require `'static` ownership;
+/// the proxy owns the scanner itself behind one shared trait object.
 pub struct AtomScanner {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    analyzer: Analyzer,
+    analyzer: Arc<Analyzer>,
     policy: ScanPolicy,
     invocation: String,
-    /// Known-good/known-bad bloom filters, when synced. `None` disables the
-    /// fast path entirely (no hashing, no lookups) — the safe, zero-overhead
-    /// default on a machine that has never run `atomscan update-rules`.
+    status: Option<Arc<ScanStats>>,
     bloom: Option<Lookup>,
+}
+
+/// Thread-safe counters used to summarize a verbose Hood run.
+#[derive(Debug, Default)]
+pub struct ScanStats {
+    passed: AtomicU64,
+    suspicious_blocked: AtomicU64,
+    suspicious_forwarded: AtomicU64,
+    hostile_blocked: AtomicU64,
+    hostile_forwarded: AtomicU64,
+    errors_blocked: AtomicU64,
+    errors_forwarded: AtomicU64,
+}
+
+/// Stable snapshot of the model-scan outcomes in one Hood invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanSummary {
+    /// Downloads classified as benign.
+    pub passed: u64,
+    /// Suspicious downloads withheld by policy.
+    pub suspicious_blocked: u64,
+    /// Suspicious downloads forwarded by policy.
+    pub suspicious_forwarded: u64,
+    /// Hostile downloads withheld by policy.
+    pub hostile_blocked: u64,
+    /// Hostile downloads forwarded by policy.
+    pub hostile_forwarded: u64,
+    /// Scan errors withheld by policy.
+    pub errors_blocked: u64,
+    /// Scan errors forwarded by policy.
+    pub errors_forwarded: u64,
+}
+
+impl ScanSummary {
+    /// Total number of downloads submitted to the model scanner.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.passed
+            + self.suspicious_blocked
+            + self.suspicious_forwarded
+            + self.hostile_blocked
+            + self.hostile_forwarded
+            + self.errors_blocked
+            + self.errors_forwarded
+    }
+
+    /// Total number of downloads Hood withheld.
+    #[must_use]
+    pub const fn blocked(self) -> u64 {
+        self.suspicious_blocked + self.hostile_blocked + self.errors_blocked
+    }
+}
+
+impl ScanStats {
+    fn record(&self, classification: Classification, disposition: crate::output::Disposition) {
+        let counter = match (classification, disposition) {
+            (Classification::Benign, _) => &self.passed,
+            (Classification::Suspicious, crate::output::Disposition::Blocked) => {
+                &self.suspicious_blocked
+            }
+            (Classification::Suspicious, crate::output::Disposition::Forwarded) => {
+                &self.suspicious_forwarded
+            }
+            (Classification::Hostile, crate::output::Disposition::Blocked) => &self.hostile_blocked,
+            (Classification::Hostile, crate::output::Disposition::Forwarded) => {
+                &self.hostile_forwarded
+            }
+            _ => {
+                self.record_error(disposition);
+                return;
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_error(&self, disposition: crate::output::Disposition) {
+        let counter = match disposition {
+            crate::output::Disposition::Blocked => &self.errors_blocked,
+            crate::output::Disposition::Forwarded => &self.errors_forwarded,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a consistent-enough diagnostic snapshot after the proxy stops.
+    #[must_use]
+    pub fn snapshot(&self) -> ScanSummary {
+        ScanSummary {
+            passed: self.passed.load(Ordering::Relaxed),
+            suspicious_blocked: self.suspicious_blocked.load(Ordering::Relaxed),
+            suspicious_forwarded: self.suspicious_forwarded.load(Ordering::Relaxed),
+            hostile_blocked: self.hostile_blocked.load(Ordering::Relaxed),
+            hostile_forwarded: self.hostile_forwarded.load(Ordering::Relaxed),
+            errors_blocked: self.errors_blocked.load(Ordering::Relaxed),
+            errors_forwarded: self.errors_forwarded.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl std::fmt::Debug for AtomScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomScanner")
-            .field("policy", &self.inner.policy)
-            .field("model_dir", &self.inner.analyzer.model_dir())
-            .finish()
+            .field("policy", &self.policy)
+            .field("model_dir", &self.analyzer.model_dir())
+            .finish_non_exhaustive()
     }
 }
 
@@ -187,29 +280,57 @@ impl AtomScanner {
     /// Load model artifacts from disk and prepare a ready-to-use scanner.
     ///
     /// `model_dir` is the same directory passed to `atomscan --model-dir`;
-    /// when `None`, the scan models_repo resolver is used (auto-clone on
+    /// when `None`, the scan `models_repo` resolver is used (auto-clone on
     /// first call).
     ///
     /// `invocation` is the shell-quoted command the user ran (e.g.
     /// `"curl -fsSL https://x"`), surfaced in the bypass hint of the
     /// stderr panel so they can copy/paste a working command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model directory or analyzer cannot be loaded.
     pub fn load(
         model_dir: Option<PathBuf>,
         policy: ScanPolicy,
         invocation: String,
     ) -> Result<Self> {
+        Self::load_with_status(model_dir, policy, invocation, None)
+    }
+
+    /// Load the scanner and attach counters for verbose status reporting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model directory or analyzer cannot be loaded.
+    pub fn load_with_status(
+        model_dir: Option<PathBuf>,
+        policy: ScanPolicy,
+        invocation: String,
+        status: Option<Arc<ScanStats>>,
+    ) -> Result<Self> {
         let model_dir = match model_dir {
             Some(d) => d,
             None => scan::models_repo::model_dir().context("resolve scan model dir")?,
         };
-        let analyzer = Analyzer::load(model_dir).context("load scan analyzer")?;
+        // Hood deliberately shares Scan's L25 operating point. Fail closed if
+        // a future dependency update changes that contract silently.
+        if scan::model::DEFAULT_SEVERITY_LEVEL != HOOD_SCAN_LEVEL {
+            anyhow::bail!(
+                "scan default level changed from L{HOOD_SCAN_LEVEL} to L{}",
+                scan::model::DEFAULT_SEVERITY_LEVEL,
+            );
+        }
+        let analyzer = Analyzer::load(model_dir)
+            .context("load scan analyzer")?
+            .with_level(Some(HOOD_SCAN_LEVEL));
+        tracing::debug!(level = HOOD_SCAN_LEVEL, "Atomdrift Hood scanner ready");
         Ok(Self {
-            inner: Arc::new(Inner {
-                analyzer,
-                policy,
-                invocation,
-                bloom: load_bloom(),
-            }),
+            analyzer: Arc::new(analyzer),
+            policy,
+            invocation,
+            status,
+            bloom: load_bloom(),
         })
     }
 
@@ -218,21 +339,15 @@ impl AtomScanner {
     /// block), or `None` to fall through to the ML scan. Hashes the body, then
     /// defers to [`bloom_gate_sha`].
     fn bloom_gate(&self, req: &ScanRequest) -> Option<Verdict> {
-        let lookup = self.inner.bloom.as_ref()?;
+        let lookup = self.bloom.as_ref()?;
         let mut hasher = Sha256::new();
         hasher.update(&req.body);
         let sha: [u8; 32] = hasher.finalize().into();
-        bloom_gate_sha(
-            lookup,
-            self.inner.policy,
-            &self.inner.invocation,
-            &req.url,
-            &sha,
-        )
+        bloom_gate_sha(lookup, self.policy, &self.invocation, &req.url, &sha)
     }
 
     fn verdict_for(&self, result: &ScanResult) -> Verdict {
-        verdict_from(result.classification, self.inner.policy)
+        verdict_from(result.classification, self.policy)
     }
 
     /// Turn a raw analyzer result into a [`Verdict`], emitting the appropriate
@@ -240,16 +355,36 @@ impl AtomScanner {
     /// active policy. Shared by the in-memory ([`Scanner::scan`]) and
     /// streamed-to-disk ([`Scanner::scan_disk`]) paths so both render identically.
     fn classify_result(&self, url: &str, result: Result<ScanResult>) -> Verdict {
+        let result = result.and_then(|result| {
+            if !result.probability.is_finite()
+                || !(0.0..=1.0).contains(&result.probability)
+                || !result.threshold.is_finite()
+                || !(0.0..=1.0).contains(&result.threshold)
+            {
+                anyhow::bail!(
+                    "scanner returned invalid probability/threshold ({:?}/{:?})",
+                    result.probability,
+                    result.threshold,
+                );
+            }
+            Ok(result)
+        });
         match result {
             Ok(r) => {
                 let verdict = self.verdict_for(&r);
+                let disposition = match &verdict {
+                    Verdict::Allow => crate::output::Disposition::Forwarded,
+                    Verdict::Block(_) => crate::output::Disposition::Blocked,
+                };
+                if let Some(status) = &self.status {
+                    status.record(r.classification, disposition);
+                }
                 if matches!(r.classification, Classification::Benign) {
                     tracing::debug!(url, probability = r.probability, "scan clean");
+                    if self.status.is_some() {
+                        crate::output::emit_pass(url, r.probability);
+                    }
                 } else {
-                    let disposition = match &verdict {
-                        Verdict::Allow => crate::output::Disposition::Forwarded,
-                        Verdict::Block(_) => crate::output::Disposition::Blocked,
-                    };
                     // `top_findings` is already deduped, ranked strongest-first,
                     // and capped at 5 by the engine; take the leading three to
                     // keep the panel tight.
@@ -263,31 +398,34 @@ impl AtomScanner {
                         // classification, so there is nothing to attribute here.
                         original: None,
                         disposition,
-                        policy: self.inner.policy,
+                        policy: self.policy,
                         probability: r.probability,
                         url,
                         traits: traits_slice,
                         reasons: reasons_slice,
-                        invocation: &self.inner.invocation,
+                        invocation: &self.invocation,
                     });
                 }
                 verdict
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                let policy = self.inner.policy;
+                let policy = self.policy;
                 let allowed = policy_allows_error(policy);
                 let disposition = if allowed {
                     crate::output::Disposition::Forwarded
                 } else {
                     crate::output::Disposition::Blocked
                 };
+                if let Some(status) = &self.status {
+                    status.record_error(disposition);
+                }
                 crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
                     url,
                     error: &msg,
                     policy,
                     disposition,
-                    invocation: &self.inner.invocation,
+                    invocation: &self.invocation,
                 });
                 if allowed {
                     Verdict::Allow
@@ -368,7 +506,7 @@ enum GateOutcome {
 /// Resolve the two bloom channels + policy into an action. Pulled out so the
 /// precedence (known-bad wins; a known-good *hash or PURL* skips) is
 /// unit-testable without loading real filters.
-fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) -> GateOutcome {
+const fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) -> GateOutcome {
     if matches!(by_hash, Decision::KnownBad) || matches!(by_purl, Decision::KnownBad) {
         // Known-bad is at least as severe as an ML "hostile" verdict, so only
         // the top bypass tier (forward everything) lets it through.
@@ -389,9 +527,12 @@ fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) -> Gat
 /// Load the bloom filters, honoring `HOOD_NO_BLOOM` and dropping an empty
 /// (unsynced) set so the gate is a no-op rather than a wasted hash per payload.
 fn load_bloom() -> Option<Lookup> {
-    if std::env::var_os("HOOD_NO_BLOOM").is_some_and(|v| !v.is_empty()) {
-        tracing::debug!("HOOD_NO_BLOOM set — bloom fast path disabled");
-        return None;
+    if let Some(value) = std::env::var_os("HOOD_NO_BLOOM") {
+        if value == "1" {
+            tracing::debug!("HOOD_NO_BLOOM=1 — bloom fast path disabled");
+            return None;
+        }
+        tracing::warn!("invalid HOOD_NO_BLOOM value ignored; bloom gate remains enabled");
     }
     let lookup = Lookup::load();
     lookup.is_active().then_some(lookup)
@@ -415,12 +556,9 @@ fn hex32(digest: &[u8; 32]) -> String {
 /// `policy_allows_error`; this function only sees successful classifications.
 fn verdict_from(classification: Classification, policy: ScanPolicy) -> Verdict {
     match (classification, policy) {
-        // Bypass forwards every classification.
-        (_, ScanPolicy::Bypass) => Verdict::Allow,
-        // Benign is always allowed.
-        (Classification::Benign, _) => Verdict::Allow,
-        // Suspicious: allowed by AllowSuspicious (and Bypass, handled above).
-        (Classification::Suspicious, ScanPolicy::AllowSuspicious) => Verdict::Allow,
+        (_, ScanPolicy::Bypass)
+        | (Classification::Benign, _)
+        | (Classification::Suspicious, ScanPolicy::AllowSuspicious) => Verdict::Allow,
         // Block paths.
         (Classification::Hostile, _) => Verdict::Block(BlockReason::Hostile),
         (Classification::Suspicious, _) => Verdict::Block(BlockReason::Suspicious),
@@ -453,17 +591,19 @@ impl Scanner for AtomScanner {
         // Analyzer::scan_bytes is CPU-bound (XGBoost + cleave). Run it on
         // the blocking pool so the proxy's async reactor isn't stalled by a
         // multi-megabyte binary classification.
-        let inner = Arc::clone(&self.inner);
-        let url = req.url.clone();
-        let body = req.body;
-        let result = tokio::task::spawn_blocking(move || inner.analyzer.scan_bytes(body, &url))
-            .await
-            .context("scan task join")?;
-        Ok(self.classify_result(&req.url, result))
+        let ScanRequest { url, body } = req;
+        let analyzer = Arc::clone(&self.analyzer);
+        let (url, result) = tokio::task::spawn_blocking(move || {
+            let result = analyzer.scan_bytes(body, &url);
+            (url, result)
+        })
+        .await
+        .context("scan task join")?;
+        Ok(self.classify_result(&url, result))
     }
 
     fn prefetch(&self, url: &str) -> Prefetch {
-        let Some(lookup) = self.inner.bloom.as_ref() else {
+        let Some(lookup) = self.bloom.as_ref() else {
             return Prefetch::Proceed;
         };
         let Some(purl) = fletch::url_to_purl(url) else {
@@ -478,20 +618,20 @@ impl Scanner for AtomScanner {
             // Known-bad PURL: withhold before downloading a byte. `HOOD_BYPASS=3`
             // forwards it (still unscanned) instead of blocking.
             Decision::KnownBad => {
-                let blocked = !matches!(self.inner.policy, ScanPolicy::Bypass);
+                let blocked = !matches!(self.policy, ScanPolicy::Bypass);
                 crate::output::emit_known_bad(&crate::output::KnownBadPanel {
                     url,
                     // No bytes fetched yet, so no hash to link — the panel keys
                     // the match on the PURL instead.
                     sha256: "",
                     purl: Some(&purl),
-                    policy: self.inner.policy,
+                    policy: self.policy,
                     disposition: if blocked {
                         crate::output::Disposition::Blocked
                     } else {
                         crate::output::Disposition::Forwarded
                     },
-                    invocation: &self.inner.invocation,
+                    invocation: &self.invocation,
                 });
                 if blocked {
                     Prefetch::Block(BlockReason::KnownBad(purl))
@@ -506,27 +646,24 @@ impl Scanner for AtomScanner {
     async fn scan_disk(&self, req: DiskScanRequest) -> Result<Verdict> {
         // Bloom gate on the SHA computed while streaming to disk (plus the URL's
         // PURL) — no re-read of the file. A decisive hit skips the ML scan.
-        if let Some(lookup) = self.inner.bloom.as_ref() {
-            if let Some(verdict) = bloom_gate_sha(
-                lookup,
-                self.inner.policy,
-                &self.inner.invocation,
-                &req.url,
-                &req.sha256,
-            ) {
-                return Ok(verdict);
-            }
+        if let Some(lookup) = self.bloom.as_ref()
+            && let Some(verdict) =
+                bloom_gate_sha(lookup, self.policy, &self.invocation, &req.url, &req.sha256)
+        {
+            return Ok(verdict);
         }
 
         // cleave memory-maps the file, so this classifies a multi-hundred-megabyte
         // payload without loading it whole into RAM. Still CPU-bound → blocking pool.
-        let inner = Arc::clone(&self.inner);
-        let url = req.url.clone();
-        let path = req.path.clone();
-        let result = tokio::task::spawn_blocking(move || inner.analyzer.scan_file(&path, &url))
-            .await
-            .context("disk scan task join")?;
-        Ok(self.classify_result(&req.url, result))
+        let DiskScanRequest { url, path, .. } = req;
+        let analyzer = Arc::clone(&self.analyzer);
+        let (url, result) = tokio::task::spawn_blocking(move || {
+            let result = analyzer.scan_file(&path, &url);
+            (url, result)
+        })
+        .await
+        .context("disk scan task join")?;
+        Ok(self.classify_result(&url, result))
     }
 }
 
@@ -557,6 +694,39 @@ mod tests {
         assert_eq!(BlockReason::Hostile.label(), "hostile");
         assert_eq!(BlockReason::Suspicious.label(), "suspicious");
         assert_eq!(BlockReason::ScanError("boom".into()).label(), "scan-error");
+    }
+
+    #[test]
+    fn hood_uses_scan_l25_default() {
+        assert_eq!(scan::model::DEFAULT_SEVERITY_LEVEL, 25);
+    }
+
+    #[test]
+    fn scan_stats_separate_verdicts_from_policy_actions() {
+        let stats = ScanStats::default();
+        stats.record(
+            Classification::Benign,
+            crate::output::Disposition::Forwarded,
+        );
+        stats.record(
+            Classification::Suspicious,
+            crate::output::Disposition::Blocked,
+        );
+        stats.record(
+            Classification::Suspicious,
+            crate::output::Disposition::Forwarded,
+        );
+        stats.record_error(crate::output::Disposition::Blocked);
+        assert_eq!(
+            stats.snapshot(),
+            ScanSummary {
+                passed: 1,
+                suspicious_blocked: 1,
+                suspicious_forwarded: 1,
+                errors_blocked: 1,
+                ..ScanSummary::default()
+            }
+        );
     }
 
     // ----- bloom gate ------------------------------------------------------
@@ -734,9 +904,10 @@ mod tests {
         assert_eq!(s.len(), 64);
         assert!(s.starts_with("00ff"));
         assert!(s.ends_with("ab"));
-        assert!(s
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     // ----- verdict matrix --------------------------------------------------

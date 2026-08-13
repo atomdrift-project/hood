@@ -346,10 +346,6 @@ impl AtomScanner {
         bloom_gate_sha(lookup, self.policy, &self.invocation, &req.url, &sha)
     }
 
-    fn verdict_for(&self, result: &ScanResult) -> Verdict {
-        verdict_from(result.classification, self.policy)
-    }
-
     /// Turn a raw analyzer result into a [`Verdict`], emitting the appropriate
     /// panel — a non-benign classification, or a scan error handled under the
     /// active policy. Shared by the in-memory ([`Scanner::scan`]) and
@@ -371,7 +367,7 @@ impl AtomScanner {
         });
         match result {
             Ok(r) => {
-                let verdict = self.verdict_for(&r);
+                let verdict = verdict_from(r.classification, self.policy);
                 let disposition = match &verdict {
                     Verdict::Allow => crate::output::Disposition::Forwarded,
                     Verdict::Block(_) => crate::output::Disposition::Blocked,

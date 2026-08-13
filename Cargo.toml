@@ -61,7 +61,6 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
-getrandom = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }

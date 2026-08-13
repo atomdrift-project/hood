@@ -62,7 +62,7 @@ use crate::scanner::{BlockReason, DiskScanRequest, Prefetch, ScanRequest, Scanne
 /// The proxy's response body. A [`BoxBody`] so one return type covers three
 /// shapes: a fully-buffered small response ([`full_body`]), an upstream body
 /// streamed straight through ([`passthrough_body`]), and a large payload
-/// streamed back from its on-disk spill file ([`file_body`]).
+/// streamed back from its on-disk spill file.
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
 /// Wrap fully-buffered bytes as a [`ProxyBody`].
@@ -75,14 +75,6 @@ fn full_body(bytes: Bytes) -> ProxyBody {
 /// used for known-good-PURL skips and payloads too large to scan.
 fn passthrough_body(body: Incoming) -> ProxyBody {
     body.map_err(std::io::Error::other).boxed()
-}
-
-/// Stream a spill file back to the client. The file is read in chunks, so a
-/// multi-gigabyte forward never materializes in RAM. The caller unlinks the
-/// path before handing back the [`tokio::fs::File`]; the open descriptor keeps
-/// the data alive until the body is fully sent, then the OS reclaims it.
-fn file_body(file: tokio::fs::File) -> ProxyBody {
-    StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)).boxed()
 }
 
 /// Upper bound on a response body buffered *in memory* for scanning. Larger
@@ -105,23 +97,16 @@ const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 fn bridge_token() -> Result<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut random = [0_u8; 16];
-    getrandom::fill(&mut random).context("generate Go bridge route token")?;
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut random)
+        .map_err(|error| anyhow!("generate Go bridge route token: {error:?}"))?;
     let mut out = String::with_capacity(32);
     for byte in random {
         out.push(char::from(HEX[usize::from(byte >> 4)]));
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Ok(out)
-}
-
-/// Resolve the in-memory body cap from the environment, falling back to the default.
-fn max_body_bytes_from_env() -> Result<u64> {
-    Ok(mb_env("HOOD_MAX_BODY_MB")?.unwrap_or(MAX_BODY_BYTES_DEFAULT))
-}
-
-/// Resolve the disk-scan cap from the environment, falling back to the default.
-fn max_scan_bytes_from_env() -> Result<u64> {
-    Ok(mb_env("HOOD_MAX_SCAN_MB")?.unwrap_or(MAX_SCAN_BYTES_DEFAULT))
 }
 
 /// Read a megabyte-valued env var and convert it to bytes.
@@ -192,7 +177,9 @@ impl Config {
     ///
     /// Returns an error if the configured limits are zero or out of order.
     pub fn from_env() -> Result<Self> {
-        Self::default().with_scan_limits(max_body_bytes_from_env()?, max_scan_bytes_from_env()?)
+        let max_body_bytes = mb_env("HOOD_MAX_BODY_MB")?.unwrap_or(MAX_BODY_BYTES_DEFAULT);
+        let max_scan_bytes = mb_env("HOOD_MAX_SCAN_MB")?.unwrap_or(MAX_SCAN_BYTES_DEFAULT);
+        Self::default().with_scan_limits(max_body_bytes, max_scan_bytes)
     }
 
     /// Set the in-memory and total scan limits.
@@ -619,7 +606,11 @@ impl Proxy {
         // length — has nothing to scan. Forward it as-is (preserving upstream
         // headers, e.g. a HEAD's echoed Content-Length); handing an empty buffer
         // to the analyzer just yields a spurious "unexpected end of file" block.
-        if is_bodyless(&method, parts.status, &parts.headers) {
+        if method == Method::HEAD
+            || parts.status == StatusCode::NO_CONTENT
+            || parts.status == StatusCode::NOT_MODIFIED
+            || content_length(&parts.headers) == Some(0)
+        {
             tracing::debug!(url = %scan_url, "forward (no body to scan)");
             return build_response(parts.status, &parts.headers, passthrough_body(body), None);
         }
@@ -714,7 +705,11 @@ impl Proxy {
                             bytes = len,
                             "forward (from disk)"
                         );
-                        let response = build_response(status, headers, file_body(file), Some(len));
+                        // Stream the open, unlinked spill file; the descriptor
+                        // keeps it alive until the response body is consumed.
+                        let body =
+                            StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)).boxed();
+                        let response = build_response(status, headers, body, Some(len));
                         drop(tmp);
                         response
                     }
@@ -927,17 +922,6 @@ fn temp_suffix(url: &str) -> String {
         }
         _ => String::new(),
     }
-}
-
-/// True when a response is defined to carry no message body, so scanning it is
-/// both pointless and — for archive-typed URLs — actively wrong (an empty buffer
-/// trips cleave's "unexpected end of file"). Covers HEAD replies, `204 No
-/// Content`, `304 Not Modified`, and an explicit `Content-Length: 0`.
-fn is_bodyless(method: &Method, status: StatusCode, headers: &hyper::HeaderMap) -> bool {
-    *method == Method::HEAD
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
-        || content_length(headers) == Some(0)
 }
 
 /// Parse a `Content-Length` header into a byte count, if present and well-formed.

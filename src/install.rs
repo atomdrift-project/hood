@@ -70,14 +70,6 @@ fn layout_default() -> Result<Layout> {
     Ok(Layout::at_home(home))
 }
 
-/// Absolute path of the current hood binary — the target every shim symlink
-/// points at. We prefer the canonicalized path so symlinks resolve to a
-/// stable location regardless of how hood was launched.
-fn hood_binary_path() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("resolve current_exe")?;
-    Ok(exe.canonicalize().unwrap_or(exe))
-}
-
 /// Names hood will respond to when invoked via a symlink. Mirrors
 /// [`Tool::SHIMMABLE`] but lifted into a slice of `&'static str` for easy
 /// matching against `argv[0]`.
@@ -119,7 +111,9 @@ pub fn tool_from_argv0(argv0: &str) -> Option<Tool> {
 /// (symlink-and-rename for links; append-or-replace bracketed block for rc).
 pub fn install(force: bool) -> Result<i32> {
     let layout = layout_default()?;
-    let hood_bin = hood_binary_path()?;
+    let hood_bin = std::env::current_exe().context("resolve current_exe")?;
+    // A canonical target keeps every shim stable regardless of how Hood ran.
+    let hood_bin = hood_bin.canonicalize().unwrap_or(hood_bin);
     let report = install_at(&layout, &hood_bin, force, std::env::consts::OS)?;
     print_install_report(&layout, &hood_bin, &report);
     Ok(0)

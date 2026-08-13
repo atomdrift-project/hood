@@ -212,18 +212,14 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let mut cli = parse_cli_with_argv0_dispatch();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let mut cli = Cli::parse_from(rewrite_argv_for_shim(argv));
     cli.verbose = resolve_verbose(cli.verbose);
     init_logging(cli.verbose);
 
-    // Install the ring crypto provider for rustls. Without this rustls panics
-    // the first time it needs default crypto.
-    if rustls::crypto::ring::default_provider()
-        .install_default()
-        .is_err()
-    {
-        // Another caller (tests, etc.) already installed it — fine.
-    }
+    // Install Ring before rustls needs default crypto. An existing process-wide
+    // provider is already usable.
+    drop(rustls::crypto::ring::default_provider().install_default());
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -245,20 +241,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Busybox-style entrypoint: if `argv[0]`'s basename matches one of hood's
-/// known tool shims (installed via `hood install`), translate the invocation
-/// into the corresponding `hood <tool> <args>` form before clap parses it.
-///
-/// Falls back to the normal CLI when `argv[0]` is `hood` (the canonical name)
-/// or anything unrecognized.
-fn parse_cli_with_argv0_dispatch() -> Cli {
-    let argv: Vec<OsString> = std::env::args_os().collect();
-    Cli::parse_from(rewrite_argv_for_shim(argv))
-}
-
-/// Pure-function half of [`parse_cli_with_argv0_dispatch`]: takes the raw argv
-/// and, if `argv[0]`'s basename is a recognized tool shim, prepends `hood`
-/// and the canonical tool name. Otherwise the argv is returned unchanged.
+/// If `argv[0]` is a known tool shim, prepend `hood` and the canonical tool
+/// name before clap parses it. Otherwise return the arguments unchanged.
 fn rewrite_argv_for_shim(argv: Vec<OsString>) -> Vec<OsString> {
     let Some(argv0) = argv.first() else {
         return argv;

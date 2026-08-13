@@ -280,7 +280,12 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
         Disposition::Blocked => "block",
         Disposition::Forwarded => "forward",
     };
-    let traits = format_traits_inline(p.traits);
+    let traits = p
+        .traits
+        .iter()
+        .map(|finding| finding.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let reasons: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
     writeln!(
         w,
@@ -632,14 +637,6 @@ const fn policy_tag(p: ScanPolicy) -> &'static str {
         ScanPolicy::AllowSuspicious => "HOOD_BYPASS=2",
         ScanPolicy::Bypass => "HOOD_BYPASS=3",
     }
-}
-
-fn format_traits_inline(traits: &[TopFinding]) -> String {
-    traits
-        .iter()
-        .map(|t| t.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 const fn classification_label(c: Classification) -> &'static str {

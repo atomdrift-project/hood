@@ -400,67 +400,41 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
         return Dispatch::Intercept(args);
     }
 
-    // Decide whether this invocation touches the network. Most tools express
-    // the operation as a leading positional subcommand (`npm install`); the
-    // Arch and RPM families express it as a flag (`pacman -S`, `rpm -U`), so
-    // they get dedicated detectors that read the whole argv.
+    // Most tools fetch through a positional verb (`npm install`). Arch tools
+    // use operation flags, while rpm fetches only when given a remote URL.
     let fetches = match tool {
         Tool::Pacman => pacman_fetches(&args),
         Tool::Yay | Tool::Paru => aur_helper_fetches(&args),
         Tool::Makepkg => makepkg_fetches(&args),
-        Tool::Rpm => rpm_fetches(&args),
-        _ => has_fetching_subcommand(tool, &args),
+        Tool::Rpm => args.iter().any(|arg| is_remote_url(&arg.to_string_lossy())),
+        // Search every positional token so global option values cannot hide a
+        // later fetch verb such as `npm --prefix /tmp install`.
+        _ => args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            !arg.starts_with('-')
+                && !arg.starts_with('+')
+                && is_fetching_subcommand(tool, Some(arg.as_ref()))
+        }),
     };
     if !fetches {
         return Dispatch::Passthrough(args);
     }
 
-    // For npm-family install-style subcommands, inject --ignore-scripts so we
-    // match pnpm's default safety posture. The user can opt back in with
-    // --enable-scripts on the hood command.
-    let final_args = if runs_install_scripts(tool, leading_subcommand(&args).as_deref()) {
+    // Only the leading verb controls lifecycle scripts; a later flag value
+    // resembling a verb must not trigger argument injection.
+    let leading_subcommand = args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .find(|arg| !arg.starts_with('-') && !arg.starts_with('+'));
+    let runs_install_scripts = matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun)
+        && leading_subcommand.as_deref() != Some("x")
+        && is_fetching_subcommand(tool, leading_subcommand.as_deref());
+    let final_args = if runs_install_scripts {
         maybe_add_ignore_scripts(args, enable_scripts)
     } else {
         args
     };
     Dispatch::Intercept(final_args)
-}
-
-/// True when a subcommand installs dependencies and thus runs lifecycle scripts
-/// worth suppressing with `--ignore-scripts`. Gated on the *leading* subcommand
-/// (so a fetch verb appearing only as a flag value doesn't trigger injection),
-/// and excludes `bun x` — that's exec, not install, so the flag would be handed
-/// to the executed package and suppress nothing.
-fn runs_install_scripts(tool: Tool, sub: Option<&str>) -> bool {
-    matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun)
-        && sub != Some("x")
-        && is_fetching_subcommand(tool, sub)
-}
-
-/// The leading subcommand token: the first argument that is neither a flag
-/// (`-…`) nor a toolchain selector (`+nightly`, which cargo/rustup consume
-/// before the real subcommand). `None` when the invocation is all flags (e.g.
-/// bare `npm`). We don't expand combined short flags — the only question is
-/// which token is the subcommand.
-fn leading_subcommand(args: &[OsString]) -> Option<String> {
-    args.iter()
-        .map(|a| a.to_string_lossy())
-        .find(|s| !s.starts_with('-') && !s.starts_with('+'))
-        .map(std::borrow::Cow::into_owned)
-}
-
-/// True when *any* non-flag, non-toolchain token is a fetching subcommand for
-/// the tool. Checking every token (not just the first) is the security-biased
-/// choice: a leading toolchain selector (`cargo +nightly install`) or a
-/// value-taking global flag (`npm --prefix /tmp install`, `pip --log f install`)
-/// would otherwise push the real subcommand out of first position and pass the
-/// fetch through unscanned. Scanning an occasional local command by mistake is
-/// the safe failure mode; missing a real download is not.
-fn has_fetching_subcommand(tool: Tool, args: &[OsString]) -> bool {
-    args.iter().any(|a| {
-        let s = a.to_string_lossy();
-        !s.starts_with('-') && !s.starts_with('+') && is_fetching_subcommand(tool, Some(s.as_ref()))
-    })
 }
 
 /// Per-tool subcommand list that triggers interception. Anything not in the
@@ -656,13 +630,6 @@ fn makepkg_fetches(args: &[OsString]) -> bool {
     })
 }
 
-/// True when an `rpm` invocation names a remote payload. rpm installs local
-/// files the vast majority of the time; it only reaches the network when an
-/// argument is an explicit `http(s)`/`ftp(s)` URL, so that is the precise trigger.
-fn rpm_fetches(args: &[OsString]) -> bool {
-    args.iter().any(|a| is_remote_url(&a.to_string_lossy()))
-}
-
 /// True when `s` begins with a remote URL scheme libcurl would fetch. URL
 /// schemes are case-insensitive (RFC 3986 §3.1), so `HTTPS://` must match too —
 /// matching only lowercase would let `rpm -i HTTPS://host/x.rpm` fetch unscanned.
@@ -783,10 +750,6 @@ impl PreparedChildEnv {
     /// Add macOS Go bridge settings to the environment.
     pub fn set_go_bridge(&mut self, go: GoChildEnv) {
         self.env.go = Some(go);
-    }
-
-    const fn env(&self) -> &ChildEnv {
-        &self.env
     }
 }
 
@@ -1041,7 +1004,7 @@ pub async fn run_child(
     env: &PreparedChildEnv,
     shim_dir: Option<&Path>,
 ) -> Result<i32> {
-    execute(program, args, Some(env.env()), shim_dir).await
+    execute(program, args, Some(&env.env), shim_dir).await
 }
 
 /// Pass through to the real binary without setting up the proxy. Used when

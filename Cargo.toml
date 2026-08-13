@@ -56,7 +56,7 @@ cast_possible_truncation = "warn"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
@@ -67,11 +67,11 @@ hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client", "client-legacy", "http1"] }
 percent-encoding = "2"
 scan = { package = "atomdrift-scan", git = "https://github.com/atomdrift-project/scan.git" }
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 rustls-native-certs = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
@@ -87,7 +87,7 @@ flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tar = "0.4"
 tokio = { version = "1", features = ["test-util", "macros"] }
-zip = { version = "2.4", default-features = false }
+zip = { version = "8.6", default-features = false }
 
 [[bin]]
 name = "hood"

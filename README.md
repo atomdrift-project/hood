@@ -2,8 +2,8 @@
 
 [![Status: experimental](https://img.shields.io/badge/status-experimental-E5A50A)](#what) [![CI](https://github.com/atomdrift-project/hood/actions/workflows/ci.yml/badge.svg)](https://github.com/atomdrift-project/hood/actions/workflows/ci.yml) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/atomdrift-project/hood/badge)](https://scorecard.dev/viewer/?uri=github.com/atomdrift-project/hood) [![License: Apache-2.0](https://img.shields.io/github/license/atomdrift-project/hood)](LICENSE)
 
-> [!WARNING] Evaluation software, not an enterprise endpoint control. Test in a VM before piloting it with developers.
-
+> [!WARNING] This is experimental. It may eat your cat.
+> 
 <p align="center"><img src="media/hood.jpg" alt="Handle chemicals under a fume hood" width="560"></p>
 
 ## What

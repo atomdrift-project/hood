@@ -20,7 +20,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair, SanType};
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer};
 
@@ -112,14 +112,15 @@ fn make_origin_tls() -> Result<OriginTls> {
     dn.push(DnType::CommonName, "test origin root");
     root_params.distinguished_name = dn;
     let root_cert = root_params.self_signed(&root_key)?;
+    let root_issuer = Issuer::new(root_params, root_key);
 
     let leaf_key = KeyPair::generate()?;
     let mut leaf_params = CertificateParams::default();
     leaf_params.subject_alt_names = vec![
-        SanType::DnsName(rcgen::Ia5String::try_from("localhost".to_owned())?),
+        SanType::DnsName(rcgen::string::Ia5String::try_from("localhost".to_owned())?),
         SanType::IpAddress("127.0.0.1".parse()?),
     ];
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &root_cert, &root_key)?;
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &root_issuer)?;
 
     Ok(OriginTls {
         cert_chain: vec![

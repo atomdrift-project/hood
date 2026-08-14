@@ -14,9 +14,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use rcgen::string::Ia5String;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Ia5String, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -38,8 +39,10 @@ pub struct Ca {
 }
 
 struct Inner {
-    root_cert: rcgen::Certificate,
-    root_key: KeyPair,
+    /// Root distinguished name + key, in the form `signed_by` wants.
+    root_issuer: Issuer<'static, KeyPair>,
+    /// Root in DER, appended to every leaf chain we hand out.
+    root_der: CertificateDer<'static>,
     root_pem: String,
     cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
@@ -81,11 +84,12 @@ impl Ca {
         let key = KeyPair::generate().context("generate root key")?;
         let cert = params.self_signed(&key).context("sign root cert")?;
         let root_pem = cert.pem();
+        let root_der = CertificateDer::from(cert.der().to_vec());
 
         Ok(Self {
             inner: Arc::new(Inner {
-                root_cert: cert,
-                root_key: key,
+                root_issuer: Issuer::new(params, key),
+                root_der,
                 root_pem,
                 cache: Mutex::new(HashMap::new()),
             }),
@@ -147,11 +151,11 @@ impl Ca {
 
         let leaf_key = KeyPair::generate().context("generate leaf key")?;
         let leaf_cert = params
-            .signed_by(&leaf_key, &self.inner.root_cert, &self.inner.root_key)
+            .signed_by(&leaf_key, &self.inner.root_issuer)
             .context("sign leaf cert")?;
 
         let cert_der = CertificateDer::from(leaf_cert.der().to_vec());
-        let root_der = CertificateDer::from(self.inner.root_cert.der().to_vec());
+        let root_der = self.inner.root_der.clone();
         let key_der: PrivateKeyDer<'static> =
             PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
 

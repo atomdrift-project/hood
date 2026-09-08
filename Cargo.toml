@@ -82,6 +82,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 url = "2"
 
 [dev-dependencies]
+# Builds the bloom bundles the gate tests load; the same crate scan reads them with.
+burton = { git = "https://github.com/atomdrift-project/burton.git" }
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tar = "0.4"

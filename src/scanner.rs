@@ -635,7 +635,12 @@ impl Scanner for AtomScanner {
                     Prefetch::SkipForward
                 }
             }
-            Decision::Conflicted | Decision::Unknown => Prefetch::Proceed,
+            Decision::Conflicted
+            | Decision::Unknown
+            // Outside claims (sighted-hostile / sighted-suspicious) are flags,
+            // not the producer's verdicts — download proceeds to the ML scan.
+            | Decision::SightedHostile
+            | Decision::SightedSuspicious => Prefetch::Proceed,
         }
     }
 
@@ -667,6 +672,7 @@ impl Scanner for AtomScanner {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use burton::{KeySets, Record, Tier};
 
     #[tokio::test]
     async fn allow_all_allows() {
@@ -790,18 +796,26 @@ mod tests {
         );
     }
 
-    /// Build the four `.adbl` filters from a small pool and write them to `dir`
-    /// exactly as `atomscan update-rules` would, so the gate exercises the real
-    /// on-disk load + query path.
-    fn publish_filters(
-        dir: &std::path::Path,
-        good: Vec<scan::bloom::Record>,
-        bad: Vec<scan::bloom::Record>,
-    ) {
-        for f in scan::bloom::generate(good, bad, 1e-9) {
-            let path = dir.join(format!("{}.adbl", f.artifact_stem()));
-            std::fs::write(path, f.to_bytes()).unwrap();
+    /// Build the bundle from a small pool and write it to `dir` exactly as
+    /// `atomscan update-rules` would, so the gate exercises the real on-disk
+    /// load + query path.
+    fn publish_filters(dir: &std::path::Path, good: Vec<Record>, bad: Vec<Record>) {
+        let mut sets = KeySets::new();
+        for (tier, records) in [(Tier::Good, good), (Tier::Bad, bad)] {
+            for mut record in records {
+                // Canonicalize exactly as the producer does, so the probe-side
+                // keys (which run the same canonicalization) cannot miss.
+                record.purl = record.purl.as_deref().and_then(scan::bloom_repo::purl_key);
+                sets.insert(tier, record);
+            }
         }
+        burton::build::write_bundle(
+            dir,
+            &sets.into_filters(1e-9),
+            "2026-09-09",
+            scan::bloom_repo::KEY_SCHEME,
+        )
+        .unwrap();
     }
 
     fn sha_of(bytes: &[u8]) -> [u8; 32] {
@@ -812,8 +826,6 @@ mod tests {
 
     #[test]
     fn bloom_gate_end_to_end_over_real_filters() {
-        use scan::bloom::Record;
-
         let tmp = tempfile::tempdir().unwrap();
         let good_body = b"benign package bytes".to_vec();
         let bad_body = b"malware package bytes".to_vec();

@@ -98,6 +98,15 @@ path = "src/main.rs"
 name = "hood"
 path = "src/lib.rs"
 
+# Dependencies compile at opt-level 1 even in debug builds. Debug builds of the
+# full dependency graph (scan, cleave, fletch, tree-sitter) emit a __eh_frame
+# section past the 16MB that macOS ld can encode in the compact unwind table,
+# which the linker warns about on every build. Optimizing dependencies keeps
+# the section under that limit and speeds debug runs; the local crates stay at
+# opt-level 0 so they remain fully steppable.
+[profile.dev.package."*"]
+opt-level = 1
+
 [profile.release]
 strip = "debuginfo"
 lto = "thin"

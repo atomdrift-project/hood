@@ -511,7 +511,11 @@ const fn gate_outcome(by_hash: Decision, by_purl: Decision, policy: ScanPolicy) 
         } else {
             GateOutcome::Block
         }
-    } else if matches!(by_hash, Decision::Skip) || matches!(by_purl, Decision::Skip) {
+    } else if by_hash.is_adverse() || by_purl.is_adverse() {
+        // A sighting (outside claim) or a conflicted entry on either channel is
+        // a flag, not a verdict: not enough to block, but enough to deny a skip.
+        GateOutcome::Scan
+    } else if by_hash.may_skip() || by_purl.may_skip() {
         // A known-good hash proves the bytes; a known-good PURL is trusted as an
         // allowlist entry. Either skips the scan.
         GateOutcome::Skip
@@ -788,6 +792,30 @@ mod tests {
     }
 
     #[test]
+    fn gate_sighting_or_conflict_denies_skip() {
+        // A known-good channel beside an outside claim or a conflicted entry:
+        // a flag is not a verdict, so nothing blocks, but nothing skips either.
+        for adverse in [
+            Decision::SightedHostile,
+            Decision::SightedSuspicious,
+            Decision::Conflicted,
+        ] {
+            assert_eq!(
+                gate_outcome(adverse, Decision::Skip, ScanPolicy::Strict),
+                GateOutcome::Scan,
+            );
+            assert_eq!(
+                gate_outcome(Decision::Skip, adverse, ScanPolicy::Strict),
+                GateOutcome::Scan,
+            );
+            assert_eq!(
+                gate_outcome(adverse, Decision::Unknown, ScanPolicy::Strict),
+                GateOutcome::Scan,
+            );
+        }
+    }
+
+    #[test]
     fn gate_known_bad_wins_over_hash_skip() {
         // Contradictory channels resolve conservatively toward blocking.
         assert_eq!(
@@ -796,18 +824,14 @@ mod tests {
         );
     }
 
-    /// Build the bundle from a small pool and write it to `dir` exactly as
-    /// `atomscan update-rules` would, so the gate exercises the real on-disk
-    /// load + query path.
-    fn publish_filters(dir: &std::path::Path, good: Vec<Record>, bad: Vec<Record>) {
+    /// Build a bloom bundle (the `.adbl` filters plus `bloom.toml`) from a small
+    /// pool and write it to `dir` exactly as `atomscan update-rules` would, so
+    /// the gate exercises the real on-disk load + query path. PURLs are
+    /// canonicalized with scan's key scheme, as the producer does.
+    fn publish_filters(dir: &std::path::Path, rows: &[(Tier, Record)]) {
         let mut sets = KeySets::new();
-        for (tier, records) in [(Tier::Good, good), (Tier::Bad, bad)] {
-            for mut record in records {
-                // Canonicalize exactly as the producer does, so the probe-side
-                // keys (which run the same canonicalization) cannot miss.
-                record.purl = record.purl.as_deref().and_then(scan::bloom_repo::purl_key);
-                sets.insert(tier, record);
-            }
+        for (tier, record) in rows {
+            sets.insert(*tier, record.clone());
         }
         burton::build::write_bundle(
             dir,
@@ -816,6 +840,14 @@ mod tests {
             scan::bloom_repo::KEY_SCHEME,
         )
         .unwrap();
+    }
+
+    /// A pool record with the PURL in scan's canonical key form.
+    fn rec(purl: Option<&str>, sha256: Option<[u8; 32]>) -> Record {
+        Record {
+            purl: purl.and_then(scan::bloom_repo::purl_key),
+            sha256,
+        }
     }
 
     fn sha_of(bytes: &[u8]) -> [u8; 32] {
@@ -829,20 +861,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let good_body = b"benign package bytes".to_vec();
         let bad_body = b"malware package bytes".to_vec();
+        let sighted_body = b"reported package bytes".to_vec();
         let good_sha = sha_of(&good_body);
         let bad_sha = sha_of(&bad_body);
+        let sighted_sha = sha_of(&sighted_body);
 
         publish_filters(
             tmp.path(),
-            vec![Record {
-                purl: Some("pkg:npm/good@1.0.0".into()),
-                sha256: Some(good_sha),
-            }],
-            vec![Record {
+            &[
+                (Tier::Good, rec(Some("pkg:npm/good@1.0.0"), Some(good_sha))),
                 // Known-bad by BOTH a hash and, separately, a PURL coordinate.
-                purl: Some("pkg:npm/evil@1.0.0".into()),
-                sha256: Some(bad_sha),
-            }],
+                (Tier::Bad, rec(Some("pkg:npm/evil@1.0.0"), Some(bad_sha))),
+                // A lone outside report: denies a skip, does not block.
+                (Tier::SightedSuspicious, rec(None, Some(sighted_sha))),
+            ],
         );
         let lookup = Lookup::load_from(tmp.path());
         assert!(lookup.is_active());
@@ -899,6 +931,18 @@ mod tests {
             "",
             "https://x/u.tgz",
             &sha_of(b"novel"),
+        );
+        assert_eq!(v, None);
+
+        // A sighted hash under a known-good PURL: the claim denies the
+        // allowlist skip, so the payload goes to the ML scan rather than
+        // being forwarded unexamined — and is not blocked outright either.
+        let v = bloom_gate_sha(
+            &lookup,
+            ScanPolicy::Strict,
+            "",
+            "https://registry.npmjs.org/good/-/good-1.0.0.tgz",
+            &sighted_sha,
         );
         assert_eq!(v, None);
     }

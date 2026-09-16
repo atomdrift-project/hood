@@ -47,6 +47,7 @@ install: release
 	echo "Installed to $$dest"
 
 lint:
+	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
 
 test:

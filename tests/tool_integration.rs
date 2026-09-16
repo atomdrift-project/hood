@@ -118,6 +118,17 @@ impl TestOrigin {
         format!("http://{}", self.addr)
     }
 
+    /// The origin's URL spelled so a Go client routes it through `HTTP_PROXY`.
+    ///
+    /// Go never proxies `localhost` or a loopback IP, regardless of `NO_PROXY`,
+    /// so a `GOPROXY` of `http://127.0.0.1:…` would reach the fixture directly
+    /// and hood would see nothing. The unspecified address is not loopback to
+    /// that rule, and a connection to `0.0.0.0:port` lands on the local
+    /// listener on every Unix, so hood forwards to the same fixture.
+    fn go_url(&self) -> String {
+        format!("http://0.0.0.0:{}", self.addr.port())
+    }
+
     fn requested_paths(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
@@ -476,7 +487,7 @@ async fn go_mod_download_runs_through_hood() -> Result<()> {
         ("GOWORK", OsString::from("off")),
         ("GOFLAGS", OsString::new()),
         ("GOTOOLCHAIN", OsString::from("local")),
-        ("GOPROXY", OsString::from(origin.url())),
+        ("GOPROXY", OsString::from(origin.go_url())),
         ("GOSUMDB", OsString::from("off")),
         ("GONOPROXY", OsString::new()),
         ("GOPRIVATE", OsString::new()),
@@ -510,7 +521,7 @@ async fn go_mod_download_runs_through_hood() -> Result<()> {
             .contains(&format!(r#""Version": "{GO_VERSION}""#))
     );
     assert!(output.stderr.contains("hood proxy listening"));
-    let archive_url = format!("{}/{GO_MODULE}/@v/{GO_VERSION}.zip", origin.url());
+    let archive_url = format!("{}/{GO_MODULE}/@v/{GO_VERSION}.zip", origin.go_url());
     assert!(
         output.stderr.contains(&archive_url),
         "Go module archive was not visibly scanned:\n{}",

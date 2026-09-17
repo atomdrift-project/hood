@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "2.12.0-beta.0"
-source = "git+https://github.com/atomdrift-project/scan.git#73d1eb120847084a0a8e6b92c27c7df837ccb19f"
+source = "git+https://github.com/atomdrift-project/scan.git#4b068072f7154fe4b8f68c245ea813f2549b3df0"
 dependencies = [
  "anyhow",
  "axum",

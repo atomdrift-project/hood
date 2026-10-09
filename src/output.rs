@@ -13,8 +13,7 @@
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 
-use scan::engine::TopFinding;
-use scan::explain::Reason;
+use scan::engine::{Reason, TopFinding};
 use scan::model::Classification;
 use scan::output::Theme;
 

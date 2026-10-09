@@ -311,7 +311,7 @@ impl AtomScanner {
     ) -> Result<Self> {
         let model_dir = match model_dir {
             Some(d) => d,
-            None => scan::models_repo::model_dir().context("resolve scan model dir")?,
+            None => scan::models_repo::ensure_model_dir().context("resolve scan model dir")?,
         };
         // Hood deliberately shares Scan's L25 operating point. Fail closed if
         // a future dependency update changes that contract silently.

@@ -62,7 +62,7 @@ async-trait = "0.1"
 base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -91,7 +91,7 @@ flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tar = "0.4"
 tokio = { version = "1", features = ["test-util", "macros"] }
-zip = { version = "8.6", default-features = false }
+zip = { version = "9.0", default-features = false }
 
 [[bin]]
 name = "hood"

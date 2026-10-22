@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    Invocation, TestOrigin, ToolHarness, assert_forwarded, assert_requested, assert_success,
-    find_file, helper, is_root, path_binary, skip, tool_binary,
+    Invocation, Payload, TestOrigin, ToolHarness, find_file, helper, is_root, path_binary, skip,
+    tool_binary,
 };
 
 pub(crate) const TOOLS: &[&str] = &["rpm", "dnf", "yum", "zypper"];
@@ -70,19 +70,36 @@ async fn build_rpm(tool: &str, work: &Path, repo: bool) -> Result<Option<PathBuf
     Ok(Some(out))
 }
 
-/// Serve the fixture RPM (and repository) at `/repo`; return its base URL.
-async fn rpm_origin(
-    tool: &str,
-    harness: &ToolHarness,
-    repo: bool,
-) -> Result<Option<(TestOrigin, String)>> {
-    let Some(out) = build_rpm(tool, &harness.dir("rpm-fixture"), repo).await? else {
-        return Ok(None);
-    };
-    let origin = TestOrigin::spawn().await?;
-    origin.add_dir("/repo", &out)?;
-    let url = format!("{}/repo", origin.url());
-    Ok(Some((origin, url)))
+/// The fixture RPM served at `/repo` (with repository metadata if `repo`).
+struct RpmRepo {
+    _origin: TestOrigin,
+    url: String,
+    package: Vec<u8>,
+    package_url: String,
+}
+
+impl RpmRepo {
+    async fn spawn(tool: &str, harness: &ToolHarness, repo: bool) -> Result<Option<Self>> {
+        let Some(out) = build_rpm(tool, &harness.dir("rpm-fixture"), repo).await? else {
+            return Ok(None);
+        };
+        let origin = TestOrigin::spawn().await?;
+        origin.add_dir("/repo", &out)?;
+        let url = format!("{}/repo", origin.url());
+        Ok(Some(Self {
+            package: fs::read(out.join(RPM))?,
+            package_url: format!("{url}/{RPM}"),
+            url,
+            _origin: origin,
+        }))
+    }
+
+    fn payload(&self) -> Payload<'_> {
+        Payload {
+            bytes: &self.package,
+            url: &self.package_url,
+        }
+    }
 }
 
 /// `rpm -qp` queries a package straight from a URL.
@@ -92,26 +109,23 @@ async fn rpm_queries_remote_package_through_hood() -> Result<()> {
         return Ok(());
     };
     let harness = ToolHarness::new(&binary)?;
-    let Some((origin, base)) = rpm_origin("rpm", &harness, false).await? else {
+    let Some(repo) = RpmRepo::spawn("rpm", &harness, false).await? else {
         return Ok(());
     };
-    let url = format!("{base}/{RPM}");
-    let run = harness
-        .compare("rpm", &binary, |dir| {
-            Ok(Invocation::new(dir)
-                .arg("--define")
-                .arg(format!("_dbpath {}", dir.join("rpmdb").display()))
-                .args(["-qp", "--qf", "%{NAME}-%{VERSION}\\n", &url]))
-        })
+    harness
+        .exercise(
+            "rpm",
+            &binary,
+            |dir| {
+                Ok(Invocation::new(dir)
+                    .arg("--define")
+                    .arg(format!("_dbpath {}", dir.join("rpmdb").display()))
+                    .args(["-qp", "--qf", "%{NAME}-%{VERSION}\\n", &repo.package_url]))
+            },
+            repo.payload(),
+            |run| run.output.stdout.contains("hoodfix-1.0.0"),
+        )
         .await?;
-    assert_success("rpm", &run.output);
-    assert!(
-        run.output.stdout.contains("hoodfix-1.0.0"),
-        "rpm did not read the fixture:\n{}",
-        run.output.stdout
-    );
-    assert_forwarded("rpm", &run.output, &url);
-    assert_requested(&origin, RPM);
     Ok(())
 }
 
@@ -126,29 +140,28 @@ async fn dnf_downloads(tool: &str) -> Result<()> {
         return Ok(());
     }
     let harness = ToolHarness::new(&binary)?;
-    let Some((origin, repo)) = rpm_origin(tool, &harness, true).await? else {
+    let Some(repo) = RpmRepo::spawn(tool, &harness, true).await? else {
         return Ok(());
     };
-    let run = harness
-        .compare(tool, &binary, |dir| {
-            let cache = dir.join("cache");
-            Ok(Invocation::new(dir)
-                .arg("download")
-                .arg(format!("--repofrompath=hoodfix,{repo}"))
-                .args(["--repo=hoodfix", "--setopt=hoodfix.gpgcheck=0"])
-                .arg(format!("--setopt=cachedir={}", cache.display()))
-                .arg(format!("--setopt=system_cachedir={}", cache.display()))
-                .arg(format!("--destdir={}", dir.join("dl").display()))
-                .arg("hoodfix"))
-        })
+    harness
+        .exercise(
+            tool,
+            &binary,
+            |dir| {
+                let cache = dir.join("cache");
+                Ok(Invocation::new(dir)
+                    .arg("download")
+                    .arg(format!("--repofrompath=hoodfix,{}", repo.url))
+                    .args(["--repo=hoodfix", "--setopt=hoodfix.gpgcheck=0"])
+                    .arg(format!("--setopt=cachedir={}", cache.display()))
+                    .arg(format!("--setopt=system_cachedir={}", cache.display()))
+                    .arg(format!("--destdir={}", dir.join("dl").display()))
+                    .arg("hoodfix"))
+            },
+            repo.payload(),
+            |run| run.dir.join("dl").join(RPM).is_file(),
+        )
         .await?;
-    assert_success(tool, &run.output);
-    assert_forwarded(tool, &run.output, RPM);
-    assert!(
-        run.dir.join("dl").join(RPM).is_file(),
-        "{tool} did not save {RPM}"
-    );
-    assert_requested(&origin, "repomd.xml");
     Ok(())
 }
 
@@ -173,33 +186,33 @@ async fn zypper_downloads_package_through_hood() -> Result<()> {
         return Ok(());
     }
     let harness = ToolHarness::new(&binary)?;
-    let Some((origin, repo)) = rpm_origin("zypper", &harness, true).await? else {
+    let Some(repo) = RpmRepo::spawn("zypper", &harness, true).await? else {
         return Ok(());
     };
-    let run = harness
-        .compare("zypper", &binary, |dir| {
-            let repos = dir.join("repos.d");
-            fs::create_dir_all(&repos)?;
-            fs::write(
-                repos.join("hoodfix.repo"),
-                format!(
-                    "[hoodfix]\nname=hoodfix\nbaseurl={repo}\nenabled=1\nautorefresh=1\ngpgcheck=0\ntype=rpm-md\n"
-                ),
-            )?;
-            Ok(Invocation::new(dir)
-                .args(["--non-interactive", "--no-gpg-checks", "--reposd-dir"])
-                .arg(repos)
-                .arg("--cache-dir")
-                .arg(dir.join("cache"))
-                .args(["download", "hoodfix"]))
-        })
+    harness
+        .exercise(
+            "zypper",
+            &binary,
+            |dir| {
+                let repos = dir.join("repos.d");
+                fs::create_dir_all(&repos)?;
+                fs::write(
+                    repos.join("hoodfix.repo"),
+                    format!(
+                        "[hoodfix]\nname=hoodfix\nbaseurl={}\nenabled=1\nautorefresh=1\ngpgcheck=0\ntype=rpm-md\n",
+                        repo.url
+                    ),
+                )?;
+                Ok(Invocation::new(dir)
+                    .args(["--non-interactive", "--no-gpg-checks", "--reposd-dir"])
+                    .arg(repos)
+                    .arg("--cache-dir")
+                    .arg(dir.join("cache"))
+                    .args(["download", "hoodfix"]))
+            },
+            repo.payload(),
+            |run| find_file(&run.dir.join("cache"), &|name| name == RPM).is_some(),
+        )
         .await?;
-    assert_success("zypper", &run.output);
-    assert_forwarded("zypper", &run.output, RPM);
-    assert!(
-        find_file(&run.dir.join("cache"), &|name| name == RPM).is_some(),
-        "zypper did not save {RPM}"
-    );
-    assert_requested(&origin, "repomd.xml");
     Ok(())
 }

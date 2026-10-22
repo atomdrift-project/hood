@@ -6,8 +6,8 @@ use std::fs;
 use anyhow::Result;
 
 use crate::{
-    Invocation, TOOL_MARKER, TestOrigin, ToolHarness, assert_forwarded, assert_requested,
-    assert_success, gzip, helper, is_root, sha256_hex, skip, tar_gz, tar_header, tool_binary,
+    Invocation, Payload, TOOL_MARKER, TestOrigin, ToolHarness, assert_forwarded, gzip, helper,
+    is_root, sha256_hex, skip, tar_gz, tar_header, tool_binary,
 };
 
 pub(crate) const TOOLS: &[&str] = &["apk"];
@@ -51,7 +51,8 @@ async fn apk_fetches_package_through_hood() -> Result<()> {
     let repo = harness.dir("apk-repo");
     let arch_dir = repo.join(&arch);
     fs::create_dir_all(&arch_dir)?;
-    fs::write(arch_dir.join(PACKAGE_FILE), package()?)?;
+    let package = package()?;
+    fs::write(arch_dir.join(PACKAGE_FILE), &package)?;
     helper(
         "apk",
         &[
@@ -67,27 +68,33 @@ async fn apk_fetches_package_through_hood() -> Result<()> {
     let origin = TestOrigin::spawn().await?;
     origin.add_dir("/repo", &repo)?;
     let url = format!("{}/repo", origin.url());
+    let package_url = format!("{url}/{arch}/{PACKAGE_FILE}");
     let run = harness
-        .compare("apk", &binary, |dir| {
-            Ok(Invocation::new(dir)
-                .args([
-                    "fetch",
-                    "--allow-untrusted",
-                    "--no-cache",
-                    "--repositories-file",
-                    "/dev/null",
-                    "--repository",
-                    &url,
-                    "--output",
-                ])
-                .arg(dir)
-                .arg("hoodfix"))
-        })
+        .exercise(
+            "apk",
+            &binary,
+            |dir| {
+                Ok(Invocation::new(dir)
+                    .args([
+                        "fetch",
+                        "--allow-untrusted",
+                        "--no-cache",
+                        "--repositories-file",
+                        "/dev/null",
+                        "--repository",
+                        &url,
+                        "--output",
+                    ])
+                    .arg(dir)
+                    .arg("hoodfix"))
+            },
+            Payload {
+                bytes: &package,
+                url: &package_url,
+            },
+            |run| run.dir.join(PACKAGE_FILE).is_file(),
+        )
         .await?;
-    assert_success("apk", &run.output);
     assert_forwarded("apk", &run.output, "APKINDEX.tar.gz");
-    assert_forwarded("apk", &run.output, PACKAGE_FILE);
-    assert!(run.dir.join(PACKAGE_FILE).is_file());
-    assert_requested(&origin, PACKAGE_FILE);
     Ok(())
 }

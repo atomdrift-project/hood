@@ -9,9 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 use crate::{
-    Invocation, Output, PROXY_VARS, TOOL_MARKER, TestOrigin, ToolHarness, assert_forwarded,
-    assert_requested, assert_success, find_file, missing_tool, path_binary, sha256_hex, tar_gz,
-    tool_binary, tool_is_selected,
+    Invocation, Output, PROXY_VARS, Payload, TOOL_MARKER, TestOrigin, ToolHarness, find_file,
+    missing_tool, path_binary, sha256_hex, tar_gz, tool_binary, tool_is_selected,
 };
 
 pub(crate) const TOOLS: &[&str] = &["go", "cargo", "zig"];
@@ -68,46 +67,47 @@ async fn go_mod_download_runs_through_hood() -> Result<()> {
         "text/plain",
         format!("module {GO_MODULE}\n\ngo 1.20\n").into_bytes(),
     );
-    origin.add_route(format!("{prefix}.zip"), "application/zip", go_module_zip()?);
-    let run = harness
-        .compare("go", &go, |dir| {
-            Ok(Invocation::new(dir)
-                .args([
-                    "mod",
-                    "download",
-                    "-json",
-                    &format!("{GO_MODULE}@{GO_VERSION}"),
-                ])
-                .env("GOENV", "off")
-                .env("GOWORK", "off")
-                .env("GOFLAGS", "-modcacherw")
-                .env("GOTOOLCHAIN", "local")
-                .env("GOPROXY", origin.go_url())
-                .env("GOSUMDB", "off")
-                .env("GONOPROXY", "")
-                .env("GOPRIVATE", "")
-                .env("GONOSUMDB", "")
-                .env("GOMODCACHE", dir.join("gomodcache"))
-                .env("GOCACHE", dir.join("gocache")))
-        })
+    let module = go_module_zip()?;
+    origin.add_route(format!("{prefix}.zip"), "application/zip", module.clone());
+    let url = format!("{}{prefix}.zip", origin.go_url());
+    harness
+        .exercise(
+            "go",
+            &go,
+            |dir| {
+                Ok(Invocation::new(dir)
+                    .args([
+                        "mod",
+                        "download",
+                        "-json",
+                        &format!("{GO_MODULE}@{GO_VERSION}"),
+                    ])
+                    .env("GOENV", "off")
+                    .env("GOWORK", "off")
+                    .env("GOFLAGS", "-modcacherw")
+                    .env("GOTOOLCHAIN", "local")
+                    .env("GOPROXY", origin.go_url())
+                    .env("GOSUMDB", "off")
+                    .env("GONOPROXY", "")
+                    .env("GOPRIVATE", "")
+                    .env("GONOSUMDB", "")
+                    .env("GOMODCACHE", dir.join("gomodcache"))
+                    .env("GOCACHE", dir.join("gocache")))
+            },
+            Payload {
+                bytes: &module,
+                url: &url,
+            },
+            |run| {
+                let source = run
+                    .dir
+                    .join("gomodcache")
+                    .join(format!("{GO_MODULE}@{GO_VERSION}"))
+                    .join("hood_integration.go");
+                fs::read_to_string(source).is_ok_and(|source| source == GO_SOURCE)
+            },
+        )
         .await?;
-    assert_success("go", &run.output);
-    assert!(
-        run.output
-            .stdout
-            .contains(&format!(r#""Version": "{GO_VERSION}""#))
-    );
-    assert_forwarded(
-        "go",
-        &run.output,
-        &format!("{}{prefix}.zip", origin.go_url()),
-    );
-    let source = run
-        .dir
-        .join("gomodcache")
-        .join(format!("{GO_MODULE}@{GO_VERSION}"))
-        .join("hood_integration.go");
-    assert_eq!(fs::read_to_string(source)?, GO_SOURCE);
     Ok(())
 }
 
@@ -149,34 +149,40 @@ async fn cargo_fetches_crate_through_hood() -> Result<()> {
         entry.into_bytes(),
     );
     let download = format!("/dl/{CRATE}/{CRATE_VERSION}/download");
-    origin.add_route(download.clone(), "application/gzip", package);
+    origin.add_route(download.clone(), "application/gzip", package.clone());
     let index = format!("sparse+{}/index/", origin.url());
-    let run = harness
-        .compare("cargo", &binary, |dir| {
-            fs::create_dir_all(dir.join("src"))?;
-            fs::write(dir.join("src").join("lib.rs"), "")?;
-            fs::write(
-                dir.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"hood-cargo-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CRATE} = {{ version = \"{CRATE_VERSION}\", registry = \"hoodfix\" }}\n"
-                ),
-            )?;
-            Ok(Invocation::new(dir)
-                .arg("fetch")
-                .env("CARGO_HOME", dir.join("cargo-home"))
-                .env("CARGO_REGISTRIES_HOODFIX_INDEX", &index)
-                .env("CARGO_NET_RETRY", "0"))
-        })
+    let url = format!("{}{download}", origin.url());
+    harness
+        .exercise(
+            "cargo",
+            &binary,
+            |dir| {
+                fs::create_dir_all(dir.join("src"))?;
+                fs::write(dir.join("src").join("lib.rs"), "")?;
+                fs::write(
+                    dir.join("Cargo.toml"),
+                    format!(
+                        "[package]\nname = \"hood-cargo-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CRATE} = {{ version = \"{CRATE_VERSION}\", registry = \"hoodfix\" }}\n"
+                    ),
+                )?;
+                Ok(Invocation::new(dir)
+                    .arg("fetch")
+                    .env("CARGO_HOME", dir.join("cargo-home"))
+                    .env("CARGO_REGISTRIES_HOODFIX_INDEX", &index)
+                    .env("CARGO_NET_RETRY", "0"))
+            },
+            Payload {
+                bytes: &package,
+                url: &url,
+            },
+            |run| {
+                find_file(&run.dir.join("cargo-home"), &|name| {
+                    name == format!("{CRATE}-{CRATE_VERSION}.crate")
+                })
+                .is_some()
+            },
+        )
         .await?;
-    assert_success("cargo", &run.output);
-    assert_forwarded("cargo", &run.output, &format!("{}{download}", origin.url()));
-    assert!(
-        find_file(&run.dir.join("cargo-home"), &|name| {
-            name == format!("{CRATE}-{CRATE_VERSION}.crate")
-        })
-        .is_some(),
-        "cargo did not cache the crate"
-    );
     Ok(())
 }
 
@@ -188,10 +194,11 @@ const ZIG_PACKAGE_FINGERPRINT: &str = "0x7cdd4dfe1f9b6709";
 const ZIG_APP: &str = "hood_zig_app";
 const ZIG_APP_FINGERPRINT: &str = "0xd2721cdb1f9b6709";
 
-/// A Zig test fixture: the package origin, its URL and content hash, and the
-/// warm global cache both runs share.
+/// A Zig test fixture: the package origin, its tarball, URL, and content
+/// hash, and the warm global cache every run shares.
 struct ZigFixture {
     origin: TestOrigin,
+    tarball: Vec<u8>,
     url: String,
     hash: String,
     cache: PathBuf,
@@ -215,18 +222,15 @@ impl ZigFixture {
             ".{{\n    .name = .{ZIG_PACKAGE},\n    .version = \"{ZIG_VERSION}\",\n    .fingerprint = {ZIG_PACKAGE_FINGERPRINT},\n    .paths = .{{\"\"}},\n}}\n"
         );
         let path = format!("/{ZIG_PACKAGE}-{ZIG_VERSION}.tar.gz");
-        origin.add_route(
-            path.clone(),
-            "application/gzip",
-            tar_gz(&[
-                (
-                    &format!("{ZIG_PACKAGE}/build.zig.zon"),
-                    0o644,
-                    manifest.as_bytes(),
-                ),
-                (&format!("{ZIG_PACKAGE}/root.zig"), 0o644, source.as_bytes()),
-            ])?,
-        );
+        let tarball = tar_gz(&[
+            (
+                &format!("{ZIG_PACKAGE}/build.zig.zon"),
+                0o644,
+                manifest.as_bytes(),
+            ),
+            (&format!("{ZIG_PACKAGE}/root.zig"), 0o644, source.as_bytes()),
+        ])?;
+        origin.add_route(path.clone(), "application/gzip", tarball.clone());
         let url = format!("{}{path}", origin.url());
         let cache = zig_global_cache(zig, harness).await?;
         let mut fetch = Command::new(zig);
@@ -251,6 +255,7 @@ impl ZigFixture {
         }
         Ok(Self {
             origin,
+            tarball,
             url,
             hash,
             cache,
@@ -275,10 +280,19 @@ impl ZigFixture {
             .env("ZIG_LOCAL_CACHE_DIR", dir.join("zig-local-cache")))
     }
 
-    fn cached(&self) -> Result<bool> {
-        Ok(fs::read_dir(self.cache.join("p"))?
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with(&self.hash)))
+    fn payload(&self) -> Payload<'_> {
+        Payload {
+            bytes: &self.tarball,
+            url: &self.url,
+        }
+    }
+
+    fn cached(&self) -> bool {
+        fs::read_dir(self.cache.join("p")).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(&self.hash))
+        })
     }
 }
 
@@ -354,15 +368,15 @@ async fn zig_fetch_downloads_package_through_hood() -> Result<()> {
     let harness = ToolHarness::new(&zig)?;
     let fixture = ZigFixture::new(&zig, &harness).await?;
     let run = harness
-        .compare("zig", &zig, |dir| {
-            Ok(fixture.invocation(dir)?.args(["fetch", &fixture.url]))
-        })
+        .exercise(
+            "zig",
+            &zig,
+            |dir| Ok(fixture.invocation(dir)?.args(["fetch", &fixture.url])),
+            fixture.payload(),
+            |run| run.output.stdout.trim() == fixture.hash && fixture.cached(),
+        )
         .await?;
-    assert_success("zig", &run.output);
     assert_zig_absolute_form(&run.output);
-    assert_forwarded("zig", &run.output, &fixture.url);
-    assert_eq!(run.output.stdout.trim(), fixture.hash);
-    assert!(fixture.cached()?, "package {} not cached", fixture.hash);
     Ok(())
 }
 
@@ -373,22 +387,29 @@ async fn zig_fetch_save_records_dependency_through_hood() -> Result<()> {
     };
     let harness = ToolHarness::new(&zig)?;
     let fixture = ZigFixture::new(&zig, &harness).await?;
+    let saved_hash = format!(".hash = \"{}\"", fixture.hash);
     let run = harness
-        .compare("zig", &zig, |dir| {
-            write_zig_project(dir, EMPTY_BUILD_ZIG, "")?;
-            Ok(fixture
-                .invocation(dir)?
-                .args(["fetch", "--save", &fixture.url]))
-        })
+        .exercise(
+            "zig",
+            &zig,
+            |dir| {
+                write_zig_project(dir, EMPTY_BUILD_ZIG, "")?;
+                Ok(fixture
+                    .invocation(dir)?
+                    .args(["fetch", "--save", &fixture.url]))
+            },
+            fixture.payload(),
+            |run| {
+                fs::read_to_string(run.dir.join("build.zig.zon"))
+                    .is_ok_and(|saved| saved.contains(&saved_hash))
+            },
+        )
         .await?;
-    assert_success("zig", &run.output);
     assert_zig_absolute_form(&run.output);
-    assert_forwarded("zig", &run.output, &fixture.url);
     let saved = fs::read_to_string(run.dir.join("build.zig.zon"))?;
     for needle in [
         format!(".{ZIG_PACKAGE} = "),
         format!(".url = \"{}\"", fixture.url),
-        format!(".hash = \"{}\"", fixture.hash),
     ] {
         assert!(
             saved.contains(&needle),
@@ -421,21 +442,25 @@ async fn zig_build_fetches_dependencies_and_runs_build_step_downloads() -> Resul
         fixture.url, fixture.hash
     );
     let run = harness
-        .compare("zig", &zig, |dir| {
-            let build_zig = format!(
-                "const std = @import(\"std\");\npub fn build(b: *std.Build) void {{\n    _ = b.dependency(\"{ZIG_PACKAGE}\", .{{}});\n    const probe = b.addSystemCommand(&.{{ {:?}, \"-fsS\", \"-o\", {:?}, {probe_url:?} }});\n    b.getInstallStep().dependOn(&probe.step);\n}}\n",
-                curl.to_string_lossy(),
-                dir.join("probe.txt").to_string_lossy(),
-            );
-            write_zig_project(dir, &build_zig, &dependency)?;
-            Ok(fixture.invocation(dir)?.arg("build"))
-        })
+        .exercise(
+            "zig",
+            &zig,
+            |dir| {
+                let build_zig = format!(
+                    "const std = @import(\"std\");\npub fn build(b: *std.Build) void {{\n    _ = b.dependency(\"{ZIG_PACKAGE}\", .{{}});\n    const probe = b.addSystemCommand(&.{{ {:?}, \"-fsS\", \"-o\", {:?}, {probe_url:?} }});\n    b.getInstallStep().dependOn(&probe.step);\n}}\n",
+                    curl.to_string_lossy(),
+                    dir.join("probe.txt").to_string_lossy(),
+                );
+                write_zig_project(dir, &build_zig, &dependency)?;
+                Ok(fixture.invocation(dir)?.arg("build"))
+            },
+            fixture.payload(),
+            |run| {
+                fs::read_to_string(run.dir.join("probe.txt")).is_ok_and(|probe| probe == TOOL_MARKER)
+            },
+        )
         .await?;
-    assert_success("zig", &run.output);
     assert_zig_absolute_form(&run.output);
-    assert_forwarded("zig", &run.output, &fixture.url);
-    assert_forwarded("zig", &run.output, &probe_url);
-    assert_eq!(fs::read_to_string(run.dir.join("probe.txt"))?, TOOL_MARKER);
-    assert_requested(&fixture.origin, probe_path);
+    crate::assert_forwarded("zig", &run.output, &probe_url);
     Ok(())
 }

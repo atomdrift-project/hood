@@ -371,18 +371,29 @@ impl Inner {
     }
 }
 
+/// Platform trust roots, loaded once per process and shared by the proxy's
+/// upstream verifier and the Beamline client. Loading takes ~130 ms on macOS,
+/// so it runs on background threads; [`Proxy::spawn`] starts it while the
+/// child process starts.
+pub(crate) fn native_roots() -> &'static RootCertStore {
+    static ROOTS: std::sync::OnceLock<RootCertStore> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            // Individual cert failures are common (expired/unsupported algos);
+            // skip them and keep building the set.
+            drop(roots.add(cert));
+        }
+        roots
+    })
+}
+
 /// Build the verifier for upstream servers from the platform roots plus any
 /// configured extras.
 fn upstream_tls_config(
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        // Individual cert failures are common (expired/unsupported algos);
-        // skip them and keep building the set.
-        drop(roots.add(cert));
-    }
+    let mut roots = native_roots().clone();
     for cert in extra_roots {
         drop(roots.add(cert.clone()));
     }

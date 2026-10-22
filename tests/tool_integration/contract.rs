@@ -3,7 +3,8 @@
 //! Each stand-in is a shell script named after a tool that records its argv
 //! and downloads a file with curl through whatever proxy it inherited. This
 //! proves, on any Unix, that `hood <tool>` intercepts a fetching invocation,
-//! passes the argv through, and gives the child a working proxy. It cannot
+//! passes the argv through, gives the child a working proxy, and blocks a
+//! download Beamline rates hostile. It cannot
 //! prove the real tool honors that proxy; the tool-specific tests here and in
 //! CI's distribution images do that.
 
@@ -13,8 +14,8 @@ use anyhow::Result;
 use hood::tools::Tool;
 
 use crate::{
-    Invocation, TOOL_MARKER, TestOrigin, ToolHarness, assert_forwarded, assert_success,
-    path_binary, skip,
+    Beamline, Invocation, TOOL_MARKER, TestOrigin, ToolHarness, assert_blocked, assert_forwarded,
+    assert_success, path_binary, sha256_hex, skip,
 };
 
 /// A representative network-fetching invocation for each tool.
@@ -70,17 +71,34 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
         }
     }
     let harness = ToolHarness::new(&bin.path().join("curl"))?;
-    for tool in Tool::SHIMMABLE {
-        let name = tool.name();
-        let args = fetching_args(*tool);
-        let dir = harness.dir(&format!("stand-in-{name}"));
+    let invocation = |name: &str, args: &[&str], mode: &str| -> Result<Invocation> {
+        let dir = harness.dir(&format!("stand-in-{name}-{mode}"));
         fs::create_dir_all(&dir)?;
-        let invocation = Invocation::new(&dir)
+        Ok(Invocation::new(&dir)
             .args(args)
             .env("HOOD_STAND_IN_ARGV", dir.join("argv"))
             .env("HOOD_STAND_IN_OUT", dir.join("out"))
-            .env("HOOD_STAND_IN_URL", &url);
-        let (output, _) = harness.hood(name, &invocation).await?;
+            .env("HOOD_STAND_IN_URL", &url))
+    };
+    for tool in Tool::SHIMMABLE {
+        let name = tool.name();
+        let args = fetching_args(*tool);
+
+        harness
+            .beamline
+            .set(Beamline::Assesses, Some(sha256_hex(TOOL_MARKER.as_bytes())));
+        let blocked = invocation(name, args, "known-bad")?;
+        let (output, _) = harness.hood(name, &blocked, &harness.no_models).await?;
+        assert_blocked(name, &output, &url);
+        assert!(
+            !blocked.cwd.join("out").is_file(),
+            "{name} saved a blocked payload"
+        );
+
+        harness.beamline.set(Beamline::Assesses, None);
+        let allowed = invocation(name, args, "known-good")?;
+        let dir = allowed.cwd.clone();
+        let (output, _) = harness.hood(name, &allowed, &harness.no_models).await?;
         assert_success(name, &output);
         assert_forwarded(name, &output, &url);
         assert_eq!(fs::read_to_string(dir.join("out"))?, TOOL_MARKER, "{name}");

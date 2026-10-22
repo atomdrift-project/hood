@@ -1,10 +1,22 @@
 //! Command-level integration tests for every command hood supports.
 //!
 //! Each test runs a real package-manager executable against a local registry
-//! fixture twice, each time with fresh state: once directly and once through
-//! the compiled `hood` binary. Both runs must succeed, the hood run must be
-//! visibly intercepted, and it may take at most [`MAX_SLOWDOWN`] times as long
-//! as the direct run (or [`TIMING_FLOOR`], if that was faster). Tests are hermetic: isolated caches, no public registry.
+//! fixture, each time with fresh state: directly, then through the compiled
+//! `hood` binary under each answer its assessment service can give:
+//!
+//! - known good: Beamline rates the payload benign. Hood must forward it
+//!   without loading its models, in at most [`MAX_SLOWDOWN`] times the direct
+//!   run (or [`TIMING_FLOOR`], if that was faster).
+//! - known bad: Beamline rates it hostile. Hood must block it, the tool must
+//!   fail, and nothing may be installed or run.
+//! - private: Beamline has no assessment, so hood scans locally.
+//! - quota exceeded: Beamline answers 429, so hood shows why and scans
+//!   locally. Both local scans get [`LOCAL_SLOWDOWN`] plus
+//!   [`LOCAL_SCAN_ALLOWANCE`] for the analyzer's start-up.
+//!
+//! Beamline is a local fake, so tests are hermetic: isolated caches, no
+//! public registry. Local scans use the installed scan models, downloaded once
+//! outside any timed run if missing.
 //!
 //! Missing tools are skipped during a normal `cargo test`; strict mode
 //! (`HOOD_REQUIRE_TOOL_INTEGRATION`, set by `make test-tools` and CI) treats a
@@ -62,6 +74,15 @@ const MAX_SLOWDOWN: u32 = 2;
 /// startup rather than interception.
 const TIMING_FLOOR: Duration = Duration::from_millis(20);
 
+/// The most a local scan may slow a command down, plus analyzer start-up.
+const LOCAL_SLOWDOWN: u32 = 10;
+
+/// Fixed time allowed for the analyzer's start-up in each hood process that
+/// scans locally. Loading the ONNX models takes about 80 ms; warming cleave's
+/// rule engine (`prefetch_cleave_resources`) and the first scan take 2-4 s on
+/// an M-series Mac with a development traits checkout.
+const LOCAL_SCAN_ALLOWANCE: Duration = Duration::from_secs(8);
+
 /// Timed attempts before an overhead failure is reported. Each attempt
 /// repeats both runs and the fastest of each is compared, so a single run
 /// slowed by unrelated machine load cannot fail a test.
@@ -85,6 +106,153 @@ const PROXY_VARS: &[&str] = &[
     "ALL_PROXY",
 ];
 
+/// The message a quota-exhausted Beamline sends, as `beamline.js` words it.
+const QUOTA_MESSAGE: &str =
+    "anonymous quota exceeded, visit https://dash.isotope13.io/ for a token";
+
+/// How the fake Beamline answers lookups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beamline {
+    /// Every artifact is analyzed: hostile when marked, benign otherwise.
+    Assesses,
+    /// Nothing is analyzed, as for a private package.
+    Unanalyzed,
+    /// The caller's hourly quota is spent.
+    QuotaExceeded,
+}
+
+#[derive(Debug, Default)]
+struct BeamlineState {
+    mode: Option<Beamline>,
+    hostile: BTreeSet<String>,
+}
+
+/// A loopback stand-in for Beamline's `GET /v1/lookup?sha256=` route,
+/// answering in its NDJSON assessment and JSON error shapes.
+#[derive(Debug)]
+struct FakeBeamline {
+    addr: SocketAddr,
+    state: Arc<Mutex<BeamlineState>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FakeBeamline {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FakeBeamline {
+    /// Must be called from within a Tokio runtime.
+    fn spawn() -> Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind fake Beamline")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let listener = TcpListener::from_std(listener)?;
+        let state: Arc<Mutex<BeamlineState>> = Arc::default();
+        let served = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = Arc::clone(&served);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let response = Self::answer(&state, &req);
+                        async move { Ok::<_, hyper::Error>(response) }
+                    });
+                    drop(
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await,
+                    );
+                });
+            }
+        });
+        Ok(Self { addr, state, task })
+    }
+
+    fn answer(state: &Mutex<BeamlineState>, req: &Request<Incoming>) -> Response<Full<Bytes>> {
+        let sha256 = req
+            .uri()
+            .query()
+            .and_then(|query| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("sha256="))
+            })
+            .unwrap_or_default()
+            .to_owned();
+        let (mode, hostile) = {
+            let state = state.lock().unwrap();
+            (
+                state.mode.unwrap_or(Beamline::Assesses),
+                state.hostile.contains(&sha256),
+            )
+        };
+        let (status, body) = match mode {
+            Beamline::Assesses => {
+                let severity = if hostile { "hostile" } else { "benign" };
+                let assessment = serde_json::json!({
+                    "status": "analyzed", "severity": severity, "sha256": sha256, "findings": [],
+                });
+                (StatusCode::OK, format!("{assessment}\n"))
+            }
+            Beamline::Unanalyzed => {
+                let assessment = serde_json::json!({
+                    "status": "unanalyzed", "severity": "unknown", "sha256": sha256,
+                });
+                (StatusCode::OK, format!("{assessment}\n"))
+            }
+            Beamline::QuotaExceeded => {
+                let error = serde_json::json!({
+                    "error": {"code": "quota_exceeded", "message": QUOTA_MESSAGE},
+                });
+                (StatusCode::TOO_MANY_REQUESTS, error.to_string())
+            }
+        };
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/x-ndjson")
+            .header("retry-after", "1800")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn set(&self, mode: Beamline, hostile: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        state.mode = Some(mode);
+        state.hostile = hostile.into_iter().collect();
+    }
+}
+
+/// The scan models for local analysis, installed once (downloading on first
+/// use) outside any timed run.
+async fn scan_models() -> Result<PathBuf> {
+    static MODELS: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+    MODELS
+        .get_or_try_init(|| async {
+            tokio::task::spawn_blocking(scan::models_repo::ensure_model_dir)
+                .await
+                .context("join scan model install")?
+        })
+        .await
+        .cloned()
+}
+
+/// What a scenario downloads: the artifact the known-bad mode marks hostile,
+/// and a fragment of the URL hood logs for it.
+#[derive(Debug, Clone, Copy)]
+struct Payload<'a> {
+    bytes: &'a [u8],
+    url: &'a str,
+}
+
 type Route = (String, Vec<u8>);
 type Routes = Arc<Mutex<HashMap<String, Route>>>;
 
@@ -94,7 +262,6 @@ type Routes = Arc<Mutex<HashMap<String, Route>>>;
 struct TestOrigin {
     addr: SocketAddr,
     routes: Routes,
-    requests: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -111,24 +278,17 @@ impl TestOrigin {
             .context("bind tool-test origin")?;
         let addr = listener.local_addr().context("tool-test origin address")?;
         let routes: Routes = Arc::default();
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let served_routes = Arc::clone(&routes);
-        let request_log = Arc::clone(&requests);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let routes = Arc::clone(&served_routes);
-                let requests = Arc::clone(&request_log);
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let routes = Arc::clone(&routes);
-                        let requests = Arc::clone(&requests);
+                        let route = routes.lock().unwrap().get(req.uri().path()).cloned();
                         async move {
-                            let path = req.uri().path().to_owned();
-                            requests.lock().unwrap().push(path.clone());
-                            let route = routes.lock().unwrap().get(&path).cloned();
                             let response = match route {
                                 Some((content_type, body)) => Response::builder()
                                     .status(StatusCode::OK)
@@ -152,12 +312,7 @@ impl TestOrigin {
                 });
             }
         });
-        Ok(Self {
-            addr,
-            routes,
-            requests,
-            task,
-        })
+        Ok(Self { addr, routes, task })
     }
 
     fn url(&self) -> String {
@@ -173,10 +328,6 @@ impl TestOrigin {
     /// every Unix, so hood forwards to the same fixture.
     fn go_url(&self) -> String {
         format!("http://0.0.0.0:{}", self.addr.port())
-    }
-
-    fn requested_paths(&self) -> Vec<String> {
-        self.requests.lock().unwrap().clone()
     }
 
     fn add_route(&self, path: impl Into<String>, content_type: &str, body: Vec<u8>) {
@@ -258,6 +409,9 @@ struct Run {
 struct ToolHarness {
     root: TempDir,
     path: OsString,
+    beamline: FakeBeamline,
+    /// An empty model directory: any local scan attempted with it fails.
+    no_models: PathBuf,
 }
 
 impl ToolHarness {
@@ -278,24 +432,107 @@ impl ToolHarness {
                 .chain(std::env::split_paths(&inherited).filter(|dir| !is_hood_shim_dir(dir))),
         )
         .context("construct integration-test PATH")?;
-        Ok(Self { root, path })
+        let no_models = root.path().join("no-models");
+        fs::create_dir_all(&no_models)?;
+        Ok(Self {
+            root,
+            path,
+            beamline: FakeBeamline::spawn()?,
+            no_models,
+        })
     }
 
     fn dir(&self, name: &str) -> PathBuf {
         self.root.path().join(name)
     }
 
-    /// Run a scenario directly and through hood, each in a fresh directory
-    /// handed to `prepare`, and return the hood run.
-    ///
-    /// The direct run must succeed. The hood run is returned whatever its
-    /// outcome so the caller's assertions can report it; when it succeeds it
-    /// must take at most [`MAX_SLOWDOWN`] times as long as the direct run.
-    async fn compare<F>(&self, tool: &str, binary: &Path, prepare: F) -> Result<Run>
+    /// Run a scenario directly and through hood in every Beamline mode, each
+    /// in a fresh directory handed to `prepare`, and return the known-good
+    /// hood run for further assertions. `accepted` reports whether a run
+    /// installed, saved, or executed the payload.
+    async fn exercise<P, A>(
+        &self,
+        tool: &str,
+        binary: &Path,
+        prepare: P,
+        payload: Payload<'_>,
+        accepted: A,
+    ) -> Result<Run>
     where
-        F: Fn(&Path) -> Result<Invocation>,
+        P: Fn(&Path) -> Result<Invocation> + Sync,
+        A: Fn(&Run) -> bool + Sync,
+    {
+        let (good, direct) = self.compare(tool, binary, &prepare).await?;
+        assert_success(tool, &good.output);
+        assert_forwarded(tool, &good.output, payload.url);
+        assert!(
+            accepted(&good),
+            "{tool} did not accept the known-good payload:\n{}",
+            good.output.stderr
+        );
+
+        self.beamline
+            .set(Beamline::Assesses, Some(sha256_hex(payload.bytes)));
+        let (bad, _) = self
+            .run_hood(tool, "known-bad", &prepare, &self.no_models)
+            .await?;
+        assert_blocked(tool, &bad.output, payload.url);
+        assert!(!accepted(&bad), "{tool} accepted a blocked payload");
+
+        let models = match scan_models().await {
+            Ok(models) => models,
+            Err(error) => {
+                skip::<()>(tool, &format!("scan models unavailable: {error:#}"))?;
+                return Ok(good);
+            }
+        };
+        let budget = direct.max(TIMING_FLOOR) * LOCAL_SLOWDOWN + LOCAL_SCAN_ALLOWANCE;
+        for (mode, label, evidence) in [
+            (
+                Beamline::Unanalyzed,
+                "private",
+                "Beamline has no matching assessment; scanning locally".to_owned(),
+            ),
+            (
+                Beamline::QuotaExceeded,
+                "quota-exceeded",
+                format!(
+                    "Beamline returned HTTP 429 Too Many Requests: {QUOTA_MESSAGE} (retry after 1800s)"
+                ),
+            ),
+        ] {
+            self.beamline.set(mode, None);
+            let run = self.timed(tool, label, &prepare, &models, budget).await?;
+            assert_success(tool, &run.output);
+            assert!(
+                run.output.stderr.contains(&evidence),
+                "hood+{tool} ({label}) did not report {evidence:?}:\n{}",
+                run.output.stderr
+            );
+            assert!(
+                run.output.stderr.contains("Atomdrift Hood scan passed"),
+                "hood+{tool} ({label}) did not scan locally:\n{}",
+                run.output.stderr
+            );
+            assert!(
+                accepted(&run),
+                "{tool} ({label}) did not accept the payload"
+            );
+        }
+        self.beamline.set(Beamline::Assesses, None);
+        Ok(good)
+    }
+
+    /// Run a scenario directly and through hood with Beamline rating
+    /// everything benign, and return the first hood run and the fastest
+    /// direct time. The direct run must succeed; a successful hood run must
+    /// fit [`time_budget`].
+    async fn compare<F>(&self, tool: &str, binary: &Path, prepare: F) -> Result<(Run, Duration)>
+    where
+        F: Fn(&Path) -> Result<Invocation> + Sync,
     {
         let _serial = TIMING.lock().await;
+        self.beamline.set(Beamline::Assesses, None);
         let mut fastest_direct = Duration::MAX;
         let mut fastest_hood = Duration::MAX;
         let mut first = None;
@@ -313,19 +550,23 @@ impl ToolHarness {
             }
             fastest_direct = fastest_direct.min(direct);
 
-            let dir = self.dir(&format!("{tool}-hood-{attempt}"));
-            fs::create_dir_all(&dir)?;
-            let invocation = prepare(&dir)?;
-            let (output, hood) = self.hood(tool, &invocation).await?;
-            let failed = !output.status.success();
+            let (run, hood) = self
+                .run_hood(
+                    tool,
+                    &format!("known-good-{attempt}"),
+                    &prepare,
+                    &self.no_models,
+                )
+                .await?;
+            let failed = !run.output.status.success();
             if first.is_none() {
-                first = Some(Run { output, dir });
+                first = Some(run);
             }
             if failed {
                 break;
             }
             fastest_hood = fastest_hood.min(hood);
-            eprintln!("{tool} attempt {attempt}: direct {direct:?}, hood {hood:?}");
+            eprintln!("{tool} known-good attempt {attempt}: direct {direct:?}, hood {hood:?}");
             if fastest_hood <= time_budget(fastest_direct) {
                 break;
             }
@@ -337,7 +578,68 @@ impl ToolHarness {
                 "hood {tool} took {fastest_hood:?}, over {MAX_SLOWDOWN}x the direct {fastest_direct:?}",
             );
         }
+        Ok((run, fastest_direct))
+    }
+
+    /// Run a scenario through hood until it fits `budget`, and return the
+    /// first run.
+    async fn timed<F>(
+        &self,
+        tool: &str,
+        label: &str,
+        prepare: F,
+        models: &Path,
+        budget: Duration,
+    ) -> Result<Run>
+    where
+        F: Fn(&Path) -> Result<Invocation> + Sync,
+    {
+        let _serial = TIMING.lock().await;
+        let mut fastest = Duration::MAX;
+        let mut first = None;
+        for attempt in 0..TIMING_ATTEMPTS {
+            let (run, elapsed) = self
+                .run_hood(tool, &format!("{label}-{attempt}"), &prepare, models)
+                .await?;
+            let failed = !run.output.status.success();
+            if first.is_none() {
+                first = Some(run);
+            }
+            if failed {
+                break;
+            }
+            fastest = fastest.min(elapsed);
+            eprintln!("{tool} {label} attempt {attempt}: hood {elapsed:?}, budget {budget:?}");
+            if fastest <= budget {
+                break;
+            }
+        }
+        let run = first.ok_or_else(|| anyhow!("no {tool} run recorded"))?;
+        if run.output.status.success() {
+            assert!(
+                fastest <= budget,
+                "hood {tool} ({label}) took {fastest:?}, over its {budget:?} budget",
+            );
+        }
         Ok(run)
+    }
+
+    /// Run a scenario once through hood in a fresh directory named `label`.
+    async fn run_hood<F>(
+        &self,
+        tool: &str,
+        label: &str,
+        prepare: F,
+        models: &Path,
+    ) -> Result<(Run, Duration)>
+    where
+        F: Fn(&Path) -> Result<Invocation> + Sync,
+    {
+        let dir = self.dir(&format!("{tool}-{label}"));
+        fs::create_dir_all(&dir)?;
+        let invocation = prepare(&dir)?;
+        let (output, elapsed) = self.hood(tool, &invocation, models).await?;
+        Ok((Run { output, dir }, elapsed))
     }
 
     async fn direct(&self, binary: &Path, invocation: &Invocation) -> Result<(Output, Duration)> {
@@ -349,15 +651,34 @@ impl ToolHarness {
         self.execute(command, invocation).await
     }
 
-    async fn hood(&self, tool: &str, invocation: &Invocation) -> Result<(Output, Duration)> {
+    /// Run `tool` through hood against the fake Beamline, scanning locally
+    /// with `models` when Beamline gives no verdict.
+    async fn hood(
+        &self,
+        tool: &str,
+        invocation: &Invocation,
+        models: &Path,
+    ) -> Result<(Output, Duration)> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hood"));
         command
             .arg("--verbose")
+            .arg("--model-dir")
+            .arg(models)
             .arg(tool)
             .args(&invocation.args)
             .env("HOOD_HOME", self.dir("hood-home"))
-            .env("HOOD_NO_SCAN", "1")
+            .env("HOOD_BEAMLINE_URL", self.beamline.url())
+            .env("HOOD_BEAMLINE_CACHE_TTL_SECS", "0")
             .env("HOOD_NO_BLOOM", "1");
+        for key in [
+            "HOOD_LOCAL",
+            "HOOD_NO_SCAN",
+            "HOOD_BYPASS",
+            "HOOD_BEAMLINE_TOKEN",
+            "SCAN_MODELS_DIR",
+        ] {
+            command.env_remove(key);
+        }
         self.execute(command, invocation).await
     }
 
@@ -499,11 +820,21 @@ fn assert_forwarded(tool: &str, output: &Output, url: &str) {
     );
 }
 
-fn assert_requested(origin: &TestOrigin, suffix: &str) {
-    let requests = origin.requested_paths();
+/// Assert hood blocked a hostile download from a URL containing `url`, and
+/// that the tool failed because of it.
+fn assert_blocked(tool: &str, output: &Output, url: &str) {
     assert!(
-        requests.iter().any(|path| path.ends_with(suffix)),
-        "missing request ending in {suffix}; got {requests:?}",
+        output.stderr.lines().any(|line| {
+            line.contains("block") && line.contains(url) && line.contains("hostile")
+        }),
+        "hood+{tool} did not block the hostile payload from {url}:\n{}",
+        output.stderr,
+    );
+    assert!(
+        !output.status.success(),
+        "{tool} succeeded despite the blocked payload\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr,
     );
 }
 

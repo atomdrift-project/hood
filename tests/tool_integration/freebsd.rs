@@ -3,11 +3,10 @@
 use std::ffi::OsStr;
 use std::fs;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::{
-    Invocation, TestOrigin, ToolHarness, assert_forwarded, assert_requested, assert_success,
-    find_file, helper, is_root, skip, tool_binary,
+    Invocation, Payload, TestOrigin, ToolHarness, find_file, helper, is_root, skip, tool_binary,
 };
 
 pub(crate) const TOOLS: &[&str] = &["pkg"];
@@ -35,7 +34,8 @@ async fn pkg_fetches_package_through_hood() -> Result<()> {
     let harness = ToolHarness::new(&binary)?;
     let work = harness.dir("pkg-fixture");
     let repo = work.join("repo");
-    fs::create_dir_all(repo.join("All"))?;
+    let all = repo.join("All");
+    fs::create_dir_all(&all)?;
     let manifest = work.join("manifest.ucl");
     fs::write(&manifest, MANIFEST)?;
     helper(
@@ -45,42 +45,49 @@ async fn pkg_fetches_package_through_hood() -> Result<()> {
             OsStr::new("-M"),
             manifest.as_os_str(),
             OsStr::new("-o"),
-            repo.join("All").as_os_str(),
+            all.as_os_str(),
         ],
         &work,
     )
     .await?;
     helper("pkg", &[OsStr::new("repo"), repo.as_os_str()], &work).await?;
+    let built = find_file(&all, &|name| name.starts_with("hoodfix-1.0.0"))
+        .context("pkg create wrote no package")?;
+    let package = fs::read(&built)?;
     let origin = TestOrigin::spawn().await?;
     origin.add_dir("/repo", &repo)?;
     let url = format!("{}/repo", origin.url());
-    let run = harness
-        .compare("pkg", &binary, |dir| {
-            let repos = dir.join("repos");
-            fs::create_dir_all(&repos)?;
-            fs::create_dir_all(dir.join("db"))?;
-            fs::write(
-                repos.join("hoodfix.conf"),
-                format!(
-                    "hoodfix: {{ url: \"{url}\", signature_type: \"none\", mirror_type: \"none\", enabled: yes }}\n"
-                ),
-            )?;
-            Ok(Invocation::new(dir)
-                .args(["fetch", "-y", "-r", "hoodfix", "hoodfix"])
-                .env("REPOS_DIR", repos)
-                .env("PKG_CACHEDIR", dir.join("cache"))
-                .env("PKG_DBDIR", dir.join("db"))
-                .env("ASSUME_ALWAYS_YES", "yes"))
-        })
+    let package_url = format!("{url}/All/hoodfix-1.0.0");
+    harness
+        .exercise(
+            "pkg",
+            &binary,
+            |dir| {
+                let repos = dir.join("repos");
+                fs::create_dir_all(&repos)?;
+                fs::create_dir_all(dir.join("db"))?;
+                fs::write(
+                    repos.join("hoodfix.conf"),
+                    format!(
+                        "hoodfix: {{ url: \"{url}\", signature_type: \"none\", mirror_type: \"none\", enabled: yes }}\n"
+                    ),
+                )?;
+                Ok(Invocation::new(dir)
+                    .args(["fetch", "-y", "-r", "hoodfix", "hoodfix"])
+                    .env("REPOS_DIR", repos)
+                    .env("PKG_CACHEDIR", dir.join("cache"))
+                    .env("PKG_DBDIR", dir.join("db"))
+                    .env("ASSUME_ALWAYS_YES", "yes"))
+            },
+            Payload {
+                bytes: &package,
+                url: &package_url,
+            },
+            |run| {
+                find_file(&run.dir.join("cache"), &|name| name.starts_with("hoodfix-1.0.0"))
+                    .is_some()
+            },
+        )
         .await?;
-    assert_success("pkg", &run.output);
-    assert_forwarded("pkg", &run.output, "hoodfix-1.0.0");
-    assert!(
-        find_file(&run.dir.join("cache"), &|name| name
-            .starts_with("hoodfix-1.0.0"))
-        .is_some(),
-        "pkg did not cache the package"
-    );
-    assert_requested(&origin, "hoodfix-1.0.0.pkg");
     Ok(())
 }

@@ -55,8 +55,8 @@ impl Assessment {
 }
 
 pub(crate) struct Client {
-    /// Built on first use: loading platform roots takes ~130 ms on macOS,
-    /// which every intercepted command would otherwise pay up front.
+    /// Built on first use with the process-wide roots the proxy prefetches,
+    /// so intercepted commands never wait on a root-store load up front.
     http: tokio::sync::OnceCell<reqwest::Client>,
     base: Url,
     token: Option<String>,
@@ -122,19 +122,28 @@ impl Client {
         self.http
             .get_or_try_init(|| async {
                 let (tx, rx) = tokio::sync::oneshot::channel();
+                let https = self.base.scheme() == "https";
                 // A detached thread, not `spawn_blocking`: runtime shutdown
                 // waits for blocking tasks, and a stalled root-store load must
                 // not hold the user's command open after it finishes.
                 std::thread::Builder::new()
                     .name("hood-beamline-tls".to_owned())
                     .spawn(move || {
-                        let client = reqwest::Client::builder()
+                        let builder = reqwest::Client::builder()
                             .no_proxy()
                             .redirect(reqwest::redirect::Policy::none())
-                            .connect_timeout(Duration::from_secs(5))
-                            .build()
-                            .context("build Beamline client");
-                        drop(tx.send(client));
+                            .connect_timeout(Duration::from_secs(5));
+                        // A plain-HTTP endpoint (loopback only) needs no roots.
+                        let builder = if https {
+                            let mut tls = rustls::ClientConfig::builder()
+                                .with_root_certificates(crate::proxy::native_roots().clone())
+                                .with_no_client_auth();
+                            tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+                            builder.use_preconfigured_tls(tls)
+                        } else {
+                            builder.tls_built_in_native_certs(false)
+                        };
+                        drop(tx.send(builder.build().context("build Beamline client")));
                     })
                     .context("spawn Beamline client builder")?;
                 rx.await.context("Beamline client builder exited")?
@@ -218,12 +227,10 @@ impl Client {
         let mut response = tokio::time::timeout(IDLE_TIMEOUT, request.send())
             .await
             .context("Beamline headers timed out")?
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()
             .map_err(reqwest::Error::without_url)?;
         // Reject redirects too: neither identifiers nor authentication may be forwarded.
         if !response.status().is_success() {
-            bail!("Beamline returned HTTP {}", response.status());
+            bail!("{}", rejection(&mut response).await);
         }
         let mut pending = Vec::new();
         let mut progress_reported = false;
@@ -261,6 +268,76 @@ impl Client {
             }
         }
     }
+}
+
+/// Largest error body read for a message.
+const MAX_ERROR_BODY: usize = 4096;
+
+/// Describe a non-success response with the server's own explanation, such
+/// as a 429's spent hourly quota, so users can see why hood fell back to a
+/// slower local scan.
+async fn rejection(response: &mut reqwest::Response) -> String {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(printable);
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY
+        && let Ok(Ok(Some(chunk))) = tokio::time::timeout(IDLE_TIMEOUT, response.chunk()).await
+    {
+        body.extend_from_slice(&chunk);
+    }
+    body.truncate(MAX_ERROR_BODY);
+    let mut message = format!("Beamline returned HTTP {status}");
+    if let Some(detail) = server_message(&body) {
+        message.push_str(": ");
+        message.push_str(&detail);
+    }
+    if let Some(retry_after) = retry_after.filter(|value| !value.is_empty()) {
+        // Beamline sends whole seconds; an HTTP date passes through as is.
+        let unit = if retry_after.bytes().all(|b| b.is_ascii_digit()) {
+            "s"
+        } else {
+            ""
+        };
+        message.push_str(" (retry after ");
+        message.push_str(&retry_after);
+        message.push_str(unit);
+        message.push(')');
+    }
+    message
+}
+
+/// Extract a server's error message: Beamline's `{"error": {"code",
+/// "message"}}` envelope (the message is for people, the code a fallback),
+/// else the first line of text. Control characters are dropped so an
+/// endpoint cannot inject terminal escapes into hood's output.
+fn server_message(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let message = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| {
+            let error = value.get("error")?;
+            ["message", "code"]
+                .into_iter()
+                .find_map(|key| error.get(key)?.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| text.lines().next().unwrap_or_default().to_owned());
+    let message = printable(&message);
+    (!message.is_empty()).then_some(message)
+}
+
+/// Keep at most 200 printable characters.
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn parse_line(line: &[u8]) -> Result<Option<Assessment>> {
@@ -474,6 +551,30 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with(&format!("GET /v1/lookup?sha256={SHA}")));
         assert!(!requests[1].contains("purl="));
+    }
+
+    #[tokio::test]
+    async fn rejections_report_status_and_server_message() {
+        for (body, expected) in [
+            (
+                r#"{"error":{"code":"quota_exceeded","message":"anonymous quota exceeded, visit https://dash.isotope13.io/ for a token"}}"#,
+                "Beamline returned HTTP 429 Too Many Requests: anonymous quota exceeded, visit https://dash.isotope13.io/ for a token",
+            ),
+            (
+                r#"{"error":{"code":"quota_exceeded"}}"#,
+                "Beamline returned HTTP 429 Too Many Requests: quota_exceeded",
+            ),
+            (
+                "slow down\u{1b}[31m\nsecond line",
+                "Beamline returned HTTP 429 Too Many Requests: slow down[31m",
+            ),
+            ("", "Beamline returned HTTP 429 Too Many Requests"),
+        ] {
+            let mock = server(vec![(429, vec![body.to_owned()])]).await;
+            let client = Client::new(&mock.url, None).unwrap();
+            let error = client.assess(None, SHA).await.unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[tokio::test]

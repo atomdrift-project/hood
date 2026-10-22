@@ -132,6 +132,8 @@ codegen-units = 1
 # filefacts, fletch, hood and scan. Remove from all five once a release
 # carries these changes.
 [patch.crates-io]
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 # NetBSD and Solaris arms for wasmtime's signal trap handler, pulled in via

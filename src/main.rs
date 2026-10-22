@@ -22,180 +22,215 @@ use hood::tools::{
 #[command(about = "Scan HTTP(S) payloads before they reach package managers and installers")]
 struct Cli {
     /// Override scan model directory (default: auto-resolve via atomscan models repo).
-    #[arg(long, global = true)]
+    #[arg(long)]
     model_dir: Option<PathBuf>,
 
     /// Verbose logging (debug level for hood; info for everything else).
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     verbose: bool,
 
     /// For npm/pnpm: allow lifecycle scripts (off by default — pnpm-style).
-    #[arg(long, global = true)]
+    #[arg(long)]
     enable_scripts: bool,
 
     #[command(subcommand)]
     command: Command,
 }
 
+/// Hood's own flags precede the tool name (`hood -v npm install`). Each tool
+/// subcommand passes everything after its name to the tool verbatim, so a
+/// shimmed `npm -v` or `curl --help` reaches npm or curl, not hood.
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run `curl` through the proxy.
+    #[command(disable_help_flag = true)]
     Curl {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `wget` through the proxy.
+    #[command(disable_help_flag = true)]
     Wget {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `npm`. install/i/add/ci/update get `--ignore-scripts` by default;
     /// `test`/`run` and friends pass straight through.
+    #[command(disable_help_flag = true)]
     Npm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `npx` through the proxy; argv is preserved exactly.
+    #[command(disable_help_flag = true)]
     Npx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pnpm` (same intercept set as npm).
+    #[command(disable_help_flag = true)]
     Pnpm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pnpx` through the proxy; argv is preserved exactly.
+    #[command(disable_help_flag = true)]
     Pnpx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `yarn` (same intercept set as npm).
+    #[command(disable_help_flag = true)]
     Yarn {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `rush`; custom commands may provision autoinstallers.
+    #[command(disable_help_flag = true)]
     Rush {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `rushx`; project scripts inherit hood's proxy environment.
+    #[command(disable_help_flag = true)]
     Rushx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `bun`.
+    #[command(disable_help_flag = true)]
     Bun {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `bunx` through the proxy; argv is preserved exactly.
+    #[command(disable_help_flag = true)]
     Bunx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pip`. install/download/wheel are intercepted; everything else passes through.
+    #[command(disable_help_flag = true)]
     Pip {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pip3` (same intercept set and trust model as pip).
+    #[command(disable_help_flag = true)]
     Pip3 {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pipx`.
+    #[command(disable_help_flag = true)]
     Pipx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `uv` (Astral's pip replacement).
+    #[command(disable_help_flag = true)]
     Uv {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `uvx` (equivalent to `uv tool run`) through the proxy.
+    #[command(disable_help_flag = true)]
     Uvx {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `poetry`.
+    #[command(disable_help_flag = true)]
     Poetry {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pdm`; dependency-resolving commands are intercepted.
+    #[command(disable_help_flag = true)]
     Pdm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `go`. `get`/`install`/`mod` are intercepted; `run`/`test`/`build`/`vet` pass through.
+    #[command(disable_help_flag = true)]
     Go {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `cargo`. `install`/`add`/`update`/`fetch` are intercepted; `build`/`test`/`run` pass through.
+    #[command(disable_help_flag = true)]
     Cargo {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `zig`. `build` and `fetch` are intercepted; `run`/`test`/`cc` pass through.
+    #[command(disable_help_flag = true)]
     Zig {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `brew`. `install`/`upgrade`/`reinstall`/`fetch`/`tap`/`bundle` are intercepted.
+    #[command(disable_help_flag = true)]
     Brew {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pacman`. `-S`/`-U` (sync/upgrade) operations are intercepted; `-Q`/`-R` pass through.
+    #[command(disable_help_flag = true)]
     Pacman {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `yay` (Arch AUR helper). Installs and upgrades are intercepted; queries pass through.
+    #[command(disable_help_flag = true)]
     Yay {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `paru` (Arch AUR helper). Same intercept model as yay.
+    #[command(disable_help_flag = true)]
     Paru {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `makepkg`. Any build fetches sources and is intercepted; info flags pass through.
+    #[command(disable_help_flag = true)]
     Makepkg {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `dnf`. `install`/`upgrade`/`update`/`download` and friends are intercepted.
+    #[command(disable_help_flag = true)]
     Dnf {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `yum` (dnf-compatible front end).
+    #[command(disable_help_flag = true)]
     Yum {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `zypper`. `install`/`in`/`update`/`dup`/`patch`/`refresh` are intercepted.
+    #[command(disable_help_flag = true)]
     Zypper {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `rpm`. Intercepted only when given an `http(s)`/`ftp` URL; local installs pass through.
+    #[command(disable_help_flag = true)]
     Rpm {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `pkg` (FreeBSD). `install`/`add`/`upgrade`/`fetch`/`update` are intercepted.
+    #[command(disable_help_flag = true)]
     Pkg {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
     /// Run `apk` (Alpine). `add`/`upgrade`/`update`/`fetch` are intercepted.
+    #[command(disable_help_flag = true)]
     Apk {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
@@ -701,6 +736,29 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_flags_reach_the_tool_not_hood() {
+        // A shim rewrites `npm -v` to `hood npm -v`; npm must receive it.
+        for flag in [
+            "-v",
+            "--verbose",
+            "--help",
+            "-h",
+            "--enable-scripts",
+            "--model-dir",
+        ] {
+            let cli = Cli::try_parse_from(["hood", "npm", flag, "x"]).unwrap();
+            assert!(!cli.verbose && !cli.enable_scripts && cli.model_dir.is_none());
+            match cli.command {
+                Command::Npm { args } => assert_eq!(args, vec![flag, "x"]),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        let cli =
+            Cli::try_parse_from(["hood", "-v", "--enable-scripts", "npm", "install"]).unwrap();
+        assert!(cli.verbose && cli.enable_scripts);
     }
 
     #[test]

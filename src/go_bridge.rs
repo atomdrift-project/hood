@@ -77,6 +77,12 @@ impl GoBridge {
     ///
     /// Returns an error if `go env` fails or reports invalid network settings.
     pub async fn query(go_binary: &Path) -> Result<Self> {
+        // Environment variables override `go env -w` configuration, so when
+        // both are set there is nothing to ask the ~50 ms `go env` run.
+        let set = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        if let (Some(goproxy), Some(gosumdb)) = (set("GOPROXY"), set("GOSUMDB")) {
+            return Self::new(&goproxy, &gosumdb);
+        }
         let output = Command::new(go_binary)
             .args(["env", "GOPROXY", "GOSUMDB"])
             .output()

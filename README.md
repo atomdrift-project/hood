@@ -142,7 +142,7 @@ hood install
 
 `hood install` adds user-level shims for supported tools already on `PATH`; it requires no system proxy, root CA, or package-manager reconfiguration. Restart the shell and use those tools normally. On macOS, Go needs no manual `SSL_CERT_FILE` setup: Hood preserves `GOPROXY` and `GOSUMDB` verification through a loopback bridge. Zig trusts only fixed system certificate stores, so during `zig build` and `zig fetch` Hood refuses tunnels from Zig's own HTTP client; Zig then sends each dependency request over loopback HTTP and Hood fetches it over verified TLS. Tools run by build steps, such as `curl` or `git`, keep the normal intercepted path and trust Hood's per-run CA.
 
-Set `HOOD_VERBOSE=1` (or use `-v`) for per-artifact results and a run summary:
+Set `HOOD_VERBOSE=1` (or `hood -v <tool> …`) for per-artifact results and a run summary:
 
 ```text
 ✅ Atomdrift Hood scan passed — 3.2% risk score — package.tgz

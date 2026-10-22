@@ -549,6 +549,8 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
                 | "dist-upgrade"
                 | "dup"
                 | "patch"
+                | "download"
+                | "source-download"
                 | "source-install"
                 | "si"
                 | "install-new-recommends"
@@ -1674,6 +1676,11 @@ mod tests {
     fn zypper_short_and_long_verbs_intercepted() {
         let _v = intercept_args(dispatch(Tool::Zypper, vec![os("in"), os("vim")], false));
         let _v = intercept_args(dispatch(Tool::Zypper, vec![os("dup")], false));
+        let _v = intercept_args(dispatch(
+            Tool::Zypper,
+            vec![os("download"), os("vim")],
+            false,
+        ));
         let _v = passthrough_args(dispatch(Tool::Zypper, vec![os("search"), os("vim")], false));
     }
 

@@ -55,7 +55,9 @@ impl Assessment {
 }
 
 pub(crate) struct Client {
-    http: reqwest::Client,
+    /// Built on first use: loading platform roots takes ~130 ms on macOS,
+    /// which every intercepted command would otherwise pay up front.
+    http: tokio::sync::OnceCell<reqwest::Client>,
     base: Url,
     token: Option<String>,
     slots: Semaphore,
@@ -107,19 +109,37 @@ impl Client {
         {
             bail!("Beamline endpoint must be an HTTPS origin (HTTP allowed on loopback)");
         }
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .context("build Beamline client")?;
         Ok(Self {
-            http,
+            http: tokio::sync::OnceCell::new(),
             base,
             token,
             slots: Semaphore::new(4),
             cache: None,
         })
+    }
+
+    async fn http(&self) -> Result<&reqwest::Client> {
+        self.http
+            .get_or_try_init(|| async {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // A detached thread, not `spawn_blocking`: runtime shutdown
+                // waits for blocking tasks, and a stalled root-store load must
+                // not hold the user's command open after it finishes.
+                std::thread::Builder::new()
+                    .name("hood-beamline-tls".to_owned())
+                    .spawn(move || {
+                        let client = reqwest::Client::builder()
+                            .no_proxy()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .connect_timeout(Duration::from_secs(5))
+                            .build()
+                            .context("build Beamline client");
+                        drop(tx.send(client));
+                    })
+                    .context("spawn Beamline client builder")?;
+                rx.await.context("Beamline client builder exited")?
+            })
+            .await
     }
 
     /// No retries: outages, quotas, and incomplete streams go to local analysis.
@@ -184,10 +204,11 @@ impl Client {
             .append_pair(kind, value)
             .append_pair("follow", FOLLOW)
             .append_pair("false_positive_budget", BUDGET);
+        let http = self.http().await?;
         let request = if analyze {
-            self.http.post(url)
+            http.post(url)
         } else {
-            self.http.get(url)
+            http.get(url)
         };
         let request = if let Some(token) = &self.token {
             request.bearer_auth(token)

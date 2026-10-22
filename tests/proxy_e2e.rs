@@ -375,6 +375,39 @@ async fn absolute_https_requires_opt_in_and_a_trusted_upstream() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plaintext_http_inside_connect_tunnel_is_forwarded_and_scanned() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // pnpm and Zig tunnel `http://` requests through CONNECT without TLS.
+    let origin_addr = start_http_origin().await?;
+    let handle = Proxy::new(Arc::new(AllowAll), Config::default())?
+        .spawn()
+        .await?;
+    let tunnel = format!(
+        "CONNECT {origin_addr} HTTP/1.1\r\nHost: {origin_addr}\r\n\r\nGET /hello HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n"
+    );
+    let response = raw_request(handle.addr, &tunnel).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("x-origin-marker: yes"), "{response}");
+    assert!(
+        response.contains(std::str::from_utf8(PAYLOAD)?),
+        "{response}"
+    );
+    handle.stop().await;
+
+    let handle = Proxy::new(Arc::new(BlockAll), Config::default())?
+        .spawn()
+        .await?;
+    let response = raw_request(handle.addr, &tunnel).await?;
+    assert!(
+        response.contains("HTTP/1.1 451"),
+        "tunneled HTTP was not scanned: {response}"
+    );
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_body_spills_to_disk_and_forwards_intact() -> Result<()> {
     drop(rustls::crypto::ring::default_provider().install_default());
 

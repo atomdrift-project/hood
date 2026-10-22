@@ -32,7 +32,9 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -54,7 +56,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -259,7 +261,9 @@ struct Inner {
     scanner: Arc<dyn Scanner>,
     ca: Ca,
     tls_acceptor: TlsAcceptor,
-    upstream_tls: Arc<ClientConfig>,
+    /// Built on first use: loading platform roots takes ~130 ms on macOS,
+    /// longer than many child commands run. See [`Inner::upstream_tls`].
+    upstream_tls: tokio::sync::OnceCell<Arc<ClientConfig>>,
     go_bridge_token: String,
     config: Config,
 }
@@ -274,8 +278,8 @@ impl std::fmt::Debug for Proxy {
 }
 
 impl Proxy {
-    /// Build a proxy. Generates an ephemeral CA and loads native TLS roots
-    /// for verifying upstream servers.
+    /// Build a proxy. Generates an ephemeral CA; native TLS roots for
+    /// verifying upstream servers load in the background once it is spawned.
     ///
     /// # Errors
     ///
@@ -290,32 +294,12 @@ impl Proxy {
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-        let mut roots = RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            // Individual cert failures are common (expired/unsupported algos);
-            // skip them and keep building the set.
-            drop(roots.add(cert));
-        }
-        for cert in &config.extra_upstream_roots {
-            drop(roots.add(cert.clone()));
-        }
-        if roots.is_empty() {
-            return Err(anyhow!(
-                "no native TLS roots found; cannot verify upstream servers",
-            ));
-        }
-        let mut upstream_tls = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        upstream_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-
         Ok(Self {
             inner: Arc::new(Inner {
                 scanner,
                 ca,
                 tls_acceptor,
-                upstream_tls: Arc::new(upstream_tls),
+                upstream_tls: tokio::sync::OnceCell::new(),
                 go_bridge_token,
                 config,
             }),
@@ -349,12 +333,69 @@ impl Proxy {
         let signal = Arc::clone(&shutdown);
         let proxy = self.clone();
         let task = tokio::spawn(async move { accept_loop(listener, proxy, signal).await });
+        // Load upstream roots while the child starts rather than delaying it.
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            if let Err(e) = inner.upstream_tls().await {
+                tracing::warn!(error = %format!("{e:#}"), "upstream TLS unavailable");
+            }
+        });
         Ok(Handle {
             addr,
             shutdown,
             task: Some(task),
         })
     }
+}
+
+impl Inner {
+    /// Upstream TLS client configuration, built once off the async workers.
+    /// Every HTTPS forward waits for it; a failure fails that forward closed
+    /// and is retried on the next one.
+    async fn upstream_tls(&self) -> Result<Arc<ClientConfig>> {
+        self.upstream_tls
+            .get_or_try_init(|| async {
+                let extra = self.config.extra_upstream_roots.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                // A detached thread, not `spawn_blocking`: runtime shutdown
+                // waits for blocking tasks, which would charge this load to
+                // runs that finish without needing it.
+                std::thread::Builder::new()
+                    .name("hood-tls-roots".to_owned())
+                    .spawn(move || drop(tx.send(upstream_tls_config(&extra))))
+                    .context("spawn upstream TLS loader")?;
+                rx.await.context("upstream TLS loader exited")?
+            })
+            .await
+            .cloned()
+    }
+}
+
+/// Build the verifier for upstream servers from the platform roots plus any
+/// configured extras.
+fn upstream_tls_config(
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<Arc<ClientConfig>> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // Individual cert failures are common (expired/unsupported algos);
+        // skip them and keep building the set.
+        drop(roots.add(cert));
+    }
+    for cert in extra_roots {
+        drop(roots.add(cert.clone()));
+    }
+    if roots.is_empty() {
+        return Err(anyhow!(
+            "no native TLS roots found; cannot verify upstream servers",
+        ));
+    }
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
 }
 
 /// Running-proxy handle. Drop or `stop()` to terminate.
@@ -428,38 +469,39 @@ async fn serve_inbound_plain(stream: TcpStream, proxy: Proxy) {
     }
 }
 
-/// Serve an inbound MITM-decrypted connection. The authority (host:port from
-/// the original CONNECT) is threaded through so we know how to reach upstream.
-async fn serve_inbound_mitm<IO>(stream: IO, proxy: Proxy, authority: String)
+/// Serve the inside of a CONNECT tunnel. `origin` (`https://host:port` for
+/// decrypted TLS, `http://host:port` for plaintext) comes from the original
+/// CONNECT and tells us how to reach upstream.
+async fn serve_inbound_tunnel<IO>(stream: IO, proxy: Proxy, origin: String)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let proxy_clone = proxy.clone();
-    let authority = Arc::<str>::from(authority);
+    let origin = Arc::<str>::from(origin);
     let svc = service_fn(move |req| {
         let proxy = proxy_clone.clone();
-        let authority = Arc::clone(&authority);
-        async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(authority)).await) }
+        let origin = Arc::clone(&origin);
+        async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(origin)).await) }
     });
     if let Err(e) = server_http1::Builder::new()
         .keep_alive(true)
         .serve_connection(TokioIo::new(stream), svc)
         .await
     {
-        tracing::trace!(error = %e, "mitm connection ended");
+        tracing::trace!(error = %e, "tunnel connection ended");
     }
 }
 
 impl Proxy {
-    /// Top-level request dispatcher. `mitm_authority` is `Some(host:port)`
-    /// when we're handling the decrypted side of a CONNECT tunnel.
+    /// Top-level request dispatcher. `tunnel_origin` is `Some(scheme://host:port)`
+    /// when we're handling the inside of a CONNECT tunnel.
     async fn dispatch_inbound(
         &self,
         mut req: Request<Incoming>,
-        mitm_authority: Option<Arc<str>>,
+        tunnel_origin: Option<Arc<str>>,
     ) -> Response<ProxyBody> {
         // CONNECT only ever arrives on the plaintext side.
-        if req.method() == Method::CONNECT && mitm_authority.is_none() {
+        if req.method() == Method::CONNECT && tunnel_origin.is_none() {
             if self.inner.config.zig_clients && is_zig_client(req.headers()) {
                 // A 4xx, not 5xx: Zig treats a server error as possibly
                 // transient and keeps trying to tunnel.
@@ -477,7 +519,7 @@ impl Proxy {
         // origin-form loopback HTTP requests. Restore the encoded upstream URL
         // before feeding them into the normal verified+scanned forward path.
         let mut go_bridge_request = false;
-        if mitm_authority.is_none() && req.uri().path().starts_with(go_bridge::ROUTE_PREFIX) {
+        if tunnel_origin.is_none() && req.uri().path().starts_with(go_bridge::ROUTE_PREFIX) {
             if !matches!(*req.method(), Method::GET | Method::HEAD) {
                 return error_response(StatusCode::METHOD_NOT_ALLOWED, "Go bridge requires GET");
             }
@@ -503,7 +545,7 @@ impl Proxy {
         }
 
         match self
-            .handle_forward(req, mitm_authority, go_bridge_request)
+            .handle_forward(req, tunnel_origin, go_bridge_request)
             .await
         {
             Ok(resp) => resp,
@@ -543,7 +585,27 @@ async fn run_mitm_after_upgrade(
             return;
         }
     };
-    let io = TokioIo::new(upgraded);
+    let mut io = TokioIo::new(upgraded);
+    // Some clients (pnpm, Zig) tunnel plain HTTP for `http://` URLs. A TLS
+    // stream opens with a handshake record; anything else is served as HTTP.
+    let mut first = [0_u8; 1];
+    match io.read(&mut first).await {
+        Ok(0) => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(authority, error = %e, "tunnel read failed");
+            return;
+        }
+    }
+    let io = Prefixed {
+        first: Some(first[0]),
+        io,
+    };
+    if first[0] != TLS_HANDSHAKE {
+        tracing::debug!(authority, "plaintext HTTP tunnel");
+        serve_inbound_tunnel(io, proxy, format!("http://{authority}")).await;
+        return;
+    }
     let tls = match proxy.inner.tls_acceptor.accept(io).await {
         Ok(s) => s,
         Err(e) => {
@@ -552,19 +614,69 @@ async fn run_mitm_after_upgrade(
         }
     };
     // From this point on, traffic is plaintext HTTP/1.1 inside our TLS server.
-    serve_inbound_mitm(tls, proxy, authority).await;
+    serve_inbound_tunnel(tls, proxy, format!("https://{authority}")).await;
+}
+
+/// TLS record content type of a handshake, the first byte of every TLS stream.
+const TLS_HANDSHAKE: u8 = 0x16;
+
+/// A stream that yields one already-read byte before the rest of `io`.
+struct Prefixed<IO> {
+    first: Option<u8>,
+    io: IO,
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for Prefixed<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() > 0
+            && let Some(byte) = this.first.take()
+        {
+            buf.put_slice(&[byte]);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.io).poll_read(cx, buf)
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for Prefixed<IO> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
 }
 
 impl Proxy {
     async fn handle_forward(
         &self,
         mut req: Request<Incoming>,
-        mitm_authority: Option<Arc<str>>,
+        tunnel_origin: Option<Arc<str>>,
         go_bridge_request: bool,
     ) -> Result<Response<ProxyBody>> {
         let (mut target_url, host_header) = resolve_target(
             &req,
-            mitm_authority.as_deref(),
+            tunnel_origin.as_deref(),
             go_bridge_request || self.inner.config.zig_clients,
         )?;
         let redirect_base = target_url.clone();
@@ -758,22 +870,21 @@ fn is_zig_client(headers: &HeaderMap) -> bool {
 ///
 /// - In the plaintext-forward case, the request URI is absolute and the URL
 ///   is taken from it directly.
-/// - In the MITM case, the URI is origin-form; the authority comes from the
-///   original CONNECT.
+/// - Inside a CONNECT tunnel, the URI is origin-form; the scheme and
+///   authority come from the tunnel.
 fn resolve_target(
     req: &Request<Incoming>,
-    mitm_authority: Option<&str>,
+    tunnel_origin: Option<&str>,
     allow_absolute_https: bool,
 ) -> Result<(url::Url, String)> {
-    if let Some(authority) = mitm_authority {
+    if let Some(origin) = tunnel_origin {
         let path = req
             .uri()
             .path_and_query()
             .map_or_else(|| "/".to_owned(), ToString::to_string);
-        let url =
-            url::Url::parse(&format!("https://{authority}{path}")).context("build mitm url")?;
+        let url = url::Url::parse(&format!("{origin}{path}")).context("build tunnel url")?;
         // RFC 7230 §5.4: the Host header should match the request target.
-        let host_header = authority_header(&url).unwrap_or_else(|_| authority.to_owned());
+        let host_header = authority_header(&url)?;
         return Ok((url, host_header));
     }
     let uri = req.uri();
@@ -817,7 +928,7 @@ async fn upstream_request(
     if is_https {
         let server_name = ServerName::try_from(host.to_owned())
             .map_err(|e| anyhow!("invalid SNI {host}: {e}"))?;
-        let connector = TlsConnector::from(Arc::clone(&inner.upstream_tls));
+        let connector = TlsConnector::from(inner.upstream_tls().await?);
         let tls = connector
             .connect(server_name, tcp)
             .await

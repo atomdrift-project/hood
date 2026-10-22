@@ -49,8 +49,8 @@ impl Scanner for BlockAll {
 const PAYLOAD: &[u8] = b"hello from origin\n";
 
 /// A larger, deterministic body used to exercise the spill-to-disk and
-/// oversized-passthrough paths. 256 KiB so a small `max_body_bytes` forces a
-/// spill and a small `max_scan_bytes` forces an unscanned forward.
+/// inspection-limit paths. 256 KiB so a small `max_body_bytes` forces a
+/// spill and a small `max_scan_bytes` exercises the failure policy.
 fn big_payload() -> Vec<u8> {
     (0_u8..=250).cycle().take(256 * 1024).collect()
 }
@@ -298,15 +298,12 @@ async fn large_body_spills_to_disk_and_forwards_intact() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_body_forwards_unscanned_intact() -> Result<()> {
+async fn oversized_body_is_blocked_by_default() -> Result<()> {
     drop(rustls::crypto::ring::default_provider().install_default());
 
     let origin_addr = start_http_origin().await?;
-    // BlockAll would block anything it scans — so if the 256 KiB body still
-    // comes back whole, it proves the body was forwarded *without* scanning
-    // because it exceeded the disk-scan cap.
     let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
-    // The 256 KiB body exceeds this scan limit and is forwarded unscanned.
+    // Oversized artifacts must not bypass the release gate.
     let cfg = Config::default().with_scan_limits(4096, 16 * 1024)?;
     let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
@@ -315,13 +312,7 @@ async fn oversized_body_forwards_unscanned_intact() -> Result<()> {
     let client = client_with_proxy(handle.addr, &hood_ca);
     let url = format!("http://{origin_addr}/big");
     let resp = client.get(&url).send().await?;
-    assert_eq!(
-        resp.status(),
-        200,
-        "oversized body must be forwarded, not blocked"
-    );
-    let body = resp.bytes().await?;
-    assert_eq!(body.as_ref(), big_payload().as_slice());
+    assert_eq!(resp.status(), 451);
 
     handle.stop().await;
     Ok(())

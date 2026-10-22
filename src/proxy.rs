@@ -17,12 +17,11 @@
 //! Hop-by-hop headers are stripped on both legs and `Accept-Encoding` is forced
 //! to `identity` on outbound so we never have to decompress for scanning.
 //!
-//! Response bodies are handled by size to bound memory. First a pre-fetch PURL
-//! gate can skip (known-good) or block (known-bad) before a byte is downloaded.
-//! Otherwise: a body within the configured in-memory limit is buffered and
+//! Response bodies are held until assessment. A body within the configured
+//! in-memory limit is buffered and
 //! scanned in RAM; a larger one spills to a temp file and is scanned from disk
 //! (cleave memory-maps it) up to the configured scan limit; past that it is
-//! forwarded unscanned. Forwarded large bodies stream back from the spill file,
+//! handled by the scanner's failure policy. Forwarded large bodies stream back from the spill file,
 //! so a multi-gigabyte transfer never materializes whole in RAM.
 
 use std::convert::Infallible;
@@ -57,7 +56,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::ca::{Ca, CaResolver};
 use crate::go_bridge;
-use crate::scanner::{BlockReason, DiskScanRequest, Prefetch, ScanRequest, Scanner, Verdict};
+use crate::scanner::{BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
 
 /// The proxy's response body. A [`BoxBody`] so one return type covers three
 /// shapes: a fully-buffered small response ([`full_body`]), an upstream body
@@ -72,7 +71,7 @@ fn full_body(bytes: Bytes) -> ProxyBody {
 }
 
 /// Stream an upstream body straight through to the client without buffering —
-/// used for known-good-PURL skips and payloads too large to scan.
+/// used for empty responses and explicitly allowed inspection failures.
 fn passthrough_body(body: Incoming) -> ProxyBody {
     body.map_err(std::io::Error::other).boxed()
 }
@@ -87,8 +86,8 @@ const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 /// Upper bound on a response body scanned *from disk*. Between
 /// [`MAX_BODY_BYTES_DEFAULT`] and this, the body is streamed to a temp file and
 /// scanned there (cleave memory-maps it, so RAM stays bounded). Past this, the
-/// body is too large to scan and is forwarded unscanned — bounded only by the
-/// pre-fetch PURL gate. Tunable via `HOOD_MAX_SCAN_MB`.
+/// body is too large to scan and follows the scanner's failure policy.
+/// Tunable via `HOOD_MAX_SCAN_MB`.
 const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Generate an independent 128-bit route token for the loopback Go bridge.
@@ -148,8 +147,7 @@ pub struct Config {
     /// Maximum response body buffered in RAM for scanning. Larger responses
     /// spill to disk and are scanned from there.
     max_body_bytes: u64,
-    /// Maximum response body scanned from disk. Larger responses are forwarded
-    /// unscanned (bounded only by the pre-fetch PURL gate).
+    /// Maximum response body inspected. Larger responses follow failure policy.
     max_scan_bytes: u64,
     /// Bind address. Forced to a loopback address for safety.
     bind: SocketAddr,
@@ -536,6 +534,7 @@ impl Proxy {
         let (mut target_url, host_header) =
             resolve_target(&req, mitm_authority.as_deref(), go_bridge_request)?;
         let redirect_base = target_url.clone();
+        let allow_purl = permits_public_coordinate(req.method(), req.headers(), &target_url);
         let url_authorization = take_url_authorization(&mut target_url)?;
         // Captured before `req` is consumed by the upstream call: a HEAD request
         // never carries a response body to scan.
@@ -568,29 +567,6 @@ impl Proxy {
 
         let scan_url = target_url.to_string();
 
-        // Pre-fetch PURL gate — decided from the URL alone, before any download.
-        match self.inner.scanner.prefetch(&scan_url) {
-            Prefetch::Block(reason) => {
-                tracing::warn!(url = %scan_url, verdict = reason.label(), "block (pre-fetch purl)");
-                return Ok(blocked_response(&scan_url, &reason));
-            }
-            Prefetch::SkipForward => {
-                // Known-good PURL: stream straight through, no buffering, no scan.
-                let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
-                let (mut parts, body) = response.into_parts();
-                if go_bridge_request {
-                    rewrite_go_bridge_location(
-                        &mut parts.headers,
-                        &redirect_base,
-                        &self.inner.go_bridge_token,
-                    );
-                }
-                tracing::debug!(url = %scan_url, "forward (known-good purl skip)");
-                return build_response(parts.status, &parts.headers, passthrough_body(body), None);
-            }
-            Prefetch::Proceed => {}
-        }
-
         // Open upstream connection (no pool for v1; one TCP per request).
         let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
         let (mut parts, body) = response.into_parts();
@@ -618,22 +594,32 @@ impl Proxy {
         let ram_cap = self.inner.config.max_body_bytes;
         let disk_cap = self.inner.config.max_scan_bytes;
 
-        // A declared Content-Length past the disk-scan cap: too large to scan, so
-        // forward it straight through unscanned rather than spilling gigabytes.
+        // Apply failure policy before buffering a declared oversized download.
         if content_length(&parts.headers).is_some_and(|len| len > disk_cap) {
-            tracing::debug!(url = %scan_url, "forward (declared >scan cap, unscanned)");
-            return build_response(parts.status, &parts.headers, passthrough_body(body), None);
+            return match self.inner.scanner.scan_limit(&scan_url) {
+                Verdict::Block(reason) => Ok(blocked_response(&scan_url, &reason)),
+                Verdict::Allow => {
+                    build_response(parts.status, &parts.headers, passthrough_body(body), None)
+                }
+            };
         }
 
         let buffered = collect_or_spill(body, &scan_url, ram_cap, disk_cap).await?;
-        self.finish_scanned_response(buffered, &scan_url, parts.status, &parts.headers)
-            .await
+        self.finish_scanned_response(
+            buffered,
+            &scan_url,
+            allow_purl && parts.status.is_success(),
+            parts.status,
+            &parts.headers,
+        )
+        .await
     }
 
     async fn finish_scanned_response(
         &self,
         buffered: Buffered,
         scan_url: &str,
+        allow_purl: bool,
         status: StatusCode,
         headers: &HeaderMap,
     ) -> Result<Response<ProxyBody>> {
@@ -648,6 +634,7 @@ impl Proxy {
                     .scanner
                     .scan(ScanRequest {
                         url: scan_url.to_owned(),
+                        allow_purl,
                         body: bytes.to_vec(),
                     })
                     .await
@@ -681,18 +668,14 @@ impl Proxy {
                         .scanner
                         .scan_disk(DiskScanRequest {
                             url: scan_url.to_owned(),
+                            allow_purl,
                             path: path.clone(),
                             sha256,
                         })
                         .await
                         .context("disk scanner")?
                 } else {
-                    tracing::debug!(
-                        url = scan_url,
-                        len,
-                        "forward (spilled >scan cap, unscanned)"
-                    );
-                    Verdict::Allow
+                    self.inner.scanner.scan_limit(scan_url)
                 };
                 match verdict {
                     Verdict::Allow => {
@@ -819,13 +802,22 @@ where
     Ok(resp)
 }
 
+/// Capture provenance before URL credentials are moved into headers.
+fn permits_public_coordinate(method: &Method, headers: &HeaderMap, url: &url::Url) -> bool {
+    method == Method::GET
+        && !headers.contains_key(AUTHORIZATION)
+        && !headers.contains_key("cookie")
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 /// Outcome of reading an upstream body under the size policy.
 enum Buffered {
     /// Fit within the in-RAM cap — buffered whole and scanned in memory.
     Memory(Bytes),
     /// Spilled to a temporary file (dropping `tmp` unlinks it). `scan` is true
-    /// when the payload is within the disk-scan cap; false when it is too large
-    /// to scan and must be forwarded from disk unscanned.
+    /// when the payload is within the disk-scan cap; false when it must follow
+    /// the scanner's inspection-failure policy.
     Spilled {
         tmp: tempfile::NamedTempFile,
         path: std::path::PathBuf,
@@ -1085,6 +1077,26 @@ fn blocked_response(url: &str, reason: &BlockReason) -> Response<ProxyBody> {
 mod tests {
     use super::*;
     use hyper::header::HeaderMap;
+
+    #[test]
+    fn authenticated_requests_never_disclose_coordinates() {
+        let url = url::Url::parse("https://registry.npmjs.org/demo/-/demo-1.tgz").unwrap();
+        let empty = HeaderMap::new();
+        assert!(permits_public_coordinate(&Method::GET, &empty, &url));
+        assert!(!permits_public_coordinate(&Method::POST, &empty, &url));
+        for header in ["authorization", "cookie"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_static("private"));
+            assert!(!permits_public_coordinate(&Method::GET, &headers, &url));
+        }
+        let credentialed =
+            url::Url::parse("https://user:secret@registry.npmjs.org/demo/-/demo-1.tgz").unwrap();
+        assert!(!permits_public_coordinate(
+            &Method::GET,
+            &empty,
+            &credentialed
+        ));
+    }
 
     #[test]
     fn rejects_non_loopback_bind() {

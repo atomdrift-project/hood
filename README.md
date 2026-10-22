@@ -13,10 +13,67 @@
 ## How it works
 
 ```mermaid
-flowchart LR; A["Developer or agent<br/>original tool"] --> B["Loopback proxy<br/>ephemeral child-only CA"] --> C["Public/private registry<br/>or any URL"] -->|bytes| B; B --> D{"Known-good/bad<br/>hash or PURL?"}; D -->|good| E["Release to tool"]; D -->|bad| G["Block and explain"]; D -->|unknown| F["Local ML + static analysis"]; F -->|benign| E; F -->|suspicious/hostile| G
+flowchart LR
+    A[Developer tool] --> B[Loopback proxy holds download]
+    B --> C{Local Bloom decision}
+    C -->|Known good| D[Release]
+    C -->|Known bad| E[Block]
+    C -->|Unresolved| F{Public package identity?}
+    F -->|Yes| G[Beamline PURL analysis]
+    F -->|No| H[Beamline SHA-256 lookup]
+    G --> I{Matching assessment?}
+    H --> I
+    I -->|Yes| J[Apply local policy]
+    I -->|No or API failure| K[Local static analysis and ML]
+    K --> J
 ```
 
-Hood creates a fresh CA for each intercepted command and trusts it only in that child process; it never changes the host trust store. Unknown artifacts are analyzed locally by [Atomdrift Scan](https://github.com/atomdrift-project/scan), while optional bloom filters fast-path known artifacts. By default, fetching commands fail closed if scanning cannot start; local operations such as `go test`, `cargo build`, and `npm test` bypass the proxy.
+Hood creates a fresh CA for each intercepted command and trusts it only in that
+child process; it never changes the host trust store. It buffers downloads in
+memory or spills them to disk, holding their contents until assessment completes.
+Local operations such as `go test`, `cargo build`, and `npm test` bypass the proxy.
+
+Assessment uses three layers:
+
+1. **Local Bloom filters from Atomdrift Scan.** Hood uses Scan's combined decision:
+   every supplied identity must be blessed to skip inspection. A good package name
+   alone cannot bless unknown bytes. Known-bad decisions block; conflicts and outside
+   sightings continue to assessment. Bloom membership is probabilistic.
+2. **Beamline.** Recognizable public packages use blocking `POST /v1/analyze?purl=…`.
+   Other artifacts use `GET /v1/lookup?sha256=…`. Only an `analyzed` assessment with
+   a matching SHA-256 and recognized severity is applied. If PURL analysis describes
+   different bytes, Hood asks about the downloaded hash. Requests use
+   `follow=references` and `false_positive_budget=25`.
+3. **Local analysis.** Unknown artifacts, API outages, quota/rate limits, malformed
+   answers, and interrupted streams fall back to Atomdrift Scan without retries.
+   The analyzer loads only when needed. Suspicious and hostile assessments block by
+   default; if local scanning also fails, Hood applies its existing `HOOD_BYPASS`
+   policy. Downloads exceeding `HOOD_MAX_SCAN_MB` also follow that failure policy.
+
+Beamline calls send only a public PURL or a SHA-256, plus assessment policy parameters.
+They never upload artifact contents or forward download URLs, cookies, or registry
+credentials. Authenticated requests, URLs with query parameters, scoped npm packages,
+GitHub archives, and unrecognized origins use hashes. This minimizes disclosure;
+PURLs still reveal dependencies and hashes can identify known artifacts. Source IPs
+and an optional Beamline token can link requests.
+
+Beamline connections bypass proxy environment variables and reject redirects.
+At most four requests run concurrently; excess work goes directly to local analysis.
+Connection establishment has a five-second timeout, headers and stream inactivity
+have a 30-second timeout, and a progressing analysis may run for up to 30 minutes.
+
+| Setting | Purpose |
+| --- | --- |
+| `HOOD_BEAMLINE_URL` | API origin; defaults to `https://api.isotope13.ai`. HTTPS required except on loopback. |
+| `HOOD_BEAMLINE_TOKEN` | Optional Beamline bearer token, separate from package-manager credentials. |
+| `HOOD_NO_BEAMLINE=1` | Use local Bloom filters and local analysis only. |
+| `HOOD_NO_BLOOM=1` | Disable the Bloom gate and its automatic refresh. |
+| `SCAN_BLOOM_DIR` | Use an explicitly managed Scan Bloom bundle; Hood does not update it. |
+| `SCAN_NO_UPDATE=1` | Disable automatic Bloom refresh. |
+
+Hood shares Scan's installed Bloom bundle and verified, atomic updater. It checks for
+updates at most once per day, including failed attempts. Missing or unusable bundles
+grant no skips; assessment continues through the other layers.
 
 ## Tool coverage
 

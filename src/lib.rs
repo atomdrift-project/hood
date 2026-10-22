@@ -6,11 +6,12 @@
 //! - [`ca`] — ephemeral certificate authority used to MITM TLS.
 //! - [`go_bridge`] — keychain-free macOS transport for Go modules and sumdb.
 //! - [`proxy`] — HTTP/1.1 forward proxy with transparent CONNECT interception.
-//! - [`scanner`] — pluggable scanner trait + in-process atomscan backend.
+//! - [`scanner`] — pluggable scanner trait, local Bloom gate, Beamline, and local analysis.
 //!
 //! Higher-level glue (env-var injection for child processes, per-tool subcommands)
 //! lives in [`tools`].
 
+pub(crate) mod beamline;
 pub mod ca;
 pub mod go_bridge;
 pub mod install;

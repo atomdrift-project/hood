@@ -88,6 +88,37 @@ pub fn emit_pass(url: &str, probability: f32) {
     ));
 }
 
+/// Report a remote assessment without inventing a model probability or logging locators.
+pub(crate) fn emit_remote(
+    classification: Classification,
+    disposition: Disposition,
+    policy: ScanPolicy,
+    assessment: &crate::beamline::Assessment,
+) {
+    let mut stderr = std::io::stderr().lock();
+    drop(writeln!(
+        stderr,
+        "hood Beamline verdict={} disposition={} policy={}",
+        classification_label(classification),
+        match disposition {
+            Disposition::Blocked => "block",
+            Disposition::Forwarded => "forward",
+        },
+        policy_tag(policy),
+    ));
+    if let Some(reason) = &assessment.reason {
+        drop(writeln!(stderr, "  {}", sanitize(reason)));
+    }
+    for finding in assessment.findings.iter().take(3) {
+        drop(writeln!(
+            stderr,
+            "  {} {}",
+            sanitize(&finding.id),
+            sanitize(finding.desc.as_deref().unwrap_or(""))
+        ));
+    }
+}
+
 /// Emit one aggregate line when a verbose invocation scanned multiple downloads.
 pub fn emit_scan_summary(summary: crate::scanner::ScanSummary) {
     let Some(line) = format_scan_summary(summary) else {

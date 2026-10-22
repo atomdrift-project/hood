@@ -72,6 +72,11 @@ pub enum Tool {
     Go,
     /// `cargo <args...>` — Rust. Respects `CARGO_HTTP_CAINFO` and `SSL_CERT_FILE`.
     Cargo,
+    /// `zig <args...>` — Zig toolchain. Its TLS stack reads only fixed system
+    /// trust stores, so hood refuses tunnels from Zig's HTTP client and Zig
+    /// falls back to absolute-form proxying, which hood fetches over verified
+    /// TLS itself. Build steps' own clients keep the CA-trusting MITM path.
+    Zig,
     /// `brew <args...>` — Homebrew (curl-backed under the hood).
     Brew,
     /// `pacman <args...>` — Arch Linux. libalpm links libcurl, so honors
@@ -126,6 +131,7 @@ impl Tool {
             Self::Pdm => "pdm",
             Self::Go => "go",
             Self::Cargo => "cargo",
+            Self::Zig => "zig",
             Self::Brew => "brew",
             Self::Pacman => "pacman",
             Self::Yay => "yay",
@@ -165,6 +171,7 @@ impl Tool {
             Self::Pdm => "pdm",
             Self::Go => "go",
             Self::Cargo => "cargo",
+            Self::Zig => "zig",
             Self::Brew => "brew",
             Self::Pacman => "pacman",
             Self::Yay => "yay",
@@ -210,7 +217,8 @@ impl Tool {
             | Self::Poetry
             | Self::Pdm
             | Self::Go
-            | Self::Cargo => true,
+            | Self::Cargo
+            | Self::Zig => true,
             // Homebrew targets macOS and Linux (Linuxbrew).
             Self::Brew => matches!(os, "macos" | "linux"),
             // Arch (pacman/AUR), RPM (dnf/yum/zypper/rpm), and Alpine (apk) system
@@ -251,6 +259,7 @@ impl Tool {
         Self::Pdm,
         Self::Go,
         Self::Cargo,
+        Self::Zig,
         Self::Brew,
         Self::Pacman,
         Self::Yay,
@@ -558,6 +567,12 @@ fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
         // Alpine apk: add installs, upgrade/update refresh, fetch downloads.
         Tool::Apk => matches!(sub, "add" | "upgrade" | "update" | "fetch"),
 
+        // `zig build` fetches every `build.zig.zon` dependency missing from
+        // the cache, and its build steps may download too. Unlike
+        // `cargo build`, dependencies are fetched by the build command
+        // itself, so it is the place to scan them. `--fetch` implies `build`.
+        Tool::Zig => matches!(sub, "build" | "fetch"),
+
         // The Arch and RPM families are flag-driven and are classified by
         // `dispatch` before this function is reached; never routed here.
         Tool::Pacman | Tool::Yay | Tool::Paru | Tool::Makepkg | Tool::Rpm => false,
@@ -710,6 +725,9 @@ impl Tool {
             Self::Pdm => TrustProfile::Pdm,
             Self::Go => TrustProfile::Go,
             Self::Cargo => TrustProfile::Cargo,
+            // Zig itself reads no CA variable (see `proxy::Config::with_zig_clients`),
+            // but `zig build` steps may run any tool, so give them every one.
+            Self::Zig => TrustProfile::Exec,
             Self::Brew => TrustProfile::Brew,
             Self::Pacman
             | Self::Paru
@@ -1435,6 +1453,40 @@ mod tests {
     }
 
     #[test]
+    fn zig_fetches_intercepted_local_commands_passthrough() {
+        let url = "https://example.com/pkg.tar.gz";
+        for args in [
+            vec![os("fetch"), os(url)],
+            vec![os("fetch"), os("--save"), os(url)],
+            vec![os("build")],
+            vec![os("build"), os("test"), os("-Doptimize=ReleaseFast")],
+            vec![os("build"), os("--fetch")],
+            vec![os("build"), os("--fetch=all")],
+        ] {
+            assert_eq!(
+                intercept_args(dispatch(Tool::Zig, args.clone(), false)),
+                args
+            );
+        }
+        for args in [
+            vec![],
+            vec![os("run"), os("fetch.zig")],
+            vec![os("run"), os("build.zig")],
+            vec![os("test"), os("src/main.zig")],
+            vec![os("cc"), os("-o"), os("a.out"), os("main.c")],
+        ] {
+            let _v = passthrough_args(dispatch(Tool::Zig, args, false));
+        }
+    }
+
+    #[test]
+    fn zig_env_trusts_hood_for_any_build_step_tool() {
+        let program = Program::command("/tmp/example").unwrap();
+        let exec = fake_env().vars_for_program(&program);
+        assert_eq!(fake_env().vars_for(Tool::Zig), exec);
+    }
+
+    #[test]
     fn cargo_toolchain_selector_does_not_hide_the_subcommand() {
         // `+nightly` is a rustup toolchain selector, not the subcommand — the
         // install must still be intercepted, and the selector preserved in argv.
@@ -1673,7 +1725,14 @@ mod tests {
         assert!(!Tool::Pkg.plausible_on("linux"));
         assert!(!Tool::Pkg.plausible_on("macos"));
         // Language toolchains and downloaders: everywhere.
-        for t in [Tool::Curl, Tool::Npm, Tool::Cargo, Tool::Go, Tool::Pip] {
+        for t in [
+            Tool::Curl,
+            Tool::Npm,
+            Tool::Cargo,
+            Tool::Go,
+            Tool::Pip,
+            Tool::Zig,
+        ] {
             for os in ["macos", "linux", "windows", "freebsd"] {
                 assert!(t.plausible_on(os), "{t:?} should be plausible on {os}");
             }

@@ -57,6 +57,22 @@ GitHub archives, and unrecognized origins use hashes. This minimizes disclosure;
 PURLs still reveal dependencies and hashes can identify known artifacts. Source IPs
 and an optional Beamline token can link requests.
 
+Verified Beamline assessments are cached locally for **30 days** by default, across
+Hood invocations. Reads do not extend the lifetime. Entries are keyed by the exact
+artifact SHA-256 and isolated by API endpoint, credentials, and analysis policy;
+PURL and hash requests for the same bytes can reuse the same assessment. Cached
+assessments still pass through Hood's current enforcement policy and local Bloom
+checks: a known-bad Bloom verdict blocks by default even when the cache says benign.
+Unknown answers and API failures are not cached. Assessments without an
+engine version expire after at most 60 seconds, matching Beamline's treatment of
+unmeasured evidence.
+
+The cache lives under the platform cache directory at `atomdrift/hood/beamline/v1`.
+It stores assessments and timestamps, without request PURLs or credentials. Expired
+entries are ignored and old files are pruned on the first cache miss in each invocation.
+Unreadable, malformed, or unwritable caches do not prevent normal assessment.
+`HOOD_LOCAL=1` also skips this cache, using only local Bloom checks and local scanning.
+
 Beamline connections bypass proxy environment variables and reject redirects.
 At most four requests run concurrently; excess work goes directly to local analysis.
 Connection establishment has a five-second timeout, headers and stream inactivity
@@ -66,7 +82,8 @@ have a 30-second timeout, and a progressing analysis may run for up to 30 minute
 | --- | --- |
 | `HOOD_BEAMLINE_URL` | API origin; defaults to `https://api.isotope13.ai`. HTTPS required except on loopback. |
 | `HOOD_BEAMLINE_TOKEN` | Optional Beamline bearer token, separate from package-manager credentials. |
-| `HOOD_NO_BEAMLINE=1` | Use local Bloom filters and local analysis only. |
+| `HOOD_BEAMLINE_CACHE_TTL_SECS` | Local assessment lifetime in seconds; defaults to `2592000` (30 days). Set `0` to disable caching. |
+| `HOOD_LOCAL=1` | Use local Bloom filters and local analysis only. |
 | `HOOD_NO_BLOOM=1` | Disable the Bloom gate and its automatic refresh. |
 | `SCAN_BLOOM_DIR` | Use an explicitly managed Scan Bloom bundle; Hood does not update it. |
 | `SCAN_NO_UPDATE=1` | Disable automatic Bloom refresh. |
@@ -101,6 +118,7 @@ grant no skips; assessment continues through the other layers.
 | `pdm` | ✅ | — | — | ✅ |
 | `go` | ✅ | ◐ | — | — |
 | `cargo` | ✅ | — | — | — |
+| `zig` | ✅ | — | — | — |
 | `brew` | ✅ | — | — | — |
 | `pacman` | ✅ | — | — | — |
 | `yay` | ✅ | — | — | — |
@@ -122,7 +140,7 @@ make install
 hood install
 ```
 
-`hood install` adds user-level shims for supported tools already on `PATH`; it requires no system proxy, root CA, or package-manager reconfiguration. Restart the shell and use those tools normally. On macOS, Go needs no manual `SSL_CERT_FILE` setup: Hood preserves `GOPROXY` and `GOSUMDB` verification through a loopback bridge.
+`hood install` adds user-level shims for supported tools already on `PATH`; it requires no system proxy, root CA, or package-manager reconfiguration. Restart the shell and use those tools normally. On macOS, Go needs no manual `SSL_CERT_FILE` setup: Hood preserves `GOPROXY` and `GOSUMDB` verification through a loopback bridge. Zig trusts only fixed system certificate stores, so during `zig build` and `zig fetch` Hood refuses tunnels from Zig's own HTTP client; Zig then sends each dependency request over loopback HTTP and Hood fetches it over verified TLS. Tools run by build steps, such as `curl` or `git`, keep the normal intercepted path and trust Hood's per-run CA.
 
 Set `HOOD_VERBOSE=1` (or use `-v`) for per-artifact results and a run summary:
 

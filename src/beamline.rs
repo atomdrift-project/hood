@@ -4,20 +4,26 @@
 // redundant_pub_crate recommendation conflicts with it in this internal module.
 #![allow(clippy::redundant_pub_crate)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use scan::model::Classification;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::beamline_cache::Cache;
 use tokio::sync::Semaphore;
 use url::Url;
+
+pub(crate) const FOLLOW: &str = "references";
+pub(crate) const BUDGET: &str = "25";
 
 const MAX_LINE: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// A measured assessment. Unrecognized statuses/severities never authorize release.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Assessment {
     status: String,
     severity: String,
@@ -25,9 +31,10 @@ pub(crate) struct Assessment {
     #[serde(default)]
     pub(crate) findings: Vec<Finding>,
     pub(crate) reason: Option<String>,
+    pub(crate) engine_version: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Finding {
     pub(crate) id: String,
     pub(crate) desc: Option<String>,
@@ -52,6 +59,7 @@ pub(crate) struct Client {
     base: Url,
     token: Option<String>,
     slots: Semaphore,
+    cache: Option<Arc<Cache>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -63,7 +71,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     pub(crate) fn from_env() -> Result<Option<Self>> {
-        if std::env::var("HOOD_NO_BEAMLINE").as_deref() == Ok("1") {
+        if std::env::var("HOOD_LOCAL").as_deref() == Ok("1") {
             return Ok(None);
         }
         let base = std::env::var("HOOD_BEAMLINE_URL")
@@ -71,7 +79,15 @@ impl Client {
         let token = std::env::var("HOOD_BEAMLINE_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
-        Self::new(&base, token).map(Some)
+        let mut client = Self::new(&base, token)?;
+        client.cache = match Cache::from_env(client.base.as_str(), client.token.as_deref()) {
+            Ok(cache) => cache.map(Arc::new),
+            Err(error) => {
+                tracing::warn!(%error, "Beamline cache disabled; remote assessment remains enabled");
+                None
+            }
+        };
+        Ok(Some(client))
     }
 
     pub(crate) fn new(base: &str, token: Option<String>) -> Result<Self> {
@@ -102,11 +118,40 @@ impl Client {
             base,
             token,
             slots: Semaphore::new(4),
+            cache: None,
         })
     }
 
     /// No retries: outages, quotas, and incomplete streams go to local analysis.
     pub(crate) async fn assess(&self, purl: Option<&str>, sha256: &str) -> Result<Assessment> {
+        if let Some(cache) = &self.cache {
+            let cache = Arc::clone(cache);
+            let sha = sha256.to_owned();
+            if let Ok(Some(assessment)) = tokio::task::spawn_blocking(move || cache.get(&sha)).await
+            {
+                tracing::debug!("using cached Beamline assessment");
+                return Ok(assessment);
+            }
+        }
+        let result = self.assess_remote(purl, sha256).await?;
+        if result.classification(sha256).is_some()
+            && let Some(cache) = &self.cache
+        {
+            let cache = Arc::clone(cache);
+            let sha = sha256.to_owned();
+            let stored = result.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || cache.put(&sha, stored))
+                .await
+                .context("Beamline cache write task")
+                .and_then(std::convert::identity)
+            {
+                tracing::debug!(%error, "could not cache Beamline assessment");
+            }
+        }
+        Ok(result)
+    }
+
+    async fn assess_remote(&self, purl: Option<&str>, sha256: &str) -> Result<Assessment> {
         // Don't queue installs behind a saturated remote service; use the local engine.
         let _slot = self
             .slots
@@ -137,8 +182,8 @@ impl Client {
         url.set_path(if analyze { "/v1/analyze" } else { "/v1/lookup" });
         url.query_pairs_mut()
             .append_pair(kind, value)
-            .append_pair("follow", "references")
-            .append_pair("false_positive_budget", "25");
+            .append_pair("follow", FOLLOW)
+            .append_pair("false_positive_budget", BUDGET);
         let request = if analyze {
             self.http.post(url)
         } else {
@@ -252,7 +297,9 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use super::{Cache, Client};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -319,13 +366,25 @@ pub(crate) mod test_support {
         serde_json::json!({"status":"analyzed", "severity":severity, "sha256":sha, "findings":[]})
             .to_string()
     }
+
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn cached_client(endpoint: &str, root: &std::path::Path) -> Client {
+        let mut client = Client::new(endpoint, None).unwrap();
+        client.cache = Some(Arc::new(Cache::new(
+            root.into(),
+            Duration::from_hours(30 * 24),
+            client.base.as_str(),
+            None,
+        )));
+        client
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use test_support::{assessment, server};
+    use test_support::{assessment, cached_client, server};
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
@@ -463,6 +522,57 @@ mod tests {
                 .contains("concurrency limit")
         );
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn disk_cache_reuses_purl_assessment_by_hash_across_clients_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = server(vec![(200, vec![assessment(SHA, "hostile")])]).await;
+        let client = cached_client(&mock.url, tmp.path());
+        let first = client.assess(Some("pkg:npm/demo@1"), SHA).await.unwrap();
+        assert_eq!(first.classification(SHA), Some(Classification::Hostile));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        let endpoint = mock.url.clone();
+        drop(client);
+        drop(mock);
+        // The server is gone and all network slots are occupied: this must be a disk hit.
+        let client = cached_client(&endpoint, tmp.path());
+        let permits = client.slots.acquire_many(4).await.unwrap();
+        let cached = client.assess(None, SHA).await.unwrap();
+        drop(permits);
+        assert_eq!(cached.classification(SHA), Some(Classification::Hostile));
+    }
+
+    #[tokio::test]
+    async fn unknown_and_failed_queries_do_not_populate_cache() {
+        for (status, body) in [
+            (429, "quota"),
+            (503, "outage"),
+            (200, r#"{"status":"unanalyzed","severity":"unknown"}"#),
+            (200, r#"{"status":"unavailable","severity":"unknown"}"#),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mock = server(vec![
+                (status, vec![body.into()]),
+                (200, vec![assessment(SHA, "benign")]),
+            ])
+            .await;
+            let client = cached_client(&mock.url, tmp.path());
+            drop(client.assess(None, SHA).await);
+            let second = client.assess(None, SHA).await.unwrap();
+            assert_eq!(second.classification(SHA), Some(Classification::Benign));
+            assert_eq!(mock.requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn unwritable_cache_does_not_discard_remote_verdict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // A file cannot be used as a cache directory, on every supported platform.
+        let mock = server(vec![(200, vec![assessment(SHA, "benign")])]).await;
+        let client = cached_client(&mock.url, tmp.path());
+        let result = client.assess(None, SHA).await.unwrap();
+        assert_eq!(result.classification(SHA), Some(Classification::Benign));
     }
 
     #[test]

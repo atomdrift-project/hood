@@ -14,6 +14,12 @@
 //!   side — feeding requests through the same forward-and-scan path as the
 //!   plaintext branch.
 //!
+//! - Absolute-form `https://` requests, accepted only when
+//!   [`Config::with_zig_clients`] is enabled. Zig's HTTP client cannot trust
+//!   hood's CA, so its CONNECT is refused with 405 and it falls back to
+//!   absolute form; hood performs the verified upstream TLS handshake itself.
+//!   The plaintext leg never leaves loopback.
+//!
 //! Hop-by-hop headers are stripped on both legs and `Accept-Encoding` is forced
 //! to `identity` on outbound so we never have to decompress for scanning.
 //!
@@ -39,7 +45,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName,
-    HeaderValue, LOCATION,
+    HeaderValue, LOCATION, USER_AGENT,
 };
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -154,6 +160,8 @@ pub struct Config {
     /// Additional roots used to verify upstream TLS. Intended for private PKI
     /// and deterministic tests; native platform roots are always loaded too.
     extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// Refuse CONNECT from Zig's HTTP client; accept absolute-form `https://`.
+    zig_clients: bool,
 }
 
 impl Default for Config {
@@ -164,6 +172,7 @@ impl Default for Config {
             // 127.0.0.1:0 → kernel-assigned ephemeral port.
             bind: ([127, 0, 0, 1], 0).into(),
             extra_upstream_roots: Vec::new(),
+            zig_clients: false,
         }
     }
 }
@@ -223,6 +232,19 @@ impl Config {
         roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     ) -> Self {
         self.extra_upstream_roots = roots;
+        self
+    }
+
+    /// Serve Zig's `std.http` client, which trusts only fixed system stores.
+    ///
+    /// CONNECT requests with Zig's default user agent are refused, so Zig
+    /// falls back to absolute-form requests; those `https://` requests are
+    /// accepted and fetched over verified upstream TLS. Every other client
+    /// keeps the CONNECT/MITM path. A client misreporting its user agent only
+    /// chooses which scanned path it takes, and fails closed on the wrong one.
+    #[must_use]
+    pub const fn with_zig_clients(mut self, enabled: bool) -> Self {
+        self.zig_clients = enabled;
         self
     }
 }
@@ -438,6 +460,15 @@ impl Proxy {
     ) -> Response<ProxyBody> {
         // CONNECT only ever arrives on the plaintext side.
         if req.method() == Method::CONNECT && mitm_authority.is_none() {
+            if self.inner.config.zig_clients && is_zig_client(req.headers()) {
+                // A 4xx, not 5xx: Zig treats a server error as possibly
+                // transient and keeps trying to tunnel.
+                tracing::debug!(authority = ?req.uri().authority(), "refuse Zig CONNECT; expecting absolute-form https");
+                return error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "send absolute-form requests instead of CONNECT",
+                );
+            }
             return self.handle_connect(req);
         }
 
@@ -531,8 +562,11 @@ impl Proxy {
         mitm_authority: Option<Arc<str>>,
         go_bridge_request: bool,
     ) -> Result<Response<ProxyBody>> {
-        let (mut target_url, host_header) =
-            resolve_target(&req, mitm_authority.as_deref(), go_bridge_request)?;
+        let (mut target_url, host_header) = resolve_target(
+            &req,
+            mitm_authority.as_deref(),
+            go_bridge_request || self.inner.config.zig_clients,
+        )?;
         let redirect_base = target_url.clone();
         let allow_purl = permits_public_coordinate(req.method(), req.headers(), &target_url);
         let url_authorization = take_url_authorization(&mut target_url)?;
@@ -709,6 +743,15 @@ impl Proxy {
             }
         }
     }
+}
+
+/// True for Zig's `std.http` client. Its CONNECT never carries caller headers,
+/// so it always sends the default `zig/<version> (std.http)` user agent.
+fn is_zig_client(headers: &HeaderMap) -> bool {
+    headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|agent| agent.starts_with("zig/"))
 }
 
 /// Build the upstream URL and Host header value for a request.

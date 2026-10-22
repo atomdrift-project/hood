@@ -21,7 +21,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair, SanType};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer};
 
 use hood::go_bridge::GoBridge;
@@ -268,6 +269,107 @@ async fn go_loopback_bridge_verifies_https_and_contains_redirects() -> Result<()
     assert_eq!(origin_marker.unwrap(), "yes");
     assert_eq!(body.as_ref(), PAYLOAD);
 
+    handle.stop().await;
+    Ok(())
+}
+
+/// Send one raw request to the proxy and read until it closes the connection.
+/// Raw bytes keep the request target exactly as written: HTTP clients such as
+/// reqwest always tunnel `https://` URLs rather than sending them absolute.
+async fn raw_request(proxy: SocketAddr, head: &str) -> Result<String> {
+    let mut stream = TcpStream::connect(proxy).await?;
+    stream.write_all(head.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+fn absolute_get(authority: &str) -> String {
+    format!(
+        "GET https://{authority}/hello HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zig_mode_refuses_zig_tunnels_and_verifies_upstream() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let (origin_addr, origin_ca_pem) = start_https_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
+    let cfg = Config::default()
+        .with_extra_upstream_roots(roots_from_pem(&origin_ca_pem))
+        .with_zig_clients(true);
+    let handle = Proxy::new(scanner, cfg)?.spawn().await?;
+    let authority = format!("localhost:{}", origin_addr.port());
+
+    // The request Zig's std.http sends. A refused tunnel must be a 4xx, or
+    // Zig keeps tunneling.
+    let refused = raw_request(
+        handle.addr,
+        &format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: zig/0.17.0 (std.http)\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await?;
+    assert!(refused.starts_with("HTTP/1.1 405"), "{refused}");
+
+    // The client trusts no hood CA; hood verifies the origin itself.
+    let response = raw_request(handle.addr, &absolute_get(&authority)).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("x-origin-marker: yes"), "{response}");
+    assert!(
+        response.contains(std::str::from_utf8(PAYLOAD)?),
+        "{response}"
+    );
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zig_mode_keeps_mitm_for_other_clients() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // `zig build` steps may run curl, git, or other CA-trusting clients.
+    // Their tunnels must still be intercepted and scanned, not refused.
+    let (origin_addr, origin_ca_pem) = start_https_origin().await?;
+    let cfg = Config::default()
+        .with_extra_upstream_roots(roots_from_pem(&origin_ca_pem))
+        .with_zig_clients(true);
+    let proxy = Proxy::new(Arc::new(BlockAll), cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let url = format!("https://localhost:{}/hello", origin_addr.port());
+    let resp = client.get(&url).send().await?;
+    assert_eq!(resp.status().as_u16(), 451, "tunneled GET was not scanned");
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absolute_https_requires_opt_in_and_a_trusted_upstream() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let (origin_addr, origin_ca_pem) = start_https_origin().await?;
+    let authority = format!("localhost:{}", origin_addr.port());
+
+    // Default mode keeps the MITM tunnel and rejects absolute-form HTTPS.
+    let cfg = Config::default().with_extra_upstream_roots(roots_from_pem(&origin_ca_pem));
+    let handle = Proxy::new(Arc::new(AllowAll), cfg)?.spawn().await?;
+    let response = raw_request(handle.addr, &absolute_get(&authority)).await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    handle.stop().await;
+
+    // Opting in never relaxes upstream verification: an origin signed by an
+    // unknown CA is refused rather than fetched.
+    let cfg = Config::default().with_zig_clients(true);
+    let handle = Proxy::new(Arc::new(AllowAll), cfg)?.spawn().await?;
+    let response = raw_request(handle.addr, &absolute_get(&authority)).await?;
+    assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    assert!(!response.contains("x-origin-marker"), "{response}");
     handle.stop().await;
     Ok(())
 }

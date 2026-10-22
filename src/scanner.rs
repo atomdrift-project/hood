@@ -361,6 +361,7 @@ impl AtomScanner {
                     })
             })
             .await;
+        // Bloom revocations must take precedence over even a fresh benign cache entry.
         if let Some(lookup) = bloom
             && let Some(verdict) = bloom_gate_sha(
                 lookup,
@@ -613,7 +614,7 @@ fn refresh_bloom() {
 }
 
 /// Lower-hex encode a 32-byte digest without pulling in a hex crate.
-fn hex32(digest: &[u8; 32]) -> String {
+pub(crate) fn hex32(digest: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
     for &b in digest {
@@ -992,6 +993,81 @@ mod tests {
         assert_eq!(verdict, Verdict::Allow);
         assert!(scanner.analyzer.get().is_none());
         assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bad_bloom_overrides_cached_good_assessment() {
+        use beamline::test_support::{assessment, cached_client, server};
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let body = b"previously benign package".to_vec();
+        let sha = sha_of(&body);
+        let sha_hex = hex32(&sha);
+        let url = "https://registry.npmjs.org/demo/-/demo-1.tgz";
+        let purl = "pkg:npm/demo@1";
+        let mock = server(vec![(200, vec![assessment(&sha_hex, "benign")])]).await;
+        let endpoint = mock.url.clone();
+        let client = cached_client(&endpoint, cache_dir.path());
+        assert_eq!(
+            client
+                .assess(Some(purl), &sha_hex)
+                .await
+                .unwrap()
+                .classification(&sha_hex),
+            Some(Classification::Benign)
+        );
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        drop(client);
+        drop(mock);
+
+        // A new client with no server can only obtain this benign verdict from disk.
+        let client = cached_client(&endpoint, cache_dir.path());
+        assert_eq!(
+            client
+                .assess(None, &sha_hex)
+                .await
+                .unwrap()
+                .classification(&sha_hex),
+            Some(Classification::Benign)
+        );
+
+        for bad_record in [rec(None, Some(sha)), rec(Some(purl), None)] {
+            let bundle = tempfile::tempdir().unwrap();
+            publish_filters(bundle.path(), &[(Tier::Bad, bad_record)]);
+            let scanner = test_scanner(
+                Some(cached_client(&endpoint, cache_dir.path())),
+                Some(Lookup::load_from(bundle.path())),
+                bundle.path().join("missing-model"),
+                ScanPolicy::default(),
+            );
+            let expected = Verdict::Block(BlockReason::KnownBad(sha_hex.clone()));
+            assert_eq!(
+                scanner
+                    .scan(ScanRequest {
+                        url: url.into(),
+                        allow_purl: true,
+                        body: body.clone(),
+                    })
+                    .await
+                    .unwrap(),
+                expected
+            );
+            let path = bundle.path().join("artifact.tgz");
+            std::fs::write(&path, &body).unwrap();
+            assert_eq!(
+                scanner
+                    .scan_disk(DiskScanRequest {
+                        url: url.into(),
+                        allow_purl: true,
+                        path,
+                        sha256: sha,
+                    })
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(scanner.analyzer.get().is_none());
+        }
     }
 
     #[tokio::test]

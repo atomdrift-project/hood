@@ -12,6 +12,7 @@
 //! lives in [`tools`].
 
 pub(crate) mod beamline;
+pub(crate) mod beamline_cache;
 pub mod ca;
 pub mod go_bridge;
 pub mod install;

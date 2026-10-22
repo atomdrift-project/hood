@@ -68,9 +68,13 @@ jobs:
           npm install --global pnpm@11.21.0 @microsoft/rush@5.178.1 bun@1.3.14
           pipx install pdm==2.26.9
           pipx install uv==0.12.3
+          curl -fsSLo "$RUNNER_TEMP/zig.tar.xz" https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
       - name: Verify tool inventory
         run: |
-          for tool in go npx pnpx rush rushx bunx pip3 uvx pdm; do
+          for tool in go npx pnpx rush rushx bunx pip3 uvx pdm zig; do
             command -v "$tool"
           done
       - name: Run hermetic command integrations

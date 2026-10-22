@@ -140,6 +140,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
+    /// Run `zig`. `build` and `fetch` are intercepted; `run`/`test`/`cc` pass through.
+    Zig {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Run `brew`. `install`/`upgrade`/`reinstall`/`fetch`/`tap`/`bundle` are intercepted.
     Brew {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -309,7 +314,17 @@ async fn run(cli: Cli) -> Result<i32> {
         None
     };
 
-    let setup_result = setup_proxy(model_dir, policy, invocation.clone(), go_bridge, verbose).await;
+    // Zig cannot trust hood's CA on any platform; see `Tool::Zig`.
+    let zig_clients = program.tool() == Some(Tool::Zig);
+    let setup_result = setup_proxy(
+        model_dir,
+        policy,
+        invocation.clone(),
+        go_bridge,
+        zig_clients,
+        verbose,
+    )
+    .await;
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
         Err(e) if matches!(policy, ScanPolicy::Bypass) => {
@@ -341,11 +356,14 @@ async fn setup_proxy(
     policy: ScanPolicy,
     invocation: String,
     go_bridge: Option<GoBridge>,
+    zig_clients: bool,
     show_passes: bool,
 ) -> Result<ProxySetup> {
     let stats = show_passes.then(|| Arc::new(ScanStats::default()));
     let scanner = build_scanner(model_dir, policy, invocation, stats.clone())?;
-    let config = Config::from_env().context("read proxy configuration")?;
+    let config = Config::from_env()
+        .context("read proxy configuration")?
+        .with_zig_clients(zig_clients);
     let proxy = Proxy::new(scanner, config).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let go_bridge_token = proxy.go_bridge_token().to_owned();
@@ -553,6 +571,7 @@ impl TryFrom<Command> for Action {
             Command::Pdm { args } => (Tool::Pdm, args),
             Command::Go { args } => (Tool::Go, args),
             Command::Cargo { args } => (Tool::Cargo, args),
+            Command::Zig { args } => (Tool::Zig, args),
             Command::Brew { args } => (Tool::Brew, args),
             Command::Pacman { args } => (Tool::Pacman, args),
             Command::Yay { args } => (Tool::Yay, args),

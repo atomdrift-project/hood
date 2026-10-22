@@ -585,6 +585,7 @@ mod tests {
         assert_eq!(tool_from_argv0("uvx"), Some(Tool::Uvx));
         assert_eq!(tool_from_argv0("pdm"), Some(Tool::Pdm));
         assert_eq!(tool_from_argv0("/usr/local/bin/cargo"), Some(Tool::Cargo));
+        assert_eq!(tool_from_argv0("zig"), Some(Tool::Zig));
         assert_eq!(tool_from_argv0("./brew"), Some(Tool::Brew));
         assert_eq!(tool_from_argv0("npm.exe"), Some(Tool::Npm));
     }
@@ -720,6 +721,7 @@ mod tests {
         let names = shim_names();
         assert!(names.contains(&"npm"));
         assert!(names.contains(&"cargo"));
+        assert!(names.contains(&"zig"));
         assert!(names.contains(&"brew"));
         assert!(!names.contains(&"exec"));
         assert!(!names.contains(&"hood"));

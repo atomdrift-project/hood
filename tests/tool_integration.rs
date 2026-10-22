@@ -40,6 +40,13 @@ const NPM_PACKAGE: &str = "hood-integration-cli";
 const PYPI_PACKAGE: &str = "hood-integration";
 const PYPI_VERSION: &str = "1.0.0";
 const TOOL_MARKER: &str = "hood-tool-integration-ok";
+const ZIG_PACKAGE: &str = "hood_integration";
+const ZIG_VERSION: &str = "1.0.0";
+/// Zig fingerprints embed a CRC-32 of the package name in their upper half,
+/// so each is valid only for the name it was minted with.
+const ZIG_PACKAGE_FINGERPRINT: &str = "0x7cdd4dfe1f9b6709";
+const ZIG_APP: &str = "hood_zig_app";
+const ZIG_APP_FINGERPRINT: &str = "0xd2721cdb1f9b6709";
 
 type Route = (String, Vec<u8>);
 type Routes = Arc<Mutex<HashMap<String, Route>>>;
@@ -241,22 +248,22 @@ fn tool_binary(name: &str) -> Result<Option<PathBuf>> {
     if !tool_is_selected(name) {
         return Ok(None);
     }
-    let Some(path) = std::env::var_os("PATH") else {
-        return missing_tool(name);
-    };
-    for dir in std::env::split_paths(&path) {
-        for candidate in [dir.join(name), dir.join(format!("{name}.exe"))] {
+    path_binary(name).map_or_else(|| missing_tool(name), |binary| Ok(Some(binary)))
+}
+
+/// Find `name` on PATH, skipping hood shims.
+fn path_binary(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| [dir.join(name), dir.join(format!("{name}.exe"))])
+        .find(|candidate| {
             let is_hood_shim = candidate
                 .canonicalize()
                 .ok()
                 .and_then(|path| path.file_name().map(std::ffi::OsStr::to_owned))
                 .is_some_and(|file| file == "hood" || file == "hood.exe");
-            if candidate.is_file() && !is_hood_shim {
-                return Ok(Some(candidate));
-            }
-        }
-    }
-    missing_tool(name)
+            candidate.is_file() && !is_hood_shim
+        })
 }
 
 fn missing_tool(name: &str) -> Result<Option<PathBuf>> {
@@ -766,5 +773,269 @@ async fn pdm_locks_dependency_through_hood() -> Result<()> {
     assert_forwarded("pdm", &output, &origin);
     assert!(project.join("pdm.lock").is_file());
     assert_requested(&origin, ".whl");
+    Ok(())
+}
+
+fn zig_package_tarball(source: &str) -> Result<Vec<u8>> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let manifest = format!(
+        ".{{\n    .name = .{ZIG_PACKAGE},\n    .version = \"{ZIG_VERSION}\",\n    .fingerprint = {ZIG_PACKAGE_FINGERPRINT},\n    .paths = .{{\"\"}},\n}}\n"
+    );
+    append_tar_file(
+        &mut archive,
+        &format!("{ZIG_PACKAGE}/build.zig.zon"),
+        0o644,
+        manifest.as_bytes(),
+    )?;
+    append_tar_file(
+        &mut archive,
+        &format!("{ZIG_PACKAGE}/root.zig"),
+        0o644,
+        source.as_bytes(),
+    )?;
+    archive.finish()?;
+    Ok(archive.into_inner()?.finish()?)
+}
+
+/// Serve the fixture package and return its URL. Zig, unlike Go, proxies
+/// loopback hosts, so a plain `127.0.0.1` origin still routes through hood.
+///
+/// The package content is unique per run: Zig skips the network for any hash
+/// already in its global cache, which [`zig_global_cache`] keeps across runs.
+async fn zig_origin() -> Result<(TestOrigin, String)> {
+    let origin = TestOrigin::spawn(HashMap::new()).await?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let source = format!(
+        "pub const through_hood = true;\n// fixture {nonce}-{}\n",
+        origin.addr.port()
+    );
+    let path = format!("/{ZIG_PACKAGE}-{ZIG_VERSION}.tar.gz");
+    origin.add_route(
+        path.clone(),
+        "application/gzip",
+        zig_package_tarball(&source)?,
+    );
+    let url = format!("{}{path}", origin.url());
+    Ok((origin, url))
+}
+
+/// Return a warm Zig global cache shared across runs.
+///
+/// On first use Zig compiles helper programs into its global cache, which
+/// takes longer than the harness timeout. Warm a persistent cache under
+/// Cargo's integration-test temp dir by fetching a local directory, outside
+/// hood and without network access. Zig locks its cache entries, so parallel
+/// tests may share it.
+async fn zig_global_cache(zig: &Path, harness: &ToolHarness) -> Result<PathBuf> {
+    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("zig-global-cache");
+    let warmup = harness.dir("zig-warmup");
+    fs::create_dir_all(&warmup)?;
+    fs::write(warmup.join("warmup.zig"), "")?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(600),
+        Command::new(zig)
+            .arg("fetch")
+            .arg(&warmup)
+            .env("ZIG_GLOBAL_CACHE_DIR", &cache)
+            .env("ZIG_LOCAL_CACHE_DIR", harness.dir("zig-local-cache"))
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("zig cache warmup timed out")??;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "zig cache warmup failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(cache)
+}
+
+async fn zig_envs(zig: &Path, harness: &ToolHarness) -> Result<[(&'static str, OsString); 2]> {
+    Ok([
+        (
+            "ZIG_GLOBAL_CACHE_DIR",
+            zig_global_cache(zig, harness).await?.into_os_string(),
+        ),
+        (
+            "ZIG_LOCAL_CACHE_DIR",
+            harness.dir("zig-local-cache").into_os_string(),
+        ),
+    ])
+}
+
+/// Write a Zig project and return its `build.zig.zon` path.
+fn write_zig_project(project: &Path, build_zig: &str, dependencies: &str) -> Result<PathBuf> {
+    fs::create_dir_all(project)?;
+    fs::write(project.join("build.zig"), build_zig)?;
+    let manifest = project.join("build.zig.zon");
+    fs::write(
+        &manifest,
+        format!(
+            ".{{\n    .name = .{ZIG_APP},\n    .version = \"0.0.0\",\n    .fingerprint = {ZIG_APP_FINGERPRINT},\n    .dependencies = .{{{dependencies}}},\n    .paths = .{{\"\"}},\n}}\n"
+        ),
+    )?;
+    Ok(manifest)
+}
+
+/// Zig never trusts hood's CA, so hood must refuse its CONNECT tunnel and
+/// receive the absolute-form fallback. A MITM attempt shows up as a failed
+/// TLS accept followed by a truncated HTTP response in Zig.
+fn assert_zig_absolute_form(output: &Output) {
+    assert!(
+        output.stderr.contains("refuse Zig CONNECT"),
+        "hood did not refuse Zig's tunnel:\n{}",
+        output.stderr,
+    );
+    assert!(
+        !output.stderr.contains("tls accept failed"),
+        "hood attempted TLS interception of Zig:\n{}",
+        output.stderr,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zig_fetch_downloads_package_through_hood() -> Result<()> {
+    let Some(binary) = tool_binary("zig")? else {
+        return Ok(());
+    };
+    let harness = ToolHarness::new(&binary)?;
+    let (origin, url) = zig_origin().await?;
+    let envs = zig_envs(&binary, &harness).await?;
+    let output = harness.hood("zig", &["fetch", &url], &envs).await?;
+    assert_success("zig", &output);
+    assert_zig_absolute_form(&output);
+    assert_forwarded("zig", &output, &origin);
+    assert_requested(&origin, &format!("{ZIG_PACKAGE}-{ZIG_VERSION}.tar.gz"));
+
+    let hash = output.stdout.trim();
+    assert!(
+        hash.starts_with(&format!("{ZIG_PACKAGE}-{ZIG_VERSION}-")),
+        "zig fetch did not print the fixture package hash:\n{}",
+        output.stdout,
+    );
+    // Zig stores a fetched package as `p/<hash>` (extracted, or compressed
+    // as `p/<hash>.tar.gz` since 0.16).
+    let cached = fs::read_dir(Path::new(&envs[0].1).join("p"))?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(hash));
+    assert!(cached, "package {hash} missing from Zig's global cache");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zig_fetch_save_records_dependency_through_hood() -> Result<()> {
+    let Some(binary) = tool_binary("zig")? else {
+        return Ok(());
+    };
+    let harness = ToolHarness::new(&binary)?;
+    let (origin, url) = zig_origin().await?;
+    let envs = zig_envs(&binary, &harness).await?;
+    let project = harness.dir("zig-project");
+    let manifest = write_zig_project(
+        &project,
+        "pub fn build(_: *@import(\"std\").Build) void {}\n",
+        "",
+    )?;
+    let output = harness
+        .hood_in(&project, "zig", &["fetch", "--save", &url], &envs)
+        .await?;
+    assert_success("zig", &output);
+    assert_zig_absolute_form(&output);
+    assert_forwarded("zig", &output, &origin);
+
+    let saved = fs::read_to_string(manifest)?;
+    for needle in [
+        format!(".{ZIG_PACKAGE} = "),
+        format!(".url = \"{url}\""),
+        format!(".hash = \"{ZIG_PACKAGE}-{ZIG_VERSION}-"),
+    ] {
+        assert!(
+            saved.contains(&needle),
+            "build.zig.zon lacks {needle}:\n{saved}"
+        );
+    }
+    Ok(())
+}
+
+/// `zig build` fetches missing `build.zig.zon` dependencies through hood,
+/// while its build steps' own downloads keep working through the proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zig_build_fetches_dependencies_and_runs_build_step_downloads() -> Result<()> {
+    let Some(binary) = tool_binary("zig")? else {
+        return Ok(());
+    };
+    let Some(curl) = path_binary("curl") else {
+        missing_tool("curl")?;
+        return Ok(());
+    };
+    let harness = ToolHarness::new(&binary)?;
+    let (origin, url) = zig_origin().await?;
+    let envs = zig_envs(&binary, &harness).await?;
+    let cache = PathBuf::from(&envs[0].1);
+
+    // Learn the dependency hash without hood, then evict the package so the
+    // build must download it again.
+    let fetched = Command::new(&binary)
+        .args(["fetch", &url])
+        .envs(envs.iter().map(|(key, value)| (key, value)))
+        .env_remove("http_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("all_proxy")
+        .env_remove("ALL_PROXY")
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    assert!(
+        fetched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+    let hash = String::from_utf8(fetched.stdout)?.trim().to_owned();
+    for entry in fs::read_dir(cache.join("p"))?.filter_map(Result::ok) {
+        if entry.file_name().to_string_lossy().starts_with(&hash) {
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+
+    let probe_path = "/build-step-probe.txt";
+    origin.add_route(probe_path, "text/plain", TOOL_MARKER.as_bytes().to_vec());
+    let probe_url = format!("{}{probe_path}", origin.url());
+    let probe_out = harness.dir("build-step-probe.txt");
+    let build_zig = format!(
+        "const std = @import(\"std\");\npub fn build(b: *std.Build) void {{\n    _ = b.dependency(\"{ZIG_PACKAGE}\", .{{}});\n    const probe = b.addSystemCommand(&.{{ {:?}, \"-fsS\", \"-o\", {:?}, {probe_url:?} }});\n    b.getInstallStep().dependOn(&probe.step);\n}}\n",
+        curl.to_string_lossy(),
+        probe_out.to_string_lossy(),
+    );
+    let project = harness.dir("zig-build-project");
+    write_zig_project(
+        &project,
+        &build_zig,
+        &format!(" .{ZIG_PACKAGE} = .{{ .url = {url:?}, .hash = {hash:?} }} "),
+    )?;
+
+    let output = harness.hood_in(&project, "zig", &["build"], &envs).await?;
+    assert_success("zig", &output);
+    assert_zig_absolute_form(&output);
+    assert!(
+        output.stderr.contains(&url),
+        "dependency was not fetched through hood:\n{}",
+        output.stderr,
+    );
+    assert!(
+        output.stderr.contains(&probe_url),
+        "build-step download bypassed hood:\n{}",
+        output.stderr,
+    );
+    assert_eq!(fs::read_to_string(probe_out)?, TOOL_MARKER);
     Ok(())
 }

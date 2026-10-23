@@ -364,8 +364,9 @@ impl TestOrigin {
     /// Go never proxies `localhost` or a loopback IP, regardless of `NO_PROXY`,
     /// so a URL of `http://127.0.0.1:…` would reach the fixture directly and
     /// hood would see nothing. The unspecified address is not loopback to that
-    /// rule, and a connection to `0.0.0.0:port` lands on the local listener on
-    /// every Unix, so hood forwards to the same fixture.
+    /// rule, and on Linux and macOS a connection to `0.0.0.0:port` lands on
+    /// the local listener, so hood forwards to the same fixture. FreeBSD
+    /// refuses it ("Network is unreachable").
     fn go_url(&self) -> String {
         format!("http://0.0.0.0:{}", self.addr.port())
     }
@@ -978,6 +979,9 @@ fn tar_header(path: &str, mode: u32, len: usize) -> Result<tar::Header> {
     let mut header = tar::Header::new_gnu();
     header.set_path(path)?;
     header.set_size(u64::try_from(len)?);
+    // A new header's type flag is NUL, the pre-POSIX spelling of a regular
+    // file; apk's tar reader skips such entries, so `.PKGINFO` went unseen.
+    header.set_entry_type(tar::EntryType::Regular);
     header.set_mode(mode);
     header.set_mtime(0);
     header.set_cksum();

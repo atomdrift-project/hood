@@ -175,9 +175,12 @@ async fn yum_downloads_package_through_hood() -> Result<()> {
     dnf_downloads("yum").await
 }
 
-/// `zypper download` with only the fixture repository configured.
+/// `zypper install` into a throwaway root, with only the fixture repository
+/// configured. `zypper download` (and `install --download-only`) exit 0 even
+/// when a download is refused; only a real install reports it (exit 8).
+/// `keeppackages` leaves the fetched package in the run's cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zypper_downloads_package_through_hood() -> Result<()> {
+async fn zypper_installs_package_through_hood() -> Result<()> {
     let Some(binary) = tool_binary("zypper")? else {
         return Ok(());
     };
@@ -199,16 +202,18 @@ async fn zypper_downloads_package_through_hood() -> Result<()> {
                 fs::write(
                     repos.join("hoodfix.repo"),
                     format!(
-                        "[hoodfix]\nname=hoodfix\nbaseurl={}\nenabled=1\nautorefresh=1\ngpgcheck=0\ntype=rpm-md\n",
+                        "[hoodfix]\nname=hoodfix\nbaseurl={}\nenabled=1\nautorefresh=1\ngpgcheck=0\nkeeppackages=1\ntype=rpm-md\n",
                         repo.url
                     ),
                 )?;
                 Ok(Invocation::new(dir)
-                    .args(["--non-interactive", "--no-gpg-checks", "--reposd-dir"])
+                    .args(["--non-interactive", "--no-gpg-checks", "--root"])
+                    .arg(dir.join("root"))
+                    .arg("--reposd-dir")
                     .arg(repos)
                     .arg("--cache-dir")
                     .arg(dir.join("cache"))
-                    .args(["download", "hoodfix"]))
+                    .args(["install", "--no-recommends", "hoodfix"]))
             },
             repo.payload(),
             |run| find_file(&run.dir.join("cache"), &|name| name == RPM).is_some(),

@@ -52,9 +52,6 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
     };
     let origin = TestOrigin::spawn().await?;
     origin.add_route("/stand-in", "text/plain", TOOL_MARKER.as_bytes().to_vec());
-    // Hood exempts loopback names from the proxy for Go's bridge on macOS;
-    // the unspecified address is proxied for every tool.
-    let url = format!("{}/stand-in", origin.go_url());
     let bin = tempfile::tempdir()?;
     // `go env` answers hood's macOS Go bridge query before the child runs.
     let script = format!(
@@ -71,23 +68,31 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
         }
     }
     let harness = ToolHarness::new(&bin.path().join("curl"))?;
-    let invocation = |name: &str, args: &[&str], mode: &str| -> Result<Invocation> {
+    let invocation = |name: &str, args: &[&str], mode: &str, url: &str| -> Result<Invocation> {
         let dir = harness.dir(&format!("stand-in-{name}-{mode}"));
         fs::create_dir_all(&dir)?;
         Ok(Invocation::new(&dir)
             .args(args)
             .env("HOOD_STAND_IN_ARGV", dir.join("argv"))
             .env("HOOD_STAND_IN_OUT", dir.join("out"))
-            .env("HOOD_STAND_IN_URL", &url))
+            .env("HOOD_STAND_IN_URL", url))
     };
     for tool in Tool::SHIMMABLE {
         let name = tool.name();
         let args = fetching_args(*tool);
+        // On macOS hood exempts loopback from the proxy for Go's bridge, so
+        // the Go stand-in fetches the unspecified address instead.
+        let origin_url = if *tool == Tool::Go && cfg!(target_os = "macos") {
+            origin.go_url()
+        } else {
+            origin.url()
+        };
+        let url = format!("{origin_url}/stand-in");
 
         harness
             .beamline
             .set(Beamline::Assesses, Some(sha256_hex(TOOL_MARKER.as_bytes())));
-        let blocked = invocation(name, args, "known-bad")?;
+        let blocked = invocation(name, args, "known-bad", &url)?;
         let (output, _) = harness
             .hood(name, &blocked, &harness.no_models, None)
             .await?;
@@ -98,7 +103,7 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
         );
 
         harness.beamline.set(Beamline::Assesses, None);
-        let allowed = invocation(name, args, "known-good")?;
+        let allowed = invocation(name, args, "known-good", &url)?;
         let dir = allowed.cwd.clone();
         let (output, _) = harness
             .hood(name, &allowed, &harness.no_models, None)

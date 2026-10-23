@@ -14,17 +14,20 @@ as_builder() {
 		YRX_REGENERATE_MODULES_RS=false "$@"
 }
 
+# paru builds with cargo, which the rustup package provides.
+as_builder rustup toolchain install stable --profile minimal
+as_builder rustup default stable
+
 # AUR helpers from pinned AUR commits; makepkg verifies the release archive
-# each PKGBUILD names against its recorded checksum.
+# each PKGBUILD names against its recorded checksum. paru builds from source:
+# paru-bin 2.1.0, the latest, links libalpm.so.15, older than this image's.
 build_aur() {
 	as_builder sh -euc "cd /tmp && git clone -q https://aur.archlinux.org/$1.git \
 		&& cd $1 && git checkout -q $2 && makepkg --syncdeps --install --noconfirm"
 }
 build_aur yay-bin 13e0a4754d106a9252b7479bf1b370fbe454fc48
-build_aur paru-bin 92a55429afbec4fceeb2cef843245105307444d2
-
-as_builder rustup toolchain install stable --profile minimal
-as_builder rustup default stable
+# "Add support for libalpm16"
+build_aur paru 329be2113c590046cb29858c23d9b96a8d7bd586
 
 root_tools=""
 user_tools=""

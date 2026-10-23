@@ -616,9 +616,12 @@ jobs:
   # wasmtime/cranelift — the same JIT that forced the allow-jit entitlement on
   # macOS. Rules are only compiled on an actual scan, so `--version` proves
   # nothing here; the unit tests below are what would surface it.
+  #
+  # Dispatch-only (same opt-in pattern as dragonfly/haiku) until OpenBSD's
+  # packaged rust reaches this crate's MSRV.
   openbsd:
     name: x86_64-unknown-openbsd
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-openbsd') }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-unknown-openbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -689,9 +692,12 @@ jobs:
 
   # NetBSD rounds out the BSDs. src/fetch.rs already knows the platform string,
   # and pkgsrc rust is the same deal as FreeBSD ports rust.
+  #
+  # Dispatch-only (same opt-in pattern as dragonfly/haiku): the NetBSD 9.0
+  # VM's pkgsrc binary set lacks rust and conflicts on pcre2.
   netbsd:
     name: x86_64-unknown-netbsd
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-unknown-netbsd') }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-unknown-netbsd') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
@@ -913,9 +919,12 @@ jobs:
   # Expected to be rocky: Oracle's IPS repo may carry no rust at all, in which
   # case this fails in `prepare` and the enumeration below is what tells us.
   # Same research shape the OmniOS job used to resolve its package names.
+  #
+  # Dispatch-only (same opt-in pattern as dragonfly/haiku): wasmtime, which
+  # yara-x JITs rules through, does not support Solaris.
   solaris:
     name: x86_64-pc-solaris
-    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == '' || inputs.target == 'x86_64-pc-solaris') }}
+    if: ${{ (inputs.wave == '' || inputs.wave == 'slow') && (inputs.target == 'x86_64-pc-solaris') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:

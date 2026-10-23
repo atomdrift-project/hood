@@ -49,8 +49,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.96.0 --profile minimal
-      - run: rustup run 1.96.0 cargo check --locked
+      - name: Check with Cargo.toml's rust-version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+          rustup run "$msrv" cargo check --locked
 
   # Every supported command runs against local fixtures, directly and through
   # hood; hood must succeed visibly and within 2x the direct time. The test
@@ -102,7 +105,8 @@ jobs:
           echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
       - name: Install macOS integration tools
         if: runner.os == 'macOS'
-        run: brew install rpm
+        # The macOS image keeps Go only in the setup-go tool cache, off PATH.
+        run: brew install rpm go
       - name: Verify tool inventory
         run: |
           for tool in $(echo "$HOOD_REQUIRE_TOOL_INTEGRATION" | tr ',' ' '); do

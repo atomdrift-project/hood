@@ -1,0 +1,16 @@
+# 32-bit ARM musl links statically without libgcc, but jemalloc's C code
+# (bundled by tikv-jemalloc-sys) calls libgcc helpers that compiler-builtins
+# does not provide: `__ffsdi2` on both targets, and on ARMv6 the 1-byte
+# `__sync_val_compare_and_swap_1`. Link libgcc for these two targets only.
+[target.arm-unknown-linux-musleabihf]
+rustflags = ["-C", "link-arg=-lgcc"]
+
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "link-arg=-lgcc"]
+
+# unrar-ng-sys compiles C++ with `cpp_link_stdlib(None)`, relying on another
+# crate to link the C++ runtime; on illumos none does, so `operator delete`
+# and `__cxa_*` go unresolved. Applies to the cross build and to the native
+# OmniOS build alike.
+[target.x86_64-unknown-illumos]
+rustflags = ["-C", "link-arg=-lstdc++"]

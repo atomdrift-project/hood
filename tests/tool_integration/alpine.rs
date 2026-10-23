@@ -17,10 +17,12 @@ const PACKAGE_FILE: &str = "hoodfix-1.0.0-r0.apk";
 /// Build an unsigned apk v2 package: a gzip control segment whose tar lacks
 /// an end-of-archive marker, followed by a gzip data segment, so the two
 /// streams read as one tar. `.PKGINFO` records the data segment's SHA-256.
-fn package() -> Result<Vec<u8>> {
+/// `arch` is the repository's: apk fetches a package from the directory its
+/// own arch names, so a `noarch` package under `x86_64/` is never found.
+fn package(arch: &str) -> Result<Vec<u8>> {
     let data = tar_gz(&[("usr/share/hoodfix/README", 0o644, TOOL_MARKER.as_bytes())])?;
     let pkginfo = format!(
-        "pkgname = hoodfix\npkgver = 1.0.0-r0\npkgdesc = hood integration fixture\nurl = https://example.invalid\nbuilddate = 0\npackager = hood\nsize = 0\narch = noarch\norigin = hoodfix\nlicense = Apache-2.0\ndatahash = {}\n",
+        "pkgname = hoodfix\npkgver = 1.0.0-r0\npkgdesc = hood integration fixture\nurl = https://example.invalid\nbuilddate = 0\npackager = hood\nsize = 0\narch = {arch}\norigin = hoodfix\nlicense = Apache-2.0\ndatahash = {}\n",
         sha256_hex(&data),
     );
     let mut control = tar_header(".PKGINFO", 0o644, pkginfo.len())?
@@ -51,7 +53,7 @@ async fn apk_fetches_package_through_hood() -> Result<()> {
     let repo = harness.dir("apk-repo");
     let arch_dir = repo.join(&arch);
     fs::create_dir_all(&arch_dir)?;
-    let package = package()?;
+    let package = package(&arch)?;
     fs::write(arch_dir.join(PACKAGE_FILE), &package)?;
     helper(
         "apk",

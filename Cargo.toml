@@ -1,10 +1,10 @@
 [package]
 name = "hood"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["The Atomdrift Project"]
-description = "Scan HTTP(S) payloads before they reach package managers, installers, and curl|sh scripts"
+description = "Scan payloads before they reach package managers, installers, and curl|sh scripts"
 license = "Apache-2.0"
 repository = "https://github.com/atomdrift-project/hood"
 homepage = "https://github.com/atomdrift-project/hood"

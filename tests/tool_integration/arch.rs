@@ -200,15 +200,22 @@ impl Aur {
         let (fanout, rest) = blob_id.trim().split_at(2);
         let blob = fs::read(bare.join("objects").join(fanout).join(rest))?;
 
+        // The AUR serves each package's repository at both spellings; yay
+        // clones `<aururl>/<pkg>.git` and paru `<aururl>/<pkg>`.
+        let repo = if tool == "paru" {
+            "/hoodfix"
+        } else {
+            "/hoodfix.git"
+        };
         let origin = TestOrigin::spawn().await?;
-        origin.add_dir("/hoodfix.git", &bare)?;
+        origin.add_dir(repo, &bare)?;
         let info = r#"{"version":5,"type":"multiinfo","resultcount":1,"results":[{"ID":1,"Name":"hoodfix","PackageBaseID":1,"PackageBase":"hoodfix","Version":"1.0.0-1","Description":"hood integration fixture","URL":null,"NumVotes":0,"Popularity":0,"OutOfDate":null,"Maintainer":"hood","FirstSubmitted":0,"LastModified":0,"URLPath":"/cgit/aur.git/snapshot/hoodfix.tar.gz","Depends":[],"MakeDepends":[],"License":["Apache-2.0"],"Keywords":[]}]}"#;
         for path in ["/rpc", "/rpc/", "/rpc/v5/info", "/rpc/v5/info/hoodfix"] {
             origin.add_route(path, "application/json", info.as_bytes().to_vec());
         }
         let url = origin.go_url();
         Ok(Some(Self {
-            blob_url: format!("{url}/hoodfix.git/objects/{fanout}/{rest}"),
+            blob_url: format!("{url}{repo}/objects/{fanout}/{rest}"),
             url,
             blob,
             _origin: origin,

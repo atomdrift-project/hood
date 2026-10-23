@@ -9,22 +9,22 @@
 
 ## What it does
 
-`hood` holds every download a developer tool or AI agent makes, decides whether the bytes are safe, and only then releases them to the tool. It wraps the tools you already use, so nothing about your workflow, your registries, or your CI changes.
+Hood is a local proxy that inspects what package managers and fetch tools download before the tool receives it. It wraps the commands you already run; registries, lockfiles, and CI stay as they are.
 
-Most supply-chain tools answer one question: *is this package name on a list?* Hood answers a harder one: *are these exact bytes safe?* That difference is what makes it fit for a campus or a carrier, where the packages that matter most are private, vendored, or fetched with `curl` and never appear on anyone's list.
+Most supply-chain tools check a package name against a list. Hood inspects the bytes. That matters to any organization whose critical packages are private, vendored, or fetched with `curl`: no list has seen them.
 
 ## Why hood
 
-- **Gap-free scanning.** A reputation lookup that comes back empty is not an answer. When hood does not already know an artifact is good or bad, it scans the bytes inline with local static analysis and ML before the tool sees them. Private packages, GitHub archives, freshly published versions, and one-off URLs are all covered, not just the top of npm and PyPI.
-- **ClickFix protection for fetch tools.** `curl` and `wget` are wrapped too. The script behind `curl -fsSL https://example.com/install.sh | sh` is held and scanned before a single byte reaches the shell, so paste-this-command attacks hit the same wall as a poisoned package.
-- **Fully offline mode.** `HOOD_LOCAL=1` uses only the local known-good/known-bad Bloom filters and the local analyzer. No artifact contents, URLs, credentials, or package names leave the machine. Air-gapped labs and regulated networks get the same protection as everyone else.
-- **Minimal disclosure when online.** The optional cloud tier (Beamline) receives only a public package URL or a SHA-256, never file contents, download URLs, cookies, or registry tokens. Private and authenticated fetches are always looked up by hash.
-- **No system changes.** Hood mints a fresh CA per intercepted command and trusts it only inside that child process. It never touches the host trust store, installs a system proxy, or needs root.
-- **Fails the way you choose.** Suspicious and hostile verdicts block by default. `HOOD_BYPASS` is a strict ladder (`1` forward on scanner error, `2` also forward suspicious, `3` forward everything) so a typo can never silently downgrade protection.
+- **Gap-free scanning.** No download is released without a decision. When neither the local filters nor the cloud tier can vouch for an artifact, Hood scans the bytes itself with static analysis and ML, inline. Private packages, GitHub archives, new versions, and one-off URLs get the same inspection as the top of npm and PyPI.
+- **ClickFix protection.** A script fetched with `curl -fsSL https://example.com/install.sh | sh` is scanned before the shell receives it. A pasted command faces the same check as a poisoned package.
+- **Offline operation.** `HOOD_LOCAL=1` disables the cloud tier; `SCAN_NO_UPDATE=1` also stops the daily rule download. Artifact contents, URLs, names, and credentials never leave the machine in either mode.
+- **Minimal disclosure online.** Beamline, the cloud tier, receives a public package URL or a SHA-256 and nothing else: no file contents, download URLs, cookies, or registry tokens. Private and authenticated fetches are looked up by hash only. A package URL still reveals a dependency, and the source address can link requests.
+- **No root, no host changes.** Hood installs shims under `~/.hood/bin` and one marked block in your shell rc, and that is all. Each intercepted command gets a fresh CA trusted only by that child process. The host trust store and system proxy settings are never touched.
+- **Fails closed.** Suspicious and hostile verdicts block. `HOOD_BYPASS` relaxes that in strict steps (`1` forward on scanner error, `2` also forward suspicious, `3` forward everything); any other value is treated as strict and logged.
 
 ## Supported commands
 
-Hood installs user-level shims for whichever of these are on `PATH`. Local-only operations such as `go test`, `cargo build`, and `npm test` pass straight through; commands that fetch are intercepted.
+Hood shims those of these on `PATH`. Commands that fetch are intercepted; local operations such as `go test`, `cargo build`, and `npm test` pass through.
 
 | Ecosystem | Commands |
 | --- | --- |
@@ -37,15 +37,15 @@ Hood installs user-level shims for whichever of these are on `PATH`. Local-only 
 | RPM distributions | `dnf`, `yum`, `zypper`, `rpm` |
 | Alpine and BSD | `apk`, `pkg` |
 
-Anything else runs under `hood exec -- <command>`, which injects the proxy and CA environment into an arbitrary process. npm and pnpm installs get `--ignore-scripts` by default; pass `--enable-scripts` to opt back in.
+Anything else runs under `hood exec -- <command>`, which sets the proxy and CA environment for that process. npm and pnpm installs run with `--ignore-scripts`; `--enable-scripts` restores them.
 
 ## How a download is decided
 
-1. **Local Bloom filters** from Atomdrift Scan. Every identity hood has (package URL and content hash) must be blessed to skip inspection; a trusted name alone cannot bless unknown bytes. Known-bad blocks immediately.
-2. **Beamline assessment** (skipped under `HOOD_LOCAL=1`). Public packages are analyzed by package URL; everything else is looked up by SHA-256. Verified results are cached locally for 30 days.
+1. **Local Bloom filters** from Atomdrift Scan. Both identities, package URL and content hash, must be known good to skip inspection; a trusted name cannot vouch for unknown bytes. Known-bad blocks at once. Bloom matches are probabilistic, which is why both must agree.
+2. **Beamline assessment**, unless `HOOD_LOCAL=1`. Public packages are assessed by package URL, everything else by SHA-256. Verified results are cached for 30 days.
 3. **Local analysis** for anything still unresolved, including API outages, rate limits, and oversized responses. The analyzer loads only when needed.
 
-`hood login` adds isotope13 Enriched rules, refreshed the hour they clear QA. A lapsed token is a warning, never a failed install.
+`hood login` enables the isotope13 Enriched rules. A lapsed token is a warning, never a failed install.
 
 ## Install — Rust 1.96+
 
@@ -54,14 +54,15 @@ git clone https://github.com/atomdrift-project/hood.git && cd hood
 make install && hood install
 ```
 
-Restart your shell and use your tools normally. `hood -v <tool> …` or `HOOD_VERBOSE=1` prints a per-artifact verdict and a run summary. `hood uninstall` removes the shims and shell configuration.
+Restart your shell and use your tools as before. `hood -v <tool> …` or `HOOD_VERBOSE=1` prints a verdict per artifact and a summary. `hood uninstall` removes the shims and the rc block.
 
-For GitHub Actions, pin hood to a reviewed commit, run `make install && hood install`, add `$HOME/.hood/bin` to `GITHUB_PATH`, and leave your existing `npm ci` or `pip install` steps untouched.
+For GitHub Actions, pin Hood to a reviewed commit, install it the same way, add `$HOME/.hood/bin` to `GITHUB_PATH`, and leave the existing `npm ci` or `pip install` steps alone.
 
 | Setting | Purpose |
 | --- | --- |
-| `HOOD_LOCAL=1` | Offline: local Bloom filters and local analysis only. |
-| `HOOD_BYPASS=0..3` | Failure policy ladder; unset is strict. |
-| `HOOD_MAX_SCAN_MB` | Downloads above this size follow the `HOOD_BYPASS` policy. |
+| `HOOD_LOCAL=1` | Skip the cloud tier; local filters and local analysis only. |
+| `SCAN_NO_UPDATE=1` | Skip the daily Bloom and rule refresh. |
+| `HOOD_BYPASS=0..3` | Failure policy; unset is strict. |
+| `HOOD_MAX_SCAN_MB` | Larger downloads follow the `HOOD_BYPASS` policy. |
 | `HOOD_BEAMLINE_URL` | Alternate API origin; HTTPS required except on loopback. |
 | `ISOTOPE13_TOKEN` | Enriched token; overrides the one saved by `hood login`. |

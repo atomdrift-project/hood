@@ -7,7 +7,7 @@
 
 <p align="center"><img src="media/hood.jpg" alt="Handle chemicals under a fume hood" width="392"></p>
 
-Hood is a local proxy that inspects what package managers and fetch tools download before the tool receives it. It wraps the commands you already run on Linux, macOS, Windows, and FreeBSD; registries, lockfiles, and CI stay as they are. Other supply-chain tools check names against a list; Hood inspects bytes, so private, vendored, and `curl`-fetched artifacts get the same scrutiny as the top of npm and PyPI.
+Hood stops supply-chain malware before it runs. It is a local proxy that scans every package, archive, and script your package managers and fetch tools download, and blocks hostile ones before the tool receives them, whether the command came from a developer, a CI job, or a misbehaving AI agent. It wraps the commands you already run on Linux, macOS, Windows, and FreeBSD; registries, lockfiles, and CI stay as they are. Other supply-chain tools check names against a list; Hood scans bytes, so private, vendored, and `curl`-fetched artifacts get the same scrutiny as the top of npm and PyPI.
 
 ## Why hood
 

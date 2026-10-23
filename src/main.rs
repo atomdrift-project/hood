@@ -433,7 +433,12 @@ async fn setup_proxy(
     show_passes: bool,
 ) -> Result<ProxySetup> {
     let stats = show_passes.then(|| Arc::new(ScanStats::default()));
-    let scanner = build_scanner(model_dir, policy, invocation, stats.clone())?;
+    let scanner = {
+        let stats = stats.clone();
+        tokio::task::spawn_blocking(move || build_scanner(model_dir, policy, invocation, stats))
+            .await
+            .context("build scanner task")??
+    };
     let config = Config::from_env()
         .context("read proxy configuration")?
         .with_zig_clients(zig_clients);
@@ -703,7 +708,8 @@ fn resolve_policy() -> ScanPolicy {
     }
 }
 
-/// Build the live scanner. `HOOD_NO_SCAN=1` is a debug-only escape hatch
+/// Build the live scanner, first fetching anything it lacks (blocking; see
+/// [`hood::scanner::prepare`]). `HOOD_NO_SCAN=1` is a debug-only escape hatch
 /// (loud WARN, transparent forwarding) deliberately kept off the CLI surface.
 fn build_scanner(
     model_dir: Option<PathBuf>,
@@ -718,6 +724,7 @@ fn build_scanner(
         }
         tracing::warn!("invalid HOOD_NO_SCAN value ignored; scanning remains enabled");
     }
+    hood::scanner::prepare(model_dir.as_deref());
     Ok(Arc::new(
         AtomScanner::load_with_status(model_dir, policy, invocation, status)
             .context("load scan scanner")?,

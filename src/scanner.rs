@@ -1,7 +1,7 @@
 //! Local Bloom gate, minimal-disclosure Beamline assessment, and lazy local analysis.
 //! Every available identity participates in the Bloom decision before any API call.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -325,8 +325,9 @@ impl AtomScanner {
                 let model_dir = self.model_dir.clone();
                 tokio::task::spawn_blocking(move || {
                     // Before the analyzer resolves a rules tree: logged in
-                    // means the Enriched one.
+                    // means the Enriched one, and never the working directory's.
                     activate_enriched();
+                    scan::traits_repo::prepare_runtime_env();
                     let model_dir = match model_dir {
                         Some(dir) => dir,
                         None => scan::models_repo::ensure_model_dir()
@@ -625,12 +626,51 @@ fn load_bloom() -> Option<Lookup> {
 
 /// Reuse scan's verified atomic updater, at most once per day, including failures.
 fn refresh_bloom() {
-    if std::env::var_os("SCAN_BLOOM_DIR").is_some() || !due_today("bloom-checked") {
+    if std::env::var_os("HOOD_NO_BLOOM").is_some_and(|value| value == "1")
+        || std::env::var_os("SCAN_BLOOM_DIR").is_some()
+        || !due_today("bloom-checked")
+    {
         return;
     }
     if let Err(error) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false, true) {
         tracing::warn!(%error, "Bloom refresh failed; using installed bundle if available");
     }
+}
+
+/// Do the network work local analysis may need before the command starts.
+///
+/// That is a first-run install of the models and rules, and the daily Bloom and
+/// Enriched refreshes. Left to the first scan, the download happens inside a
+/// request, and package managers abandon a transfer that sends nothing for a
+/// few seconds (pacman after 10). Failures are logged and left to the lazy
+/// analyzer load, which applies the scan policy per download.
+///
+/// Blocking: network and disk I/O.
+pub fn prepare(model_dir: Option<&Path>) {
+    // Before anything resolves a rules tree: logged in means the Enriched one.
+    activate_enriched();
+    refresh_bloom();
+    if model_dir.is_none()
+        && let Err(error) = scan::models_repo::ensure_model_dir()
+    {
+        tracing::warn!(error = %format!("{error:#}"), "model install failed before the command started");
+    }
+    install_traits();
+}
+
+/// Install the rules on first run, then pin cleave to the installed tree. Left
+/// to itself, cleave prefers a `traits/` in the working directory, which would
+/// let the checkout being installed supply its own rules.
+fn install_traits() {
+    let explicit = std::env::var_os("CLEAVE_TRAITS_DIR").is_some_and(|dir| !dir.is_empty());
+    let installed = cleave::traits_repo::installed_dir(cleave::enriched::enabled());
+    if !explicit
+        && !installed.is_dir()
+        && let Err(error) = scan::traits_repo::update(false, false)
+    {
+        tracing::warn!(error = %format!("{error:#}"), "rules install failed before the command started");
+    }
+    scan::traits_repo::prepare_runtime_env();
 }
 
 /// Check downloads with the isotope13 Enriched rules once `hood login` has
@@ -642,6 +682,11 @@ fn refresh_bloom() {
 /// — on the Enriched rules already installed, or on the open-source ones when
 /// there are none yet.
 fn activate_enriched() {
+    static ACTIVATE: std::sync::Once = std::sync::Once::new();
+    ACTIVATE.call_once(activate_enriched_once);
+}
+
+fn activate_enriched_once() {
     match cleave::enriched::token() {
         Ok(Some(_)) => {}
         Ok(None) => return,

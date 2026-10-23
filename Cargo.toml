@@ -65,7 +65,7 @@ bytes = "1"
 # The isotope13 Enriched token and rules channel (`hood login`), shared with scan.
 cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -100,7 +100,7 @@ burton = { git = "https://github.com/atomdrift-project/burton.git" }
 flate2 = "1"
 tar = "0.4"
 tokio = { version = "1", features = ["test-util", "macros"] }
-zip = { version = "8.6", default-features = false }
+zip = { version = "9.0", default-features = false }
 
 [[bin]]
 name = "hood"

@@ -844,8 +844,31 @@ fn tool_binary(name: &str) -> Result<Option<PathBuf>> {
 fn path_binary(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .flat_map(|dir| [dir.join(name), dir.join(format!("{name}.exe"))])
+        .flat_map(|dir| executable_candidates(&dir, name))
         .find(|candidate| candidate.is_file() && !is_hood(candidate))
+}
+
+/// Candidate file names for a bare tool name in one directory. On Windows a
+/// bare name runs only through `PATHEXT`, so `npm` means `npm.cmd` or
+/// `npm.exe`, never the extensionless `npm` shell script Node also ships (which
+/// Windows cannot execute — `%1 is not a valid Win32 application`). Elsewhere
+/// the bare name is the executable.
+#[cfg(windows)]
+fn executable_candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    if Path::new(name).extension().is_some() {
+        return vec![dir.join(name)];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    pathext
+        .split(';')
+        .filter(|ext| ext.starts_with('.'))
+        .map(|ext| dir.join(format!("{name}{ext}")))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn executable_candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    vec![dir.join(name)]
 }
 
 fn missing_tool<T>(name: &str) -> Result<Option<T>> {

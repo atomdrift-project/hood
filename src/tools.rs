@@ -354,6 +354,21 @@ impl Program {
         }
     }
 
+    /// Whether this program is curl, by tool identity or by the exec'd binary's
+    /// name. Windows curl is Schannel: it takes its trust from a `--cacert`
+    /// flag, not an environment variable, so both the `curl` shim and
+    /// `hood exec -- curl` need that flag injected.
+    fn is_curl(&self) -> bool {
+        match self {
+            Self::Tool(tool) => *tool == Tool::Curl,
+            Self::Command(path) => path
+                .as_path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("curl")),
+        }
+    }
+
     fn resolve<'a>(&'a self, shim_dir: Option<&Path>) -> Result<Cow<'a, Path>> {
         match self {
             Self::Tool(tool) => {
@@ -786,7 +801,7 @@ impl ChildEnv {
     /// then fails hood's certificate for lacking a revocation endpoint unless
     /// told to tolerate that.
     fn args_for_program(&self, program: &Program) -> Vec<OsString> {
-        if cfg!(windows) && program.tool() == Some(Tool::Curl) {
+        if cfg!(windows) && program.is_curl() {
             return vec![
                 OsString::from("--cacert"),
                 self.ca_pem_path.clone().into_os_string(),
@@ -938,6 +953,11 @@ impl ChildEnv {
                 out.insert("npm_config_cafile", ca);
                 out.insert("npm_config_proxy", proxy.clone());
                 out.insert("npm_config_https_proxy", proxy);
+                // Unix-only: Go reads neither SSL_CERT_FILE nor this GODEBUG on
+                // macOS or Windows, where it trusts only the system store. The
+                // `go` shim handles those through the loopback bridge, but an
+                // arbitrary Go binary under `hood exec` on macOS/Windows cannot
+                // be made to trust the per-run CA and is not covered.
                 out.insert("GODEBUG", OsString::from("x509usefallbackroots=1"));
             }
         }
@@ -1792,23 +1812,33 @@ mod tests {
     #[test]
     fn curl_args_follow_the_platform() {
         let env = fake_env();
-        let args = env.args_for_program(&Program::Tool(Tool::Curl));
+        let shim = env.args_for_program(&Program::Tool(Tool::Curl));
+        // `hood exec -- curl.exe` is curl too and needs the same flags, since
+        // the exec env vars never reach Schannel.
+        let exec_curl = env.args_for_program(&Program::command("curl.exe").unwrap());
         if cfg!(windows) {
-            assert_eq!(args[0], "--cacert");
-            assert_eq!(args[1], env.ca_pem_path.as_os_str());
-            assert_eq!(args[2], "--ssl-revoke-best-effort");
+            assert_eq!(shim[0], "--cacert");
+            assert_eq!(shim[1], env.ca_pem_path.as_os_str());
+            assert_eq!(shim[2], "--ssl-revoke-best-effort");
+            assert_eq!(exec_curl, shim);
             assert!(
                 env.vars_for(Tool::Cargo)
                     .contains_key("CARGO_HTTP_CHECK_REVOKE")
             );
         } else {
-            assert!(args.is_empty());
+            assert!(shim.is_empty());
+            assert!(exec_curl.is_empty());
             assert!(
                 !env.vars_for(Tool::Cargo)
                     .contains_key("CARGO_HTTP_CHECK_REVOKE")
             );
         }
         assert!(env.args_for_program(&Program::Tool(Tool::Npm)).is_empty());
+        // A non-curl exec target gets nothing, even on Windows.
+        assert!(
+            env.args_for_program(&Program::command("node.exe").unwrap())
+                .is_empty()
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ git clone https://github.com/atomdrift-project/hood.git && cd hood
 make install && hood install
 ```
 
-Restart your shell and use your tools as before. `hood -v <tool> …` or `HOOD_VERBOSE=1` prints a verdict per artifact and a summary; `hood uninstall` removes the shims and the rc block. On Windows, cmd.exe is not configured and `hood install` must be rerun after upgrading. For GitHub Actions, pin Hood to a reviewed commit, install it the same way, add `$HOME/.hood/bin` to `GITHUB_PATH`, and leave the existing `npm ci` or `pip install` steps alone.
+Restart your shell and use your tools as before. `hood -v <tool> …` or `HOOD_VERBOSE=1` prints a verdict per artifact and a summary; `hood uninstall` removes the shims and the rc block. On Windows, build with `cargo build --release` instead of `make`, then run `.\target\release\hood.exe install`; it wires both PowerShell profiles, cmd.exe is not configured, and `hood install` must be rerun after upgrading. For GitHub Actions, pin Hood to a reviewed commit, install it the same way, add `$HOME/.hood/bin` to `GITHUB_PATH`, and leave the existing `npm ci` or `pip install` steps alone.
 
 ## Supported commands
 

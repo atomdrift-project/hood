@@ -803,6 +803,54 @@ mod tests {
         assert!(!is_hood_shim(Path::new("/this/does/not/exist/12345")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_link_creates_a_recognized_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hood = tmp.path().join("hood.exe");
+        fs::write(&hood, b"MZ hood bytes").unwrap();
+        let dir = tmp.path().join("bin");
+        fs::create_dir(&dir).unwrap();
+
+        install_link(&dir, "npm", &hood, true).unwrap();
+        // The shim carries the `.exe` suffix Windows needs to execute it.
+        let link = dir.join("npm.exe");
+        assert!(link.exists());
+        assert!(is_hood_shim(&link));
+        // However it was linked (symlink, hard link, or copy), it is hood.
+        assert_eq!(fs::read(&link).unwrap(), b"MZ hood bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_link_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hood = tmp.path().join("hood.exe");
+        fs::write(&hood, b"MZ").unwrap();
+        let dir = tmp.path().join("bin");
+        fs::create_dir(&dir).unwrap();
+
+        install_link(&dir, "cargo", &hood, false).unwrap();
+        install_link(&dir, "cargo", &hood, false).unwrap();
+        assert!(is_hood_shim(&dir.join("cargo.exe")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_link_replaces_a_stale_copy_after_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        fs::create_dir(&dir).unwrap();
+        // A copy left by a previous hood, now out of date.
+        let link = dir.join("npm.exe");
+        fs::write(&link, b"old hood bytes").unwrap();
+        let hood = tmp.path().join("hood.exe");
+        fs::write(&hood, b"new hood bytes").unwrap();
+
+        install_link(&dir, "npm", &hood, false).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"new hood bytes");
+    }
+
     #[test]
     fn shim_names_lists_every_tool_except_exec() {
         let names = shim_names();

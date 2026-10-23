@@ -75,6 +75,38 @@ jobs:
       - run: rustup run stable cargo clippy --locked --all-targets -- -D warnings
       - run: rustup run stable cargo test --locked --lib --bins
 
+  # End-to-end command integrations on Windows: the same hermetic harness as the
+  # other platforms, scoped to the tools the runner ships. It exercises the
+  # Windows-specific paths — PATHEXT shim resolution, Schannel curl trust, the
+  # cargo revocation flag, and the Go loopback bridge. The Defender exclusions
+  # keep it from quarantining the filefacts build fixture (under .cargo) and the
+  # scan rules the local-analysis scenarios download (under %APPDATA%).
+  windows-integration:
+    name: tools on windows
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      HOOD_REQUIRE_TOOL_INTEGRATION: curl,npm,npx,pip,cargo,go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Exclude build and data trees from Defender
+        shell: pwsh
+        run: >-
+          Add-MpPreference -ExclusionPath
+          "$env:USERPROFILE\.cargo", "$env:GITHUB_WORKSPACE",
+          "$env:APPDATA\atomdrift", "$env:LOCALAPPDATA\atomdrift"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Verify tool inventory
+        shell: pwsh
+        run: foreach ($t in "curl","npm","npx","pip","cargo","go") { Get-Command $t -ErrorAction Stop | Out-Null }
+      - name: Run hermetic command integrations
+        run: rustup run stable cargo test --locked --release --test tool_integration -- --test-threads=1
+
   # Every supported command runs against local fixtures, directly and through
   # hood; hood must succeed visibly and within 2x the direct time. The test
   # suite fails if a supported command is missing from every require list.

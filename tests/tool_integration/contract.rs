@@ -53,13 +53,39 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
     let origin = TestOrigin::spawn().await?;
     origin.add_route("/stand-in", "text/plain", TOOL_MARKER.as_bytes().to_vec());
     let bin = tempfile::tempdir()?;
-    // `go env` answers hood's macOS Go bridge query before the child runs.
-    let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = env ]; then printf 'direct\\noff\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$HOOD_STAND_IN_ARGV\"\nexec '{}' -fsS -o \"$HOOD_STAND_IN_OUT\" \"$HOOD_STAND_IN_URL\"\n",
-        curl.display(),
-    );
+    // Each stand-in records the argv it was called with, then fetches the test
+    // URL with the real curl. The `env` branch answers hood's Go bridge query
+    // (`go env`) before the child runs. The file extension matters on Windows:
+    // hood resolves a bare tool name through PATHEXT, and only a `.cmd` both
+    // resolves and executes there.
+    let (extension, script) = if cfg!(windows) {
+        (
+            ".cmd",
+            format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"env\" (echo direct& echo off& exit /b 0)\r\n\
+                 break>\"%HOOD_STAND_IN_ARGV%\"\r\n\
+                 :args\r\n\
+                 if \"%~1\"==\"\" goto fetch\r\n\
+                 >>\"%HOOD_STAND_IN_ARGV%\" echo %~1\r\n\
+                 shift\r\n\
+                 goto args\r\n\
+                 :fetch\r\n\
+                 \"{}\" -fsS -o \"%HOOD_STAND_IN_OUT%\" \"%HOOD_STAND_IN_URL%\"\r\n",
+                curl.display(),
+            ),
+        )
+    } else {
+        (
+            "",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = env ]; then printf 'direct\\noff\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$HOOD_STAND_IN_ARGV\"\nexec '{}' -fsS -o \"$HOOD_STAND_IN_OUT\" \"$HOOD_STAND_IN_URL\"\n",
+                curl.display(),
+            ),
+        )
+    };
     for tool in Tool::SHIMMABLE {
-        let path = bin.path().join(tool.name());
+        let path = bin.path().join(format!("{}{extension}", tool.name()));
         fs::write(&path, &script)?;
         #[cfg(unix)]
         {
@@ -67,7 +93,7 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         }
     }
-    let harness = ToolHarness::new(&bin.path().join("curl"))?;
+    let harness = ToolHarness::new(&bin.path().join(format!("curl{extension}")))?;
     let invocation = |name: &str, args: &[&str], mode: &str, url: &str| -> Result<Invocation> {
         let dir = harness.dir(&format!("stand-in-{name}-{mode}"));
         fs::create_dir_all(&dir)?;
@@ -80,8 +106,14 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
     for tool in Tool::SHIMMABLE {
         let name = tool.name();
         let args = fetching_args(*tool);
-        // On macOS hood exempts loopback from the proxy for Go's bridge, so
-        // the Go stand-in fetches the unspecified address instead.
+        // hood routes `go` through the loopback bridge and exempts loopback
+        // from the child's proxy, so a loopback stand-in cannot be intercepted.
+        // macOS works around this with go_url()'s unspecified address; Windows
+        // cannot connect to 0.0.0.0, so skip go there. Its interception is
+        // covered by `toolchain::go_mod_download_runs_through_hood`.
+        if *tool == Tool::Go && cfg!(windows) {
+            continue;
+        }
         let origin_url = if *tool == Tool::Go && cfg!(target_os = "macos") {
             origin.go_url()
         } else {

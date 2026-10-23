@@ -55,6 +55,26 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal
           rustup run "$msrv" cargo check --locked
 
+  # Windows builds with MSVC and runs the unit tests. The runner's Defender
+  # quarantines the malware fixtures that filefacts' build script hashes, so
+  # the cargo home and workspace are excluded before the first build.
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Exclude build trees from Defender
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo", "$env:GITHUB_WORKSPACE"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - run: rustup run stable cargo clippy --locked --all-targets -- -D warnings
+      - run: rustup run stable cargo test --locked --lib --bins
+
   # Every supported command runs against local fixtures, directly and through
   # hood; hood must succeed visibly and within 2x the direct time. The test
   # suite fails if a supported command is missing from every require list.

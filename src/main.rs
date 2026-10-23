@@ -286,7 +286,12 @@ fn hood_main() -> u8 {
     // provider is already usable.
     drop(rustls::crypto::ring::default_provider().install_default());
 
+    // Hood proxies one command's traffic; scans and model loads run on the
+    // blocking pool and rayon, not on async workers. Tokio's default of one
+    // worker per core cost ~35 ms of thread start-up per run on 128 cores.
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
     {
@@ -368,7 +373,9 @@ async fn run(cli: Cli) -> Result<i32> {
     // *blocking* hostile/suspicious payloads; the scanner being down makes that
     // impossible, so an infrastructure failure fails closed like Strict rather
     // than silently downgrading to "download everything unscanned."
-    let go_bridge = if cfg!(target_os = "macos") && program.tool() == Some(Tool::Go) {
+    // Go reads SSL_CERT_FILE only on Unix systems other than macOS; macOS and
+    // Windows consult the system store alone, so they get the loopback bridge.
+    let go_bridge = if cfg!(any(target_os = "macos", windows)) && program.tool() == Some(Tool::Go) {
         let go = resolve_real_binary("go", shim_dir.as_deref())
             .ok_or_else(|| anyhow::anyhow!("no real `go` found on PATH (only the hood shim)"))?;
         Some(

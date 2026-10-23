@@ -53,7 +53,9 @@ async fn wget_downloads_through_hood() -> Result<()> {
 
 /// `brew fetch` downloads a formula's source archive. Homebrew loads formula
 /// files outside a tap only in developer mode; the API is disabled so the
-/// fixture is the only thing fetched.
+/// fixture is the only thing fetched. Without the API, brew clones the whole
+/// homebrew/core tap (1.5 GB) on first use unless it is told, as its own
+/// `Homebrew::API.with_no_api_env` does, that the mode was set automatically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn brew_fetches_formula_source_through_hood() -> Result<()> {
     let Some(binary) = tool_binary("brew")? else {
@@ -83,6 +85,7 @@ async fn brew_fetches_formula_source_through_hood() -> Result<()> {
                     .env("HOMEBREW_CACHE", dir.join("cache"))
                     .env("HOMEBREW_DEVELOPER", "1")
                     .env("HOMEBREW_NO_INSTALL_FROM_API", "1")
+                    .env("HOMEBREW_AUTOMATICALLY_SET_NO_INSTALL_FROM_API", "1")
                     .env("HOMEBREW_NO_AUTO_UPDATE", "1")
                     .env("HOMEBREW_NO_ANALYTICS", "1")
                     .env("HOMEBREW_NO_ENV_HINTS", "1"))

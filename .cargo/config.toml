@@ -1,11 +1,8 @@
-# 32-bit ARM musl links statically without libgcc, but jemalloc's C code
-# (bundled by tikv-jemalloc-sys) calls libgcc helpers that compiler-builtins
-# does not provide: `__ffsdi2` on both targets, and on ARMv6 the 1-byte
-# `__sync_val_compare_and_swap_1`. Link libgcc for these two targets only.
+# ARMv6 has no compiler_builtins versions of the `__sync_*` helpers that
+# libstdc++'s atomics call (e.g. `__sync_fetch_and_add_4`); libgcc implements
+# them with the Linux kernel helpers, and Rust's static musl link omits it.
+# Not on armv7, where libgcc's copies would collide with compiler_builtins.
 [target.arm-unknown-linux-musleabihf]
-rustflags = ["-C", "link-arg=-lgcc"]
-
-[target.armv7-unknown-linux-musleabihf]
 rustflags = ["-C", "link-arg=-lgcc"]
 
 # unrar-ng-sys compiles C++ with `cpp_link_stdlib(None)`, relying on another

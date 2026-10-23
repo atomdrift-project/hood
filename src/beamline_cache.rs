@@ -307,7 +307,10 @@ mod tests {
             assessment: assessment(),
         };
         std::fs::write(&path, serde_json::to_vec(&expired).unwrap()).unwrap();
-        std::fs::File::open(&path)
+        // Windows grants SetFileTime only to a handle opened for writing.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(UNIX_EPOCH)
             .unwrap();

@@ -1,8 +1,9 @@
-//! Go module/checksum proxy bridge used on macOS.
+//! Go module/checksum proxy bridge used on macOS and Windows.
 //!
-//! Go's `crypto/x509` deliberately ignores `SSL_CERT_FILE` on macOS. Rather
-//! than modifying a user's keychain, hood gives the `go` command loopback HTTP
-//! URLs and performs the verified upstream HTTPS requests itself. The bridge
+//! Go's `crypto/x509` deliberately ignores `SSL_CERT_FILE` on macOS and
+//! Windows, trusting only the system store. Rather than modifying that store,
+//! hood gives the `go` command loopback HTTP URLs and performs the verified
+//! upstream HTTPS requests itself. The bridge
 //! preserves `GOPROXY` ordering and comma/pipe fallback semantics, and keeps
 //! the original checksum-database verifier identity intact.
 

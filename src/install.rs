@@ -12,9 +12,12 @@
 //! - no shell-quoting concerns embedded in generated files;
 //! - uninstall is a `rm` of links that point at our binary, nothing to grep for.
 //!
-//! On Windows the platform doesn't have user-level symlinks reliably, so we
-//! fall back to hardlinks (preserving the single-binary semantics) or, as a
-//! last resort, copies.
+//! On Windows an unprivileged symlink needs Developer Mode, so hood falls back
+//! to a hard link or, across volumes, a copy; those two do not follow an
+//! upgrade of hood.exe, and `hood install` re-links them when run again.
+//! Windows has no rc file; the shim directory is instead
+//! prepended to `$env:Path` from both PowerShell profiles, which is also what
+//! lets a user-level shim shadow `C:\Windows\System32\curl.exe`.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -23,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::tools::Tool;
+use crate::tools::{Tool, resolve_binary_in_path};
 
 /// Sentinel marker bookending hood's edits in a shell rc file.
 const MARK_BEGIN: &str = "# >>> hood shim (added by `hood install`) >>>";
@@ -45,6 +48,8 @@ pub fn shim_dir() -> Result<PathBuf> {
 pub struct Layout {
     /// User's home directory; rc files are discovered relative to this.
     pub home: PathBuf,
+    /// User's Documents folder, where PowerShell keeps its profiles.
+    pub documents: PathBuf,
     /// Directory the busybox-style shims live in.
     pub shim_dir: PathBuf,
 }
@@ -55,19 +60,29 @@ impl Layout {
     #[must_use]
     pub fn at_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
+        let documents = home.join("Documents");
         let shim_dir = home.join(".hood").join("bin");
-        Self { home, shim_dir }
+        Self {
+            home,
+            documents,
+            shim_dir,
+        }
     }
 }
 
 /// Resolve the platform default layout: `HOME` (or `HOOD_HOME` override) plus the
-/// standard `<home>/.hood/bin` shim directory.
+/// standard `<home>/.hood/bin` shim directory. The Documents folder follows
+/// the platform's own answer, since Windows lets users and folder redirection move it.
 fn layout_default() -> Result<Layout> {
     if let Some(home) = std::env::var_os("HOOD_HOME") {
         return Ok(Layout::at_home(PathBuf::from(home)));
     }
     let home = dirs::home_dir().context("HOME not set; cannot resolve home directory")?;
-    Ok(Layout::at_home(home))
+    let mut layout = Layout::at_home(home);
+    if let Some(documents) = dirs::document_dir() {
+        layout.documents = documents;
+    }
+    Ok(layout)
 }
 
 /// Names hood will respond to when invoked via a symlink. Mirrors
@@ -182,7 +197,7 @@ fn install_at_with_path(
         // Absent and implausible for this OS: not a candidate; leave it unlisted.
     }
 
-    for rc in detect_shell_rcs_at(&layout.home) {
+    for rc in shell_configs(layout) {
         write_shell_block(&rc, &layout.shim_dir)
             .with_context(|| format!("update {}", rc.display()))?;
         report.touched_files.push(rc);
@@ -210,7 +225,14 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
         for f in &report.touched_files {
             eprintln!("    {}", f.display());
         }
-        eprintln!("\nRestart your shell (or `source` the rc file) to activate.");
+        if cfg!(windows) {
+            eprintln!(
+                "\nRestart PowerShell to activate. cmd.exe is not covered; put {} first in your PATH for it.",
+                layout.shim_dir.display()
+            );
+        } else {
+            eprintln!("\nRestart your shell (or `source` the rc file) to activate.");
+        }
     }
 }
 
@@ -271,7 +293,7 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
             drop(fs::remove_dir(parent));
         }
     }
-    for rc in detect_shell_rcs_at(&layout.home) {
+    for rc in shell_configs(layout) {
         if remove_shell_block(&rc).context("strip shim block")? {
             report.cleaned_files.push(rc);
         }
@@ -293,49 +315,25 @@ fn is_shim_name(path: &Path) -> bool {
 /// Probe whether a tool binary exists somewhere on `PATH` *other than* our
 /// own shim directory (to avoid claiming success based on stale shims).
 fn is_tool_present(name: &str, skip_dir: &Path, search_path: &OsStr) -> bool {
-    for entry in std::env::split_paths(search_path) {
-        if entry == skip_dir {
-            continue;
-        }
-        let candidate = entry.join(name);
-        if !candidate.is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = candidate.metadata()
-                && meta.permissions().mode() & 0o111 != 0
-            {
-                return true;
-            }
-        }
-        #[cfg(not(unix))]
-        return true;
-    }
-    false
+    resolve_binary_in_path(name, search_path, Some(skip_dir), None).is_some()
 }
 
-/// True iff `path` is a hood-managed shim — i.e. a symlink (or hardlink/copy
-/// on Windows) that ultimately resolves to a file named `hood`. We never
-/// remove anything outside this contract.
+/// True iff `path` is a hood-managed shim. We never remove anything outside
+/// this contract.
+///
+/// A symlink qualifies when it resolves to a file named `hood`. On Windows a
+/// hard link or copy carries no pointer back to hood, and after an upgrade
+/// not even its bytes, so there a regular file qualifies: hood owns the shim
+/// directory and only ever writes shim-named executables into it, which is
+/// the same contract rustup's proxies rely on. Callers restrict the name.
 fn is_hood_shim(path: &Path) -> bool {
-    // Symlink case (Unix + Windows).
     if let Ok(target) = fs::read_link(path) {
         return target
             .file_name()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("hood") || s.eq_ignore_ascii_case("hood.exe"));
     }
-    // Hard-linked / copied fallback (Windows): match by canonicalized target
-    // path against our own current_exe.
-    let Ok(canon) = path.canonicalize() else {
-        return false;
-    };
-    let Ok(me) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
-        return false;
-    };
-    canon == me
+    cfg!(windows) && fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 #[cfg(unix)]
@@ -367,21 +365,62 @@ fn install_link(dir: &Path, tool: &str, hood_bin: &Path, force: bool) -> Result<
 
 #[cfg(windows)]
 fn install_link(dir: &Path, tool: &str, hood_bin: &Path, force: bool) -> Result<()> {
-    // Windows: try a hard link first (no admin needed, single inode, no
-    // symlink privilege required). Fall back to copying.
     let link = dir.join(format!("{tool}.exe"));
-    if link.exists() && !force {
-        return Ok(());
+    match fs::symlink_metadata(&link) {
+        Ok(_) => {
+            if !is_hood_shim(&link) {
+                return Err(anyhow::anyhow!(
+                    "refusing to replace unrelated file {}",
+                    link.display(),
+                ));
+            }
+            // Upgrading hood replaces hood.exe. A symlink follows that; a hard
+            // link or copy keeps the old bytes, so it is re-linked here.
+            let current = fs::read_link(&link).is_ok_and(|target| target == hood_bin)
+                || same_file::is_same_file(&link, hood_bin).unwrap_or(false);
+            if !force && current {
+                return Ok(());
+            }
+            fs::remove_file(&link).with_context(|| format!("remove stale {}", link.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspect {}", link.display())),
     }
-    if link.exists() {
-        let _ = fs::remove_file(&link);
-    }
-    if fs::hard_link(hood_bin, &link).is_ok() {
+    // A symlink needs Developer Mode or a privilege; a hard link needs neither
+    // but must share a volume; a copy always works.
+    if std::os::windows::fs::symlink_file(hood_bin, &link).is_ok()
+        || fs::hard_link(hood_bin, &link).is_ok()
+    {
         return Ok(());
     }
     fs::copy(hood_bin, &link)
         .with_context(|| format!("copy {} -> {}", hood_bin.display(), link.display()))?;
     Ok(())
+}
+
+/// Shell startup files to edit for this platform: PowerShell profiles on
+/// Windows, POSIX and fish rc files elsewhere.
+fn shell_configs(layout: &Layout) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        powershell_profiles(&layout.documents)
+    } else {
+        detect_shell_rcs_at(&layout.home)
+    }
+}
+
+/// The per-user profiles of Windows PowerShell 5.1 and PowerShell 7, which
+/// live under the user's Documents folder. Windows PowerShell ships with
+/// every Windows, and PowerShell 7 is a plain install away, so both profiles
+/// are written whether or not they exist yet; cmd.exe sessions are not covered.
+fn powershell_profiles(documents: &Path) -> Vec<PathBuf> {
+    ["WindowsPowerShell", "PowerShell"]
+        .into_iter()
+        .map(|shell| {
+            documents
+                .join(shell)
+                .join("Microsoft.PowerShell_profile.ps1")
+        })
+        .collect()
 }
 
 /// Detect candidate shell rc files relative to a given home directory.
@@ -438,12 +477,16 @@ fn fish_quote(s: &str) -> String {
     out
 }
 
+/// PowerShell single-quote: only `'` is special inside `'…'`, written `''`.
+fn powershell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Add (or replace) the hood-marked block in `rc_file`. Idempotent.
 fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
-    let is_fish = rc_file
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("fish"));
+    let extension = rc_file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_fish = extension.eq_ignore_ascii_case("fish");
+    let is_powershell = extension.eq_ignore_ascii_case("ps1");
 
     let existing = match fs::read_to_string(rc_file) {
         Ok(existing) => existing,
@@ -457,6 +500,9 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
         format!(
             "{MARK_BEGIN}\nif type -q fish_add_path\n    fish_add_path -p {dir}\nelse\n    set -gx PATH {dir} $PATH\nend\n{MARK_END}\n",
         )
+    } else if is_powershell {
+        let dir = powershell_quote(&shim_dir.to_string_lossy());
+        format!("{MARK_BEGIN}\n$env:Path = {dir} + ';' + $env:Path\n{MARK_END}\n")
     } else {
         // Single-quote the literal dir (so spaces, `$`, `"` stay literal) and
         // concatenate the still-expanding "$PATH".
@@ -601,6 +647,47 @@ mod tests {
     fn tool_from_argv0_rejects_unknown_names() {
         assert_eq!(tool_from_argv0("rsync"), None);
         assert_eq!(tool_from_argv0(""), None);
+    }
+
+    #[test]
+    fn powershell_profiles_cover_both_shells() {
+        let profiles = powershell_profiles(Path::new("D:\\Docs"));
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .all(|p| p.ends_with("Microsoft.PowerShell_profile.ps1"))
+        );
+        assert!(profiles[0].to_string_lossy().contains("WindowsPowerShell"));
+        assert!(!profiles[1].to_string_lossy().contains("WindowsPowerShell"));
+    }
+
+    #[test]
+    fn powershell_quote_doubles_single_quotes() {
+        assert_eq!(
+            powershell_quote("C:\\Users\\o'brien"),
+            "'C:\\Users\\o''brien'"
+        );
+        assert_eq!(powershell_quote("$env:HOME \"x\""), "'$env:HOME \"x\"'");
+    }
+
+    #[test]
+    fn write_shell_block_emits_powershell_for_ps1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp
+            .path()
+            .join("PowerShell")
+            .join("Microsoft.PowerShell_profile.ps1");
+        write_shell_block(&profile, Path::new("C:\\Users\\x\\.hood\\bin")).unwrap();
+        let body = fs::read_to_string(&profile).unwrap();
+        assert!(body.contains("$env:Path = 'C:\\Users\\x\\.hood\\bin' + ';' + $env:Path"));
+        assert!(body.starts_with(MARK_BEGIN));
+        assert!(!body.contains("export PATH"));
+        // Idempotent: a second write replaces rather than appends.
+        write_shell_block(&profile, Path::new("C:\\Users\\x\\.hood\\bin")).unwrap();
+        assert_eq!(fs::read_to_string(&profile).unwrap(), body);
+        assert!(remove_shell_block(&profile).unwrap());
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "");
     }
 
     #[test]

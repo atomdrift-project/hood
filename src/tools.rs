@@ -68,7 +68,7 @@ pub enum Tool {
     /// `pdm <args...>` — Python package and project manager.
     Pdm,
     /// `go <args...>` — Go toolchain. Uses `SSL_CERT_FILE` where supported and
-    /// hood's loopback module/sumdb bridge on macOS.
+    /// hood's loopback module/sumdb bridge on macOS and Windows.
     Go,
     /// `cargo <args...>` — Rust. Respects `CARGO_HTTP_CAINFO` and `SSL_CERT_FILE`.
     Cargo,
@@ -780,6 +780,22 @@ impl ChildEnv {
         self.vars_for_profile(tool.trust_profile())
     }
 
+    /// Command-line arguments appended for tools whose trust settings cannot
+    /// be reached through the environment. Windows curl is Schannel: it
+    /// ignores `CURL_CA_BUNDLE` and `SSL_CERT_FILE`, honors `--cacert`, and
+    /// then fails hood's certificate for lacking a revocation endpoint unless
+    /// told to tolerate that.
+    fn args_for_program(&self, program: &Program) -> Vec<OsString> {
+        if cfg!(windows) && program.tool() == Some(Tool::Curl) {
+            return vec![
+                OsString::from("--cacert"),
+                self.ca_pem_path.clone().into_os_string(),
+                OsString::from("--ssl-revoke-best-effort"),
+            ];
+        }
+        Vec::new()
+    }
+
     fn vars_for_program(&self, program: &Program) -> BTreeMap<&'static str, OsString> {
         self.vars_for_profile(program.trust_profile())
     }
@@ -860,7 +876,8 @@ impl ChildEnv {
                     out.insert("no_proxy", loopback.clone());
                     out.insert("NO_PROXY", loopback);
                 } else {
-                    // Go honors this on Unix systems other than macOS.
+                    // Go honors this on Unix systems other than macOS; macOS
+                    // and Windows use the bridge instead.
                     out.insert("SSL_CERT_FILE", ca);
                 }
             }
@@ -869,6 +886,11 @@ impl ChildEnv {
                 // SSL_CERT_FILE covers git+https fetches that cargo invokes.
                 out.insert("CARGO_HTTP_CAINFO", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
+                if cfg!(windows) {
+                    // Schannel rejects hood's per-run certificate for lacking a
+                    // revocation endpoint. Upstream verification is hood's own.
+                    out.insert("CARGO_HTTP_CHECK_REVOKE", OsString::from("false"));
+                }
             }
             TrustProfile::Brew => {
                 // brew uses curl internally and respects CURL_CA_BUNDLE.
@@ -969,13 +991,14 @@ pub fn resolve_real_binary(name: &str, skip_dir: Option<&Path>) -> Option<PathBu
     resolve_binary_in_path(name, &search_path, skip_dir, current_exe.as_deref())
 }
 
-fn resolve_binary_in_path(
+pub(crate) fn resolve_binary_in_path(
     name: &str,
     search_path: &OsStr,
     skip_dir: Option<&Path>,
     current_exe: Option<&Path>,
 ) -> Option<PathBuf> {
     let canonical_skip = skip_dir.and_then(|path| path.canonicalize().ok());
+    let names = candidate_names(name);
     for entry in std::env::split_paths(search_path) {
         if let Some(skip) = skip_dir
             && (entry == skip
@@ -985,15 +1008,32 @@ fn resolve_binary_in_path(
         {
             continue;
         }
-        let candidate = entry.join(name);
-        if is_executable(&candidate)
-            && current_exe
-                .is_none_or(|current| candidate.canonicalize().ok().as_deref() != Some(current))
-        {
-            return Some(candidate);
+        for file in &names {
+            let candidate = entry.join(file);
+            if is_executable(&candidate)
+                && current_exe
+                    .is_none_or(|current| candidate.canonicalize().ok().as_deref() != Some(current))
+            {
+                return Some(candidate);
+            }
         }
     }
     None
+}
+
+/// File names that satisfy a lookup for `name`. Windows resolves a bare name
+/// through `PATHEXT`, so `npm` is `npm.cmd` and `pip` is `pip.exe`; a name
+/// that already carries an extension is looked up as written.
+fn candidate_names(name: &str) -> Vec<OsString> {
+    if !cfg!(windows) || Path::new(name).extension().is_some() {
+        return vec![OsString::from(name)];
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    pathext
+        .split(';')
+        .filter(|ext| ext.starts_with('.'))
+        .map(|ext| OsString::from(format!("{name}{ext}")))
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1051,6 +1091,7 @@ async fn execute(
     let mut command = Command::new(&*binary);
     command.args(args);
     if let Some(env) = env {
+        command.args(env.args_for_program(program));
         command.envs(env.vars_for_program(program));
     }
     let status = command
@@ -1747,6 +1788,54 @@ mod tests {
     }
 
     // ----- PATH-skipping binary resolution --------------------------------
+
+    #[test]
+    fn curl_args_follow_the_platform() {
+        let env = fake_env();
+        let args = env.args_for_program(&Program::Tool(Tool::Curl));
+        if cfg!(windows) {
+            assert_eq!(args[0], "--cacert");
+            assert_eq!(args[1], env.ca_pem_path.as_os_str());
+            assert_eq!(args[2], "--ssl-revoke-best-effort");
+            assert!(
+                env.vars_for(Tool::Cargo)
+                    .contains_key("CARGO_HTTP_CHECK_REVOKE")
+            );
+        } else {
+            assert!(args.is_empty());
+            assert!(
+                !env.vars_for(Tool::Cargo)
+                    .contains_key("CARGO_HTTP_CHECK_REVOKE")
+            );
+        }
+        assert!(env.args_for_program(&Program::Tool(Tool::Npm)).is_empty());
+    }
+
+    #[test]
+    fn candidate_names_keep_explicit_extensions() {
+        assert_eq!(candidate_names("npm.cmd"), vec![OsString::from("npm.cmd")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn candidate_names_expand_pathext_on_windows() {
+        let names = candidate_names("npm");
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("npm.cmd")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.eq_ignore_ascii_case("npm.exe")),
+            "{names:?}"
+        );
+        assert!(!names.contains(&OsString::from("npm")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn candidate_names_are_bare_off_windows() {
+        assert_eq!(candidate_names("npm"), vec![OsString::from("npm")]);
+    }
 
     #[cfg(unix)]
     #[test]

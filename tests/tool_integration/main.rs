@@ -13,6 +13,11 @@
 //! - quota exceeded: Beamline answers 429, so hood shows why and scans
 //!   locally. Both local scans get [`LOCAL_SLOWDOWN`] plus
 //!   [`LOCAL_SCAN_ALLOWANCE`] for the analyzer's start-up.
+//! - Bloom known good: hood's local filter blesses the payload, so it is
+//!   forwarded without asking Beamline, which here would block it.
+//! - Bloom known bad: the local filter lists the payload. Hood must block it
+//!   with the filter's `known-bad` verdict; Beamline, which hood may still
+//!   consult for details, agrees it is hostile.
 //!
 //! Beamline is a local fake, so tests are hermetic: isolated caches, no
 //! public registry. Local scans use the installed scan models, downloaded once
@@ -91,9 +96,11 @@ const TIMING_ATTEMPTS: usize = 3;
 /// Upper bound for any single command.
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Serializes timed runs within this test binary so that parallel tests do
-/// not distort each other's measurements.
-static TIMING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Keeps parallel tests from distorting each other's measurements. A timed
+/// section holds it exclusively; every other command this test binary runs
+/// (untimed hood runs, fixture builds) holds it shared. Never nest guards:
+/// a queued timed section blocks new shared guards.
+static TIMING: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 /// Proxy variables stripped from direct runs, so a developer's own proxy
 /// cannot slow or reroute the baseline.
@@ -109,6 +116,10 @@ const PROXY_VARS: &[&str] = &[
 /// The message a quota-exhausted Beamline sends, as `beamline.js` words it.
 const QUOTA_MESSAGE: &str =
     "anonymous quota exceeded, visit https://dash.isotope13.io/ for a token";
+
+/// The explanation the fake Beamline gives for a hostile artifact.
+const HOSTILE_REASON: &str = "integration fixture rated hostile";
+const HOSTILE_FINDING: &str = "hood-fixture/hostile";
 
 /// How the fake Beamline answers lookups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,10 +204,17 @@ impl FakeBeamline {
         };
         let (status, body) = match mode {
             Beamline::Assesses => {
-                let severity = if hostile { "hostile" } else { "benign" };
-                let assessment = serde_json::json!({
-                    "status": "analyzed", "severity": severity, "sha256": sha256, "findings": [],
-                });
+                let assessment = if hostile {
+                    serde_json::json!({
+                        "status": "analyzed", "severity": "hostile", "sha256": sha256,
+                        "reason": HOSTILE_REASON,
+                        "findings": [{"id": HOSTILE_FINDING, "desc": "fixture marked hostile"}],
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "analyzed", "severity": "benign", "sha256": sha256, "findings": [],
+                    })
+                };
                 (StatusCode::OK, format!("{assessment}\n"))
             }
             Beamline::Unanalyzed => {
@@ -229,6 +247,28 @@ impl FakeBeamline {
         state.mode = Some(mode);
         state.hostile = hostile.into_iter().collect();
     }
+}
+
+/// Launch the hood binary once, untimed, before any timed run. The first
+/// launch of a freshly built 100+ MB executable pays one-time costs (page-in,
+/// and on macOS a first-launch check of the new binary) of over a second,
+/// which would otherwise be charged to whichever tool happened to run first.
+async fn warm_hood_binary() -> Result<()> {
+    static WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    WARM.get_or_try_init(|| async {
+        let status = Command::new(env!("CARGO_BIN_EXE_hood"))
+            .arg("--version")
+            .output()
+            .await
+            .context("launch hood")?
+            .status;
+        if !status.success() {
+            bail!("hood --version failed: {status}");
+        }
+        Ok(())
+    })
+    .await
+    .copied()
 }
 
 /// The scan models for local analysis, installed once (downloading on first
@@ -471,13 +511,53 @@ impl ToolHarness {
             good.output.stderr
         );
 
+        // The untimed modes run alongside other tests, never during a
+        // measurement.
+        let shared = TIMING.read().await;
         self.beamline
             .set(Beamline::Assesses, Some(sha256_hex(payload.bytes)));
         let (bad, _) = self
-            .run_hood(tool, "known-bad", &prepare, &self.no_models)
+            .run_hood(tool, "known-bad", &prepare, &self.no_models, None)
             .await?;
-        assert_blocked(tool, &bad.output, payload.url);
+        assert_blocked(tool, &bad.output, payload.url, "hostile");
         assert!(!accepted(&bad), "{tool} accepted a blocked payload");
+
+        // Bloom known good: the local blessing must skip a Beamline that
+        // would block the payload.
+        let sha256: [u8; 32] = sha2::Sha256::digest(payload.bytes).into();
+        let bloom = self.dir(&format!("{tool}-bloom-good-filters"));
+        bloom_bundle(&bloom, burton::Tier::Good, sha256)?;
+        let (blessed, _) = self
+            .run_hood(tool, "bloom-good", &prepare, &self.no_models, Some(&bloom))
+            .await?;
+        assert_success(tool, &blessed.output);
+        assert!(
+            blessed.output.stderr.contains("bloom known-good skip"),
+            "hood+{tool} did not skip the blessed payload:\n{}",
+            blessed.output.stderr
+        );
+        assert!(
+            accepted(&blessed),
+            "{tool} did not accept the blessed payload"
+        );
+
+        // Bloom known bad: the block carries the filter's verdict, not
+        // Beamline's, and shows Beamline's explanation, which agrees.
+        let bloom = self.dir(&format!("{tool}-bloom-bad-filters"));
+        bloom_bundle(&bloom, burton::Tier::Bad, sha256)?;
+        let (listed, _) = self
+            .run_hood(tool, "bloom-bad", &prepare, &self.no_models, Some(&bloom))
+            .await?;
+        assert_blocked(tool, &listed.output, payload.url, "known-bad");
+        for detail in [HOSTILE_REASON, HOSTILE_FINDING] {
+            assert!(
+                listed.output.stderr.contains(detail),
+                "hood+{tool} did not explain the known-bad block with {detail:?}:\n{}",
+                listed.output.stderr
+            );
+        }
+        assert!(!accepted(&listed), "{tool} accepted a known-bad payload");
+        drop(shared);
 
         let models = match scan_models().await {
             Ok(models) => models,
@@ -531,7 +611,8 @@ impl ToolHarness {
     where
         F: Fn(&Path) -> Result<Invocation> + Sync,
     {
-        let _serial = TIMING.lock().await;
+        let _serial = TIMING.write().await;
+        warm_hood_binary().await?;
         self.beamline.set(Beamline::Assesses, None);
         let mut fastest_direct = Duration::MAX;
         let mut fastest_hood = Duration::MAX;
@@ -556,9 +637,18 @@ impl ToolHarness {
                     &format!("known-good-{attempt}"),
                     &prepare,
                     &self.no_models,
+                    None,
                 )
                 .await?;
             let failed = !run.output.status.success();
+            eprintln!("{tool} known-good attempt {attempt}: direct {direct:?}, hood {hood:?}");
+            if !failed && hood > time_budget(fastest_direct) {
+                // Show what the slow run spent its time on.
+                eprintln!(
+                    "{tool} attempt {attempt} hood stderr:\n{}",
+                    run.output.stderr
+                );
+            }
             if first.is_none() {
                 first = Some(run);
             }
@@ -566,7 +656,6 @@ impl ToolHarness {
                 break;
             }
             fastest_hood = fastest_hood.min(hood);
-            eprintln!("{tool} known-good attempt {attempt}: direct {direct:?}, hood {hood:?}");
             if fastest_hood <= time_budget(fastest_direct) {
                 break;
             }
@@ -594,12 +683,12 @@ impl ToolHarness {
     where
         F: Fn(&Path) -> Result<Invocation> + Sync,
     {
-        let _serial = TIMING.lock().await;
+        let _serial = TIMING.write().await;
         let mut fastest = Duration::MAX;
         let mut first = None;
         for attempt in 0..TIMING_ATTEMPTS {
             let (run, elapsed) = self
-                .run_hood(tool, &format!("{label}-{attempt}"), &prepare, models)
+                .run_hood(tool, &format!("{label}-{attempt}"), &prepare, models, None)
                 .await?;
             let failed = !run.output.status.success();
             if first.is_none() {
@@ -631,6 +720,7 @@ impl ToolHarness {
         label: &str,
         prepare: F,
         models: &Path,
+        bloom: Option<&Path>,
     ) -> Result<(Run, Duration)>
     where
         F: Fn(&Path) -> Result<Invocation> + Sync,
@@ -638,7 +728,7 @@ impl ToolHarness {
         let dir = self.dir(&format!("{tool}-{label}"));
         fs::create_dir_all(&dir)?;
         let invocation = prepare(&dir)?;
-        let (output, elapsed) = self.hood(tool, &invocation, models).await?;
+        let (output, elapsed) = self.hood(tool, &invocation, models, bloom).await?;
         Ok((Run { output, dir }, elapsed))
     }
 
@@ -658,6 +748,7 @@ impl ToolHarness {
         tool: &str,
         invocation: &Invocation,
         models: &Path,
+        bloom: Option<&Path>,
     ) -> Result<(Output, Duration)> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hood"));
         command
@@ -668,17 +759,24 @@ impl ToolHarness {
             .args(&invocation.args)
             .env("HOOD_HOME", self.dir("hood-home"))
             .env("HOOD_BEAMLINE_URL", self.beamline.url())
-            .env("HOOD_BEAMLINE_CACHE_TTL_SECS", "0")
-            .env("HOOD_NO_BLOOM", "1");
+            .env("HOOD_BEAMLINE_CACHE_TTL_SECS", "0");
         for key in [
             "HOOD_LOCAL",
             "HOOD_NO_SCAN",
+            "HOOD_NO_BLOOM",
             "HOOD_BYPASS",
-            "HOOD_BEAMLINE_TOKEN",
+            "ISOTOPE13_TOKEN",
             "SCAN_MODELS_DIR",
+            "SCAN_BLOOM_DIR",
         ] {
             command.env_remove(key);
         }
+        match bloom {
+            Some(bundle) => command
+                .env("SCAN_BLOOM_DIR", bundle)
+                .env("SCAN_NO_UPDATE", "1"),
+            None => command.env("HOOD_NO_BLOOM", "1"),
+        };
         self.execute(command, invocation).await
     }
 
@@ -820,14 +918,15 @@ fn assert_forwarded(tool: &str, output: &Output, url: &str) {
     );
 }
 
-/// Assert hood blocked a hostile download from a URL containing `url`, and
-/// that the tool failed because of it.
-fn assert_blocked(tool: &str, output: &Output, url: &str) {
+/// Assert hood blocked a download from a URL containing `url` with
+/// `verdict`, and that the tool failed because of it.
+fn assert_blocked(tool: &str, output: &Output, url: &str, verdict: &str) {
     assert!(
-        output.stderr.lines().any(|line| {
-            line.contains("block") && line.contains(url) && line.contains("hostile")
-        }),
-        "hood+{tool} did not block the hostile payload from {url}:\n{}",
+        output
+            .stderr
+            .lines()
+            .any(|line| { line.contains("block") && line.contains(url) && line.contains(verdict) }),
+        "hood+{tool} did not block the {verdict} payload from {url}:\n{}",
         output.stderr,
     );
     assert!(
@@ -836,6 +935,28 @@ fn assert_blocked(tool: &str, output: &Output, url: &str) {
         output.stdout,
         output.stderr,
     );
+}
+
+/// Write a Bloom bundle listing `sha256` in `tier`, as scan's updater installs
+/// one, for `SCAN_BLOOM_DIR`.
+fn bloom_bundle(dir: &Path, tier: burton::Tier, sha256: [u8; 32]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let mut sets = burton::KeySets::new();
+    sets.insert(
+        tier,
+        burton::Record {
+            purl: None,
+            sha256: Some(sha256),
+        },
+    );
+    burton::build::write_bundle(
+        dir,
+        &sets.into_filters(1e-9),
+        "2026-10-22",
+        scan::bloom_repo::KEY_SCHEME,
+    )
+    .map_err(|error| anyhow!("write Bloom bundle: {error:?}"))?;
+    Ok(())
 }
 
 /// Return the first file below `dir` whose name satisfies `matches`.
@@ -893,6 +1014,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Run a fixture-building helper command (`git`, `rpmbuild`, …) to completion.
 async fn helper(program: &str, args: &[&OsStr], cwd: &Path) -> Result<String> {
+    let _shared = TIMING.read().await;
     let output = tokio::time::timeout(
         RUN_TIMEOUT,
         Command::new(program)

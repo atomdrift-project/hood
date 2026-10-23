@@ -52,8 +52,8 @@ Assessment uses three layers:
 
 Beamline calls send only a public PURL or a SHA-256, plus assessment policy parameters.
 They never upload artifact contents or forward download URLs, cookies, or registry
-credentials. Authenticated requests, URLs with query parameters, scoped npm packages,
-GitHub archives, and unrecognized origins use hashes. This minimizes disclosure;
+credentials. Authenticated requests (which is how a private npm scope is fetched),
+URLs with query parameters, GitHub archives, and unrecognized origins use hashes. This minimizes disclosure;
 PURLs still reveal dependencies and hashes can identify known artifacts. Source IPs
 and an optional Beamline token can link requests.
 
@@ -78,10 +78,21 @@ At most four requests run concurrently; excess work goes directly to local analy
 Connection establishment has a five-second timeout, headers and stream inactivity
 have a 30-second timeout, and a progressing analysis may run for up to 30 minutes.
 
+### isotope13 Enriched
+
+`hood login` saves an isotope13 Enriched token, pasted from
+[dash.isotope13.io](https://dash.isotope13.io/). Once signed in, hood checks
+downloads with the Enriched rules — fresh the hour they clear QA, refreshed at
+most once a day — and sends the token to Beamline. A revoked or lapsed token is
+a warning (`run hood login`), never a failed install: hood keeps its installed
+Enriched rules, or falls back to the open-source ones. To sign out, delete the
+token file: `~/.config/atomdrift/isotope13-api.json`, or
+`~/Library/Application Support/atomdrift/isotope13-api.json` on macOS.
+
 | Setting | Purpose |
 | --- | --- |
 | `HOOD_BEAMLINE_URL` | API origin; defaults to `https://api.isotope13.ai`. HTTPS required except on loopback. |
-| `HOOD_BEAMLINE_TOKEN` | Optional Beamline bearer token, separate from package-manager credentials. |
+| `ISOTOPE13_TOKEN` | isotope13 Enriched token; overrides the one `hood login` saved. Sent only to `https://api.isotope13.ai`, never to a `HOOD_BEAMLINE_URL` elsewhere. |
 | `HOOD_BEAMLINE_CACHE_TTL_SECS` | Local assessment lifetime in seconds; defaults to `2592000` (30 days). Set `0` to disable caching. |
 | `HOOD_LOCAL=1` | Use local Bloom filters and local analysis only. |
 | `HOOD_NO_BLOOM=1` | Disable the Bloom gate and its automatic refresh. |

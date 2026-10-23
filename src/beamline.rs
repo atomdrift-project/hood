@@ -54,6 +54,26 @@ impl Assessment {
     }
 }
 
+/// isotope13's API, and the only origin the subscription token is sent to.
+const API_URL: &str = "https://api.isotope13.ai";
+
+/// The isotope13 token for requests to `base`: `ISOTOPE13_TOKEN`, else the one
+/// `hood login` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
+/// pointing anywhere else gets no token, so redirecting the endpoint can never
+/// carry a subscriber's credential with it.
+fn isotope13_token(base: &str) -> Option<String> {
+    if base.trim_end_matches('/') != API_URL {
+        return None;
+    }
+    match cleave::enriched::token() {
+        Ok(found) => found.map(|(token, _)| token.secret().to_owned()),
+        Err(error) => {
+            tracing::warn!(%error, "isotope13 token unusable; asking Beamline without one");
+            None
+        }
+    }
+}
+
 pub(crate) struct Client {
     /// Built on first use with the process-wide roots the proxy prefetches,
     /// so intercepted commands never wait on a root-store load up front.
@@ -76,12 +96,8 @@ impl Client {
         if std::env::var("HOOD_LOCAL").as_deref() == Ok("1") {
             return Ok(None);
         }
-        let base = std::env::var("HOOD_BEAMLINE_URL")
-            .unwrap_or_else(|_| "https://api.isotope13.ai".to_owned());
-        let token = std::env::var("HOOD_BEAMLINE_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let mut client = Self::new(&base, token)?;
+        let base = std::env::var("HOOD_BEAMLINE_URL").unwrap_or_else(|_| API_URL.to_owned());
+        let mut client = Self::new(&base, isotope13_token(&base))?;
         client.cache = match Cache::from_env(client.base.as_str(), client.token.as_deref()) {
             Ok(cache) => cache.map(Arc::new),
             Err(error) => {
@@ -370,7 +386,9 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
     {
         return None;
     }
-    // GitHub archives may be private, and registry hosts can serve private npm scopes.
+    // GitHub archives may be private. A private npm scope is never fetched without
+    // credentials, and the caller already sends authenticated requests by hash, so
+    // an unauthenticated scoped package on the public registry is public.
     if !matches!(
         url.host_str()?,
         "registry.npmjs.org"
@@ -386,11 +404,7 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
     ) {
         return None;
     }
-    let purl = fletch::url_to_purl(raw)?;
-    if purl.starts_with("pkg:npm/%40") || purl.starts_with("pkg:npm/@") {
-        return None;
-    }
-    Some(purl)
+    fletch::url_to_purl(raw)
 }
 
 #[cfg(test)]
@@ -485,15 +499,30 @@ mod tests {
     use test_support::{assessment, cached_client, server};
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    /// The subscription token goes to isotope13's API and nowhere else, so an
+    /// endpoint override can never carry it away — whatever token is saved.
+    #[test]
+    fn the_token_never_follows_an_endpoint_override() {
+        for base in [
+            "https://beamline.example",
+            "http://127.0.0.1:8787",
+            "https://api.isotope13.ai.example",
+            "https://api.isotope13.ai:8443",
+        ] {
+            assert_eq!(isotope13_token(base), None, "{base}");
+        }
+    }
+
     #[test]
     fn only_unambiguous_public_coordinates_are_disclosed() {
         assert_eq!(
             public_purl("https://registry.npmjs.org/demo/-/demo-1.2.3.tgz").as_deref(),
             Some("pkg:npm/demo@1.2.3")
         );
+        // A scope on the public registry is a mainstream coordinate; a private
+        // scope's download is authenticated, and the caller hashes those.
+        assert!(public_purl("https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz").is_some());
         for url in [
-            "https://registry.npmjs.org/@company/private/-/private-1.0.0.tgz",
-            "https://registry.npmjs.org/%40company/private/-/private-1.0.0.tgz",
             "https://codeload.github.com/company/private/tar.gz/v1",
             "https://private.example/demo-1.0.0.tgz",
             "https://registry.npmjs.org/demo/-/demo-1.2.3.tgz?token=private",

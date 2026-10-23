@@ -17,6 +17,9 @@ use crate::beamline;
 
 const HOOD_SCAN_LEVEL: u16 = 25;
 
+/// How long a Bloom known-bad block waits for Beamline's explanation.
+const KNOWN_BAD_DETAILS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Outcome of scanning a single payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -321,6 +324,9 @@ impl AtomScanner {
             .get_or_init(|| async {
                 let model_dir = self.model_dir.clone();
                 tokio::task::spawn_blocking(move || {
+                    // Before the analyzer resolves a rules tree: logged in
+                    // means the Enriched one.
+                    activate_enriched();
                     let model_dir = match model_dir {
                         Some(dir) => dir,
                         None => scan::models_repo::ensure_model_dir()
@@ -363,22 +369,27 @@ impl AtomScanner {
             .await;
         // Bloom revocations must take precedence over even a fresh benign cache entry.
         if let Some(lookup) = bloom
-            && let Some(verdict) = bloom_gate_sha(
-                lookup,
-                self.policy,
-                &self.invocation,
-                url,
-                purl.as_deref(),
-                sha,
-            )
+            && let Some(verdict) = bloom_gate_sha(lookup, self.policy, url, purl.as_deref(), sha)
         {
+            let known_bad = lookup.decide_any(purl.as_deref(), Some(sha)) == Decision::KnownBad;
+            if known_bad {
+                let explanation = self.known_bad_explanation(sha).await;
+                crate::output::emit_known_bad(&crate::output::KnownBadPanel {
+                    url,
+                    sha256: &hex32(sha),
+                    purl: None,
+                    policy: self.policy,
+                    disposition: disposition(&verdict),
+                    invocation: &self.invocation,
+                    beamline: &explanation,
+                });
+            }
             if let Some(status) = &self.status {
-                let classification =
-                    if lookup.decide_any(purl.as_deref(), Some(sha)) == Decision::KnownBad {
-                        Classification::Hostile
-                    } else {
-                        Classification::Benign
-                    };
+                let classification = if known_bad {
+                    Classification::Hostile
+                } else {
+                    Classification::Benign
+                };
                 status.record(classification, disposition(&verdict));
             }
             return Some(verdict);
@@ -411,6 +422,53 @@ impl AtomScanner {
                 None
             }
         }
+    }
+
+    /// Beamline's explanation of a payload the Bloom filter has already
+    /// condemned, as display lines: its reason, then its leading findings.
+    ///
+    /// The verdict never depends on this. It is a hash-only lookup, bounded
+    /// by [`KNOWN_BAD_DETAILS_TIMEOUT`], and an answer that does not agree the
+    /// payload is bad is dropped rather than shown beside the block.
+    async fn known_bad_explanation(&self, sha: &[u8; 32]) -> Vec<String> {
+        let Some(client) = &self.remote else {
+            return Vec::new();
+        };
+        let sha = hex32(sha);
+        let assessment = match tokio::time::timeout(
+            KNOWN_BAD_DETAILS_TIMEOUT,
+            client.assess(None, &sha),
+        )
+        .await
+        {
+            Ok(Ok(assessment)) => assessment,
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "no Beamline details for known-bad payload");
+                return Vec::new();
+            }
+            Err(_) => {
+                tracing::debug!("Beamline details for known-bad payload timed out");
+                return Vec::new();
+            }
+        };
+        if !matches!(
+            assessment.classification(&sha),
+            Some(Classification::Hostile | Classification::Suspicious)
+        ) {
+            tracing::debug!("Beamline does not confirm the known-bad payload; no details shown");
+            return Vec::new();
+        }
+        assessment
+            .reason
+            .iter()
+            .cloned()
+            .chain(assessment.findings.iter().take(3).map(|finding| {
+                finding.desc.as_ref().map_or_else(
+                    || finding.id.clone(),
+                    |desc| format!("{} {desc}", finding.id),
+                )
+            }))
+            .collect()
     }
 
     /// Turn a raw analyzer result into a [`Verdict`], emitting the appropriate
@@ -500,11 +558,11 @@ impl AtomScanner {
     }
 }
 
-/// Consult the shared combined identity decision; no independent allowlist logic.
+/// Consult the shared combined identity decision; no independent allowlist
+/// logic. Pure: the caller reports known-bad matches.
 fn bloom_gate_sha(
     lookup: &Lookup,
     policy: ScanPolicy,
-    invocation: &str,
     url: &str,
     purl: Option<&str>,
     sha: &[u8; 32],
@@ -515,27 +573,8 @@ fn bloom_gate_sha(
             tracing::debug!(url, "bloom known-good skip");
             Some(Verdict::Allow)
         }
-        outcome => {
-            let sha_hex = hex32(sha);
-            let blocked = matches!(outcome, GateOutcome::Block);
-            crate::output::emit_known_bad(&crate::output::KnownBadPanel {
-                url,
-                sha256: &sha_hex,
-                purl: None,
-                policy,
-                disposition: if blocked {
-                    crate::output::Disposition::Blocked
-                } else {
-                    crate::output::Disposition::Forwarded
-                },
-                invocation,
-            });
-            Some(if blocked {
-                Verdict::Block(BlockReason::KnownBad(sha_hex))
-            } else {
-                Verdict::Allow
-            })
-        }
+        GateOutcome::Block => Some(Verdict::Block(BlockReason::KnownBad(hex32(sha)))),
+        GateOutcome::Forward => Some(Verdict::Allow),
     }
 }
 
@@ -586,31 +625,74 @@ fn load_bloom() -> Option<Lookup> {
 
 /// Reuse scan's verified atomic updater, at most once per day, including failures.
 fn refresh_bloom() {
-    if std::env::var_os("SCAN_NO_UPDATE").is_some() || std::env::var_os("SCAN_BLOOM_DIR").is_some()
-    {
+    if std::env::var_os("SCAN_BLOOM_DIR").is_some() || !due_today("bloom-checked") {
         return;
     }
+    if let Err(error) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false, true) {
+        tracing::warn!(%error, "Bloom refresh failed; using installed bundle if available");
+    }
+}
+
+/// Check downloads with the isotope13 Enriched rules once `hood login` has
+/// saved a token (or `ISOTOPE13_TOKEN` names one), refreshing them at most
+/// once a day.
+///
+/// A refused token is a warning, never a failed install: a billing problem
+/// must not block a developer's `npm install`, and the check itself still runs
+/// — on the Enriched rules already installed, or on the open-source ones when
+/// there are none yet.
+fn activate_enriched() {
+    match cleave::enriched::token() {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "isotope13 token unusable; checking with open-source rules");
+            return;
+        }
+    }
+    cleave::enriched::set_enabled(true);
+    if due_today("traits-enriched-checked")
+        && let Err(error) = scan::traits_repo::update(false, true)
+    {
+        if let Some(cleave::rule_update::Error::Enriched(why)) = error.downcast_ref() {
+            tracing::warn!(reason = %why, "isotope13 Enriched unavailable; run `hood login`");
+        } else {
+            tracing::warn!(error = %format!("{error:#}"), "Enriched rules refresh failed; using installed rules");
+        }
+    }
+    let installed = cleave::traits_repo::installed_dir(true);
+    if cleave::rule_update::installed(&installed).is_none() {
+        tracing::warn!(dir = %installed.display(), "no Enriched rules installed; checking with open-source rules");
+        cleave::enriched::set_enabled(false);
+    }
+}
+
+/// Whether a once-a-day job named `name` is due, stamping it when it is.
+/// Failures stamp too, so an offline host does not retry on every command;
+/// `SCAN_NO_UPDATE` turns every refresh off.
+fn due_today(name: &str) -> bool {
+    if std::env::var_os("SCAN_NO_UPDATE").is_some() {
+        return false;
+    }
     let Some(cache) = dirs::cache_dir() else {
-        return;
+        return false;
     };
-    let stamp = cache.join("atomdrift/hood/bloom-checked");
+    let stamp = cache.join("atomdrift/hood").join(name);
     if std::fs::metadata(&stamp)
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age < std::time::Duration::from_hours(24))
     {
-        return;
+        return false;
     }
     if let Some(parent) = stamp.parent()
         && let Err(error) =
             std::fs::create_dir_all(parent).and_then(|()| std::fs::write(&stamp, []))
     {
-        tracing::debug!(%error, "could not stamp Bloom refresh");
+        tracing::debug!(%error, stamp = %stamp.display(), "could not stamp daily refresh");
     }
-    if let Err(error) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false, true) {
-        tracing::warn!(%error, "Bloom refresh failed; using installed bundle if available");
-    }
+    true
 }
 
 /// Lower-hex encode a 32-byte digest without pulling in a hex crate.
@@ -849,7 +931,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://x/e.tgz",
             None,
             &bad_sha,
@@ -863,7 +944,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Bypass,
-            "",
             "https://x/e.tgz",
             None,
             &bad_sha,
@@ -876,7 +956,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
             Some("pkg:npm/evil@1.0.0"),
             &novel,
@@ -887,7 +966,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://x/g.tgz",
             None,
             &good_sha,
@@ -901,14 +979,7 @@ mod tests {
             ("pkg:npm/good@1.0.0", bad_sha, None),
         ] {
             assert_eq!(
-                bloom_gate_sha(
-                    &lookup,
-                    ScanPolicy::Strict,
-                    "",
-                    "https://x",
-                    Some(purl),
-                    &sha
-                ),
+                bloom_gate_sha(&lookup, ScanPolicy::Strict, "https://x", Some(purl), &sha),
                 expected
             );
         }
@@ -918,7 +989,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://registry.npmjs.org/good/-/good-1.0.0.tgz",
             Some("pkg:npm/good@1.0.0"),
             &tampered,
@@ -929,7 +999,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://x/u.tgz",
             None,
             &sha_of(b"novel"),
@@ -942,7 +1011,6 @@ mod tests {
         let v = bloom_gate_sha(
             &lookup,
             ScanPolicy::Strict,
-            "",
             "https://registry.npmjs.org/good/-/good-1.0.0.tgz",
             Some("pkg:npm/good@1.0.0"),
             &sighted_sha,
@@ -1118,6 +1186,53 @@ mod tests {
             assert!(!requests[0].contains("private"));
             assert!(!requests[0].contains("secret"));
         }
+    }
+
+    #[tokio::test]
+    async fn known_bad_explanation_shows_only_confirming_assessments() {
+        use beamline::test_support::server;
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"known bad payload";
+        let sha: [u8; 32] = sha_of(body);
+        let hex = hex32(&sha);
+        let confirming = serde_json::json!({
+            "status": "analyzed", "severity": "hostile", "sha256": hex,
+            "reason": "steals credentials",
+            "findings": [{"id": "exfil/ssh-key", "desc": "reads ~/.ssh"}, {"id": "exec/curl-sh"}],
+        })
+        .to_string();
+        let benign = serde_json::json!({
+            "status": "analyzed", "severity": "benign", "sha256": hex, "findings": [],
+        })
+        .to_string();
+        for (status, response, expected) in [
+            (
+                200,
+                confirming,
+                vec![
+                    "steals credentials".to_owned(),
+                    "exfil/ssh-key reads ~/.ssh".to_owned(),
+                    "exec/curl-sh".to_owned(),
+                ],
+            ),
+            // A disagreeing or failed lookup adds nothing; the block stands.
+            (200, benign, Vec::new()),
+            (429, "quota".to_owned(), Vec::new()),
+        ] {
+            let mock = server(vec![(status, vec![response])]).await;
+            let scanner = test_scanner(
+                Some(beamline::Client::new(&mock.url, None).unwrap()),
+                None,
+                tmp.path().into(),
+                ScanPolicy::Strict,
+            );
+            assert_eq!(scanner.known_bad_explanation(&sha).await, expected);
+            let requests = mock.requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /v1/lookup?sha256="));
+        }
+        let offline = test_scanner(None, None, tmp.path().into(), ScanPolicy::Strict);
+        assert!(offline.known_bad_explanation(&sha).await.is_empty());
     }
 
     #[tokio::test]

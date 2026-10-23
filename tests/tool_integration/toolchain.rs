@@ -9,8 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
 use crate::{
-    Invocation, Output, PROXY_VARS, Payload, TOOL_MARKER, TestOrigin, ToolHarness, find_file,
-    missing_tool, path_binary, sha256_hex, tar_gz, tool_binary, tool_is_selected,
+    Invocation, Output, PROXY_VARS, Payload, TIMING, TOOL_MARKER, TestOrigin, ToolHarness,
+    find_file, missing_tool, path_binary, sha256_hex, tar_gz, tool_binary, tool_is_selected,
 };
 
 pub(crate) const TOOLS: &[&str] = &["go", "cargo", "zig"];
@@ -233,6 +233,7 @@ impl ZigFixture {
         origin.add_route(path.clone(), "application/gzip", tarball.clone());
         let url = format!("{}{path}", origin.url());
         let cache = zig_global_cache(zig, harness).await?;
+        let _shared = TIMING.read().await;
         let mut fetch = Command::new(zig);
         fetch
             .args(["fetch", &url])
@@ -308,6 +309,7 @@ async fn zig_global_cache(zig: &Path, harness: &ToolHarness) -> Result<PathBuf> 
     let warmup = harness.dir("zig-warmup");
     fs::create_dir_all(&warmup)?;
     fs::write(warmup.join("warmup.zig"), "")?;
+    let _shared = TIMING.read().await;
     let output = tokio::time::timeout(
         Duration::from_secs(600),
         Command::new(zig)

@@ -2,8 +2,8 @@
 //! scans every downloaded payload before it reaches the tool.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -249,9 +249,34 @@ enum Command {
     },
     /// Remove hood shims and shell-rc entries.
     Uninstall,
+    /// Sign in to isotope13 Enriched: paste a token from `dash.isotope13.io`.
+    /// Afterwards hood checks downloads with the
+    /// Enriched rules, fresh the hour they clear QA, and sends the token to
+    /// Beamline. To sign out, delete the saved token file.
+    Login,
 }
 
-fn main() -> ExitCode {
+fn main() {
+    let code = hood_main();
+    // End without C exit handlers. Once Security.framework has loaded trust
+    // settings (macOS), CoreAnalytics registers one that waits up to ~300 ms
+    // for analyticsd, which a busy machine starves. Everything hood owns has
+    // dropped by now; only stdout may still hold buffered bytes.
+    drop(std::io::stdout().flush());
+    #[cfg(unix)]
+    // SAFETY: `_exit` only ends the process; nothing in it can observe a
+    // half-dropped value, because none remain.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::_exit(code.into());
+    };
+    #[cfg(not(unix))]
+    std::process::exit(code.into());
+}
+
+/// Run hood and return its exit status. The runtime, proxy and temporary
+/// files all drop before this returns.
+fn hood_main() -> u8 {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let mut cli = Cli::parse_from(rewrite_argv_for_shim(argv));
     cli.verbose = resolve_verbose(cli.verbose);
@@ -268,15 +293,15 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("hood: failed to start tokio runtime: {e:#}");
-            return ExitCode::from(70);
+            return 70;
         }
     };
 
     match rt.block_on(run(cli)) {
-        Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Ok(code) => u8::try_from(code).unwrap_or(1),
         Err(e) => {
             eprintln!("hood: {e:#}");
-            ExitCode::from(70)
+            70
         }
     }
 }
@@ -312,6 +337,12 @@ async fn run(cli: Cli) -> Result<i32> {
         Action::Run { program, argv } => (program, argv),
         Action::Install { force } => return hood::install::install(force),
         Action::Uninstall => return hood::install::uninstall(),
+        Action::Login => {
+            // Blocking HTTP and a terminal read: off the async runtime.
+            tokio::task::spawn_blocking(cleave::rule_update::login).await??;
+            println!("Signed in to isotope13 Enriched.");
+            return Ok(0);
+        }
     };
     let shim_dir = hood::install::shim_dir().ok();
     let invocation = format_invocation(&program, &initial_args);
@@ -579,6 +610,7 @@ enum Action {
         force: bool,
     },
     Uninstall,
+    Login,
 }
 
 impl TryFrom<Command> for Action {
@@ -628,6 +660,7 @@ impl TryFrom<Command> for Action {
             }
             Command::Install { force } => return Ok(Self::Install { force }),
             Command::Uninstall => return Ok(Self::Uninstall),
+            Command::Login => return Ok(Self::Login),
         };
         Ok(Self::Run {
             program: tool.into(),

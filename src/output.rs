@@ -497,6 +497,10 @@ pub struct KnownBadPanel<'a> {
     pub disposition: Disposition,
     /// Shell-quoted reproducer for the bypass hint.
     pub invocation: &'a str,
+    /// Beamline's explanation of the match, one line each (its reason, then
+    /// its leading findings), when it confirms the payload is bad. Empty when
+    /// Beamline is disabled, unreachable, or disagrees.
+    pub beamline: &'a [String],
 }
 
 /// Render a known-bad panel to stderr — same TTY-vs-pipe split as [`emit`].
@@ -536,6 +540,11 @@ pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
                 Disposition::Forwarded => "forward",
             },
         ));
+    }
+    if !stderr.is_terminal() {
+        for line in p.beamline {
+            drop(writeln!(stderr, "  {}", sanitize(line)));
+        }
     }
 }
 
@@ -577,6 +586,15 @@ fn write_known_bad_pretty<W: Write>(
             "  {}  {}",
             fg(c.dim, "lab:"),
             fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
+        )?;
+    }
+    for (i, line) in p.beamline.iter().enumerate() {
+        let label = if i == 0 { "beamline:" } else { "         " };
+        writeln!(
+            w,
+            "  {}  {}",
+            fg(c.dim, label),
+            fg(c.text, sanitize(line).as_ref()),
         )?;
     }
     writeln!(w)?;
@@ -971,6 +989,7 @@ mod tests {
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "npm install evil",
+            beamline: &[],
         };
         let mut buf = Vec::new();
         write_known_bad_pretty(&mut buf, &p, Palette::dark()).unwrap();
@@ -981,6 +1000,30 @@ mod tests {
             "https://lab.atomdrift.org/file/7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b"
         ));
         assert!(s.contains("HOOD_BYPASS=3 npm install evil"));
+        assert!(!s.contains("beamline:"));
+    }
+
+    #[test]
+    fn known_bad_pretty_shows_beamline_explanation_sanitized() {
+        let explanation = [
+            "credential theft".to_owned(),
+            "exfil/ssh-key reads ~/.ssh\u{1b}[31m".to_owned(),
+        ];
+        let p = KnownBadPanel {
+            url: "https://x/evil.tgz",
+            sha256: "abc123",
+            purl: None,
+            policy: ScanPolicy::Strict,
+            disposition: Disposition::Blocked,
+            invocation: "",
+            beamline: &explanation,
+        };
+        let mut buf = Vec::new();
+        write_known_bad_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("beamline:  credential theft"), "{s}");
+        assert!(s.contains("exfil/ssh-key reads ~/.ssh"), "{s}");
+        assert!(!s.contains('\u{1b}'), "unsanitized escape in {s:?}");
     }
 
     #[test]
@@ -992,6 +1035,7 @@ mod tests {
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "",
+            beamline: &[],
         };
         // Exercise the non-TTY plain branch directly.
         let line = format!(

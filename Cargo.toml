@@ -13,7 +13,8 @@ keywords = ["malware", "supply-chain", "package-manager", "security", "proxy"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: `main` allows the crate's one unsafe call, `_exit`.
+unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unused_must_use = "deny"
@@ -61,6 +62,8 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"
 bytes = "1"
+# The isotope13 Enriched token and rules channel (`hood login`), shared with scan.
+cleave = { git = "https://github.com/atomdrift-project/cleave.git" }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
@@ -86,6 +89,10 @@ futures-util = { version = "0.3", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 url = "2"
+
+[target.'cfg(unix)'.dependencies]
+# `_exit` only; see `main`. Already in the graph via tokio.
+libc = "0.2"
 
 [dev-dependencies]
 # Builds the bloom bundles the gate tests load; the same crate scan reads them with.

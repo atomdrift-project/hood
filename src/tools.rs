@@ -20,7 +20,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
@@ -107,47 +106,8 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// Binary to invoke on the host, before any user-supplied first arg.
-    #[must_use]
-    pub const fn default_binary(self) -> &'static str {
-        match self {
-            Self::Curl => "curl",
-            Self::Wget => "wget",
-            Self::Npm => "npm",
-            Self::Npx => "npx",
-            Self::Pnpm => "pnpm",
-            Self::Pnpx => "pnpx",
-            Self::Yarn => "yarn",
-            Self::Rush => "rush",
-            Self::Rushx => "rushx",
-            Self::Bun => "bun",
-            Self::Bunx => "bunx",
-            Self::Pip => "pip",
-            Self::Pip3 => "pip3",
-            Self::Pipx => "pipx",
-            Self::Uv => "uv",
-            Self::Uvx => "uvx",
-            Self::Poetry => "poetry",
-            Self::Pdm => "pdm",
-            Self::Go => "go",
-            Self::Cargo => "cargo",
-            Self::Zig => "zig",
-            Self::Brew => "brew",
-            Self::Pacman => "pacman",
-            Self::Yay => "yay",
-            Self::Paru => "paru",
-            Self::Makepkg => "makepkg",
-            Self::Dnf => "dnf",
-            Self::Yum => "yum",
-            Self::Zypper => "zypper",
-            Self::Rpm => "rpm",
-            Self::Pkg => "pkg",
-            Self::Apk => "apk",
-        }
-    }
-
-    /// The canonical short name for this tool — used in shim file names,
-    /// `--shells` hints, and log fields.
+    /// The canonical short name for this tool — the binary hood runs, and the
+    /// name used in shim file names and log fields.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -372,7 +332,7 @@ impl Program {
     fn resolve<'a>(&'a self, shim_dir: Option<&Path>) -> Result<Cow<'a, Path>> {
         match self {
             Self::Tool(tool) => {
-                let name = tool.default_binary();
+                let name = tool.name();
                 resolve_real_binary(name, shim_dir)
                     .map(Cow::Owned)
                     .ok_or_else(|| {
@@ -435,9 +395,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
         // later fetch verb such as `npm --prefix /tmp install`.
         _ => args.iter().any(|arg| {
             let arg = arg.to_string_lossy();
-            !arg.starts_with('-')
-                && !arg.starts_with('+')
-                && is_fetching_subcommand(tool, Some(arg.as_ref()))
+            !arg.starts_with('-') && !arg.starts_with('+') && is_fetching_subcommand(tool, &arg)
         }),
     };
     if !fetches {
@@ -451,8 +409,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
         .map(|arg| arg.to_string_lossy())
         .find(|arg| !arg.starts_with('-') && !arg.starts_with('+'));
     let runs_install_scripts = matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun)
-        && leading_subcommand.as_deref() != Some("x")
-        && is_fetching_subcommand(tool, leading_subcommand.as_deref());
+        && leading_subcommand.is_some_and(|sub| sub != "x" && is_fetching_subcommand(tool, &sub));
     let final_args = if runs_install_scripts {
         maybe_add_ignore_scripts(args, enable_scripts)
     } else {
@@ -463,11 +420,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
 
 /// Per-tool subcommand list that triggers interception. Anything not in the
 /// list passes through.
-fn is_fetching_subcommand(tool: Tool, sub: Option<&str>) -> bool {
-    let Some(sub) = sub else {
-        // Bare `npm`, `pip`, etc. prints help — no network. Pass through.
-        return false;
-    };
+fn is_fetching_subcommand(tool: Tool, sub: &str) -> bool {
     match tool {
         Tool::Curl
         | Tool::Wget
@@ -686,20 +639,14 @@ fn short_flag_group(arg: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn maybe_add_ignore_scripts(args: Vec<OsString>, enable_scripts: bool) -> Vec<OsString> {
-    if enable_scripts {
-        return args;
+fn maybe_add_ignore_scripts(mut args: Vec<OsString>, enable_scripts: bool) -> Vec<OsString> {
+    let already = args
+        .iter()
+        .any(|a| a == "--ignore-scripts" || a == "--ignore-scripts=true");
+    if !enable_scripts && !already {
+        args.push(OsString::from("--ignore-scripts"));
     }
-    let already = args.iter().any(|a| {
-        let s = a.to_string_lossy();
-        s == "--ignore-scripts" || s == "--ignore-scripts=true"
-    });
-    if already {
-        return args;
-    }
-    let mut out = args;
-    out.push(OsString::from("--ignore-scripts"));
-    out
+    args
 }
 
 /// TLS/proxy behavior shared by command aliases and tools built on the same
@@ -759,6 +706,22 @@ impl Tool {
         }
     }
 }
+
+/// npm's `noproxy` for hood's children. A project's `.npmrc` can set
+/// `noproxy` to send the registry around hood unscanned; the environment
+/// outranks it, but npm ignores an empty variable, so the value is a name no
+/// real host has (`.invalid` is reserved by RFC 6761).
+const NPM_NOPROXY: &str = "invalid";
+
+/// Universal proxy env vars, in both cases — some clients only consult one.
+const PROXY_VARS: [&str; 6] = [
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+];
 
 /// Per-tool runtime context: where the proxy listens, where the CA file lives.
 #[derive(Debug)]
@@ -820,16 +783,7 @@ impl ChildEnv {
         let proxy = OsString::from(&self.proxy_url);
         let ca = OsString::from(&self.ca_pem_path);
 
-        // Universal proxy env vars (both lowercase and uppercase variants —
-        // some clients only consult one or the other).
-        for k in [
-            "http_proxy",
-            "https_proxy",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "all_proxy",
-            "ALL_PROXY",
-        ] {
+        for k in PROXY_VARS {
             out.insert(k, proxy.clone());
         }
 
@@ -855,6 +809,7 @@ impl ChildEnv {
                 out.insert("NODE_EXTRA_CA_CERTS", ca.clone());
                 out.insert("npm_config_proxy", proxy.clone());
                 out.insert("npm_config_https_proxy", proxy);
+                out.insert("npm_config_noproxy", OsString::from(NPM_NOPROXY));
                 out.insert("npm_config_cafile", ca);
             }
             TrustProfile::Pip => {
@@ -900,6 +855,8 @@ impl ChildEnv {
                 // CARGO_HTTP_CAINFO is the documented cargo override.
                 // SSL_CERT_FILE covers git+https fetches that cargo invokes.
                 out.insert("CARGO_HTTP_CAINFO", ca.clone());
+                // Outranks `http.proxy` from a project's `.cargo/config.toml`.
+                out.insert("CARGO_HTTP_PROXY", proxy);
                 out.insert("SSL_CERT_FILE", ca);
                 if cfg!(windows) {
                     // Schannel rejects hood's per-run certificate for lacking a
@@ -911,11 +868,9 @@ impl ChildEnv {
                 // brew uses curl internally and respects CURL_CA_BUNDLE.
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
-                // Most brew formulae build with curl; the env carries.
-                out.insert(
-                    "HOMEBREW_NO_AUTO_UPDATE",
-                    OsString::from("0"), // don't suppress; just declare
-                );
+                // Most brew formulae build with curl; the env carries. Auto
+                // update is declared, not suppressed.
+                out.insert("HOMEBREW_NO_AUTO_UPDATE", OsString::from("0"));
             }
             // System package managers reach the network through one of a few
             // TLS backends: libcurl (pacman's libalpm, dnf's librepo, zypper's
@@ -950,9 +905,11 @@ impl ChildEnv {
                 out.insert("REQUESTS_CA_BUNDLE", ca.clone());
                 out.insert("POETRY_REQUESTS_CA_BUNDLE", ca.clone());
                 out.insert("CARGO_HTTP_CAINFO", ca.clone());
+                out.insert("CARGO_HTTP_PROXY", proxy.clone());
                 out.insert("npm_config_cafile", ca);
                 out.insert("npm_config_proxy", proxy.clone());
                 out.insert("npm_config_https_proxy", proxy);
+                out.insert("npm_config_noproxy", OsString::from(NPM_NOPROXY));
                 // Unix-only: Go reads neither SSL_CERT_FILE nor this GODEBUG on
                 // macOS or Windows, where it trusts only the system store. The
                 // `go` shim handles those through the loopback bridge, but an
@@ -1020,6 +977,13 @@ pub(crate) fn resolve_binary_in_path(
     let canonical_skip = skip_dir.and_then(|path| path.canonicalize().ok());
     let names = candidate_names(name);
     for entry in std::env::split_paths(search_path) {
+        // A relative entry (`.`, or the empty one a stray `:` leaves) resolves
+        // against the working directory, often the checkout being installed,
+        // where a planted `./npm` would run as the tool. Go's `exec.LookPath`
+        // refuses these for the same reason.
+        if !entry.is_absolute() {
+            continue;
+        }
         if let Some(skip) = skip_dir
             && (entry == skip
                 || canonical_skip
@@ -1114,15 +1078,11 @@ async fn execute(
         command.args(env.args_for_program(program));
         command.envs(env.vars_for_program(program));
     }
+    // `status` inherits stdio, so the tool talks to the user's terminal.
     let status = command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawn {}", binary.display()))?
-        .wait()
+        .status()
         .await
-        .with_context(|| format!("wait {}", binary.display()))?;
+        .with_context(|| format!("run {}", binary.display()))?;
 
     Ok(status.code().unwrap_or(1))
 }
@@ -1585,6 +1545,41 @@ mod tests {
     }
 
     #[test]
+    fn project_config_cannot_route_around_the_proxy() {
+        let npm = fake_env().vars_for(Tool::Npm);
+        assert_eq!(
+            npm.get("npm_config_noproxy"),
+            Some(&OsString::from("invalid"))
+        );
+        let cargo = fake_env().vars_for(Tool::Cargo);
+        assert_eq!(
+            cargo.get("CARGO_HTTP_PROXY"),
+            Some(&OsString::from("http://127.0.0.1:12345"))
+        );
+        let exec = fake_env().vars_for_program(&Program::command("/tmp/example").unwrap());
+        assert!(exec.contains_key("CARGO_HTTP_PROXY") && exec.contains_key("npm_config_noproxy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entries_are_never_searched() {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = std::env::current_dir().unwrap();
+        let planted = tempfile::tempdir_in(&cwd).unwrap();
+        let p = planted.path().join("hood-planted-tool");
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let relative = planted.path().strip_prefix(&cwd).unwrap();
+        let path = std::env::join_paths([relative]).unwrap();
+        assert_eq!(
+            resolve_binary_in_path("hood-planted-tool", &path, None, None),
+            None
+        );
+        let absolute = std::env::join_paths([planted.path()]).unwrap();
+        assert!(resolve_binary_in_path("hood-planted-tool", &absolute, None, None).is_some());
+    }
+
+    #[test]
     fn no_proxy_is_neutralized_in_env() {
         // The overlay must blank out any inherited NO_PROXY so the child can't
         // route matching hosts around the proxy unscanned.
@@ -1755,9 +1750,8 @@ mod tests {
     }
 
     #[test]
-    fn every_shimmable_tool_has_a_default_binary() {
+    fn every_shimmable_tool_has_a_name() {
         for tool in Tool::SHIMMABLE {
-            assert!(!tool.default_binary().is_empty());
             assert!(!tool.name().is_empty());
         }
     }

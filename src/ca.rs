@@ -127,10 +127,10 @@ impl Ca {
             .cache
             .lock()
             .map_err(|e| anyhow::anyhow!("ca cache poisoned: {e}"))?;
-        // Another thread might have populated it concurrently; prefer their copy.
         if cache.len() >= MAX_CACHED_LEAVES {
             return Ok(certified);
         }
+        // Another thread might have populated it concurrently; prefer their copy.
         Ok(Arc::clone(
             cache.entry(host.to_owned()).or_insert(certified),
         ))
@@ -180,25 +180,27 @@ fn parse_san(host: &str) -> Result<SanType> {
     Ok(SanType::DnsName(dns))
 }
 
-/// `rustls` cert resolver that mints leaves on the fly using a [`Ca`].
+/// `rustls` cert resolver that mints leaves on the fly using a [`Ca`], for
+/// one tunnel.
 #[derive(Debug)]
 pub struct CaResolver {
     ca: Ca,
+    tunnel_host: String,
 }
 
 impl CaResolver {
-    /// Wrap a CA so it can be plugged into `rustls::ServerConfig`.
+    /// Wrap a CA for a tunnel to `tunnel_host`, which names the leaf when the
+    /// client sends no SNI. Clients never send an IP literal as SNI (RFC 6066),
+    /// so a tunnel to one, IPv4 or IPv6, has only its CONNECT target to go by.
     #[must_use]
-    pub const fn new(ca: Ca) -> Self {
-        Self { ca }
+    pub const fn new(ca: Ca, tunnel_host: String) -> Self {
+        Self { ca, tunnel_host }
     }
 }
 
 impl ResolvesServerCert for CaResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // Prefer the SNI hostname. Some clients (rare) omit SNI; fall back to
-        // the placeholder hostname we expect the connection layer to provide.
-        let host = client_hello.server_name()?;
+        let host = client_hello.server_name().unwrap_or(&self.tunnel_host);
         match self.ca.leaf_for(host) {
             Ok(ck) => Some(ck),
             Err(e) => {

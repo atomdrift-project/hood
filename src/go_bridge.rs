@@ -46,15 +46,6 @@ enum Fallback {
     AnyError,
 }
 
-impl Fallback {
-    const fn as_char(self) -> char {
-        match self {
-            Self::NotFound => ',',
-            Self::AnyError => '|',
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SumDb {
     Off,
@@ -128,8 +119,10 @@ impl GoBridge {
                 ProxyEndpoint::Off => goproxy.push_str("off"),
                 ProxyEndpoint::File(url) => goproxy.push_str(url),
             }
-            if let Some(fallback) = entry.fallback {
-                goproxy.push(fallback.as_char());
+            match entry.fallback {
+                Some(Fallback::NotFound) => goproxy.push(','),
+                Some(Fallback::AnyError) => goproxy.push('|'),
+                None => {}
             }
         }
 
@@ -149,7 +142,7 @@ pub(crate) fn resolve_request(uri: &hyper::Uri, token: &str) -> Result<Option<Ur
     let Some(rest) = uri.path().strip_prefix(&expected) else {
         return Ok(None);
     };
-    let (encoded, suffix) = rest.split_once('/').map_or((rest, ""), |(a, b)| (a, b));
+    let (encoded, suffix) = rest.split_once('/').unwrap_or((rest, ""));
     if encoded.is_empty() {
         return Err(anyhow!("missing Go bridge target"));
     }
@@ -190,8 +183,7 @@ pub(crate) fn redirect_location(token: &str, target: &Url) -> String {
 }
 
 fn bridge_base(addr: SocketAddr, token: &str, upstream: &Url) -> String {
-    let encoded = URL_SAFE_NO_PAD.encode(upstream.as_str().as_bytes());
-    format!("http://{addr}{ROUTE_PREFIX}{token}/{encoded}")
+    format!("http://{addr}{}", redirect_location(token, upstream))
 }
 
 fn normalize_proxy_url(entry: &str) -> Result<Url> {

@@ -56,7 +56,10 @@ impl Palette {
             accent: Rgb(40, 110, 170),
         }
     }
-    const fn for_theme(theme: Theme) -> Self {
+}
+
+impl From<Theme> for Palette {
+    fn from(theme: Theme) -> Self {
         match theme {
             Theme::Dark => Self::dark(),
             Theme::Light => Self::light(),
@@ -72,6 +75,24 @@ pub enum Disposition {
     Blocked,
     /// Verdict was non-benign but policy let it through (`HOOD_BYPASS` active).
     Forwarded,
+}
+
+impl Disposition {
+    /// Lowercase verb for single-line log records.
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Blocked => "block",
+            Self::Forwarded => "forward",
+        }
+    }
+
+    /// Uppercase panel header word.
+    const fn header(self) -> &'static str {
+        match self {
+            Self::Blocked => "BLOCKED",
+            Self::Forwarded => "FORWARDED",
+        }
+    }
 }
 
 /// Emit the compact successful-scan record requested by verbose mode.
@@ -100,10 +121,7 @@ pub(crate) fn emit_remote(
         stderr,
         "hood Beamline verdict={} disposition={} policy={}",
         classification_label(classification),
-        match disposition {
-            Disposition::Blocked => "block",
-            Disposition::Forwarded => "forward",
-        },
+        disposition.verb(),
         policy_tag(policy),
     ));
     if let Some(reason) = &assessment.reason {
@@ -192,7 +210,7 @@ pub fn emit(panel: &Panel<'_>) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
         let theme = scan::output::detect_theme();
-        drop(write_pretty(&mut stderr, panel, Palette::for_theme(theme)));
+        drop(write_pretty(&mut stderr, panel, Palette::from(theme)));
     } else {
         drop(write_plain(&mut stderr, panel));
     }
@@ -205,20 +223,16 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
         _ => c.text,
     };
 
-    let header_word = match p.disposition {
-        Disposition::Blocked => "BLOCKED",
-        Disposition::Forwarded => "FORWARDED",
-    };
     writeln!(w)?;
     writeln!(
         w,
         "  {} {} {}",
         fg(c.dim, "──"),
-        fg_bold(verdict_color, header_word),
+        fg_bold(verdict_color, p.disposition.header()),
         fg(c.chrome, &"─".repeat(64)),
     )?;
     writeln!(w, "  {}", fg_bold(verdict_color, &friendly_status(p)))?;
-    writeln!(w, "  {}", fg_bold(c.text, sanitize(p.url).as_ref()))?;
+    writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
 
     if let Some(orig) = p.original
         && orig != p.classification
@@ -244,7 +258,7 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
 
     if !p.reasons.is_empty() {
         writeln!(w)?;
-        let names: Vec<String> = p.reasons.iter().map(|r| r.feature.clone()).collect();
+        let names: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
         writeln!(
             w,
             "  {}  {}",
@@ -306,10 +320,6 @@ fn write_command_hint<W: Write>(
 /// Plain-text fallback for non-TTY stderr (CI logs, file redirection).
 /// Single line, structured-ish, no escape codes.
 fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
-    let header = match p.disposition {
-        Disposition::Blocked => "block",
-        Disposition::Forwarded => "forward",
-    };
     let traits = p
         .traits
         .iter()
@@ -321,8 +331,8 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
         w,
         "{}; hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]{}",
         friendly_status(p),
-        header,
-        sanitize(p.url),
+        p.disposition.verb(),
+        ShownUrl(p.url),
         classification_label(p.classification),
         p.probability,
         traits,
@@ -404,18 +414,15 @@ pub fn emit_scan_error(p: &ScanErrorPanel<'_>) {
         drop(write_scan_error_pretty(
             &mut stderr,
             p,
-            Palette::for_theme(theme),
+            Palette::from(theme),
         ));
     } else {
         drop(writeln!(
             stderr,
             "hood scan-error url={} policy={} disposition={} error={}",
-            sanitize(p.url),
+            ShownUrl(p.url),
             policy_tag(p.policy),
-            match p.disposition {
-                Disposition::Blocked => "block",
-                Disposition::Forwarded => "forward",
-            },
+            p.disposition.verb(),
             sanitize(p.error),
         ));
     }
@@ -426,23 +433,19 @@ fn write_scan_error_pretty<W: Write>(
     p: &ScanErrorPanel<'_>,
     c: Palette,
 ) -> std::io::Result<()> {
-    let (header, header_color) = match p.disposition {
-        Disposition::Blocked => ("BLOCKED", c.suspicious),
-        Disposition::Forwarded => ("FORWARDED", c.suspicious),
-    };
     writeln!(w)?;
     writeln!(
         w,
         "  {} {} {}",
         fg(c.dim, "──"),
-        fg_bold(header_color, header),
+        fg_bold(c.suspicious, p.disposition.header()),
         fg(c.chrome, &"─".repeat(62)),
     )?;
     writeln!(
         w,
         "  {}  {}",
         fg(c.dim, "scan-error"),
-        fg_bold(c.text, sanitize(p.url).as_ref())
+        fg_bold(c.text, &ShownUrl(p.url).to_string())
     )?;
     writeln!(w)?;
     writeln!(
@@ -508,40 +511,21 @@ pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
     let mut stderr = std::io::stderr().lock();
     if stderr.is_terminal() {
         let theme = scan::output::detect_theme();
-        drop(write_known_bad_pretty(
-            &mut stderr,
-            p,
-            Palette::for_theme(theme),
-        ));
-    } else if p.sha256.is_empty() {
-        // Pre-fetch PURL match: no bytes were downloaded, so key on the PURL.
-        drop(writeln!(
-            stderr,
-            "hood known-bad url={} purl={} policy={} disposition={}",
-            sanitize(p.url),
-            sanitize(p.purl.unwrap_or("?")),
-            policy_tag(p.policy),
-            match p.disposition {
-                Disposition::Blocked => "block",
-                Disposition::Forwarded => "forward",
-            },
-        ));
+        drop(write_known_bad_pretty(&mut stderr, p, Palette::from(theme)));
     } else {
+        // A pre-fetch PURL match downloaded no bytes, so it keys on the PURL.
+        let identity = if p.sha256.is_empty() {
+            format!("purl={}", sanitize(p.purl.unwrap_or("?")))
+        } else {
+            format!("sha256={0} lab={LAB_FILE_URL}{0}", p.sha256)
+        };
         drop(writeln!(
             stderr,
-            "hood known-bad url={} sha256={} lab={}{} policy={} disposition={}",
-            sanitize(p.url),
-            p.sha256,
-            LAB_FILE_URL,
-            p.sha256,
+            "hood known-bad url={} {identity} policy={} disposition={}",
+            ShownUrl(p.url),
             policy_tag(p.policy),
-            match p.disposition {
-                Disposition::Blocked => "block",
-                Disposition::Forwarded => "forward",
-            },
+            p.disposition.verb(),
         ));
-    }
-    if !stderr.is_terminal() {
         for line in p.beamline {
             drop(writeln!(stderr, "  {}", sanitize(line)));
         }
@@ -553,23 +537,19 @@ fn write_known_bad_pretty<W: Write>(
     p: &KnownBadPanel<'_>,
     c: Palette,
 ) -> std::io::Result<()> {
-    let header = match p.disposition {
-        Disposition::Blocked => "BLOCKED",
-        Disposition::Forwarded => "FORWARDED",
-    };
     writeln!(w)?;
     writeln!(
         w,
         "  {} {} {}",
         fg(c.dim, "──"),
-        fg_bold(c.hostile, header),
+        fg_bold(c.hostile, p.disposition.header()),
         fg(c.chrome, &"─".repeat(63)),
     )?;
     writeln!(
         w,
         "  {}  {}",
         fg_bold(c.hostile, "known bad package"),
-        fg_bold(c.text, sanitize(p.url).as_ref()),
+        fg_bold(c.text, &ShownUrl(p.url).to_string()),
     )?;
     writeln!(w)?;
     if p.sha256.is_empty() {
@@ -614,6 +594,103 @@ fn write_known_bad_pretty<W: Write>(
     writeln!(w)
 }
 
+/// Context for an unscanned-download panel.
+///
+/// A download past the inspection limit is forwarded without a verdict. It is
+/// not a block, so it carries no policy — only what went through, how large it
+/// was, and how to have it scanned.
+#[derive(Debug)]
+pub struct UnscannedPanel<'a> {
+    /// URL the tool fetched.
+    pub url: &'a str,
+    /// Size the server declared, when it declared one; otherwise the download
+    /// is known only to be past `limit`.
+    pub size: Option<u64>,
+    /// The inspection limit in bytes (`HOOD_MAX_SCAN_MB`).
+    pub limit: u64,
+    /// Shell-quoted reproducer for the "to scan" hint.
+    pub invocation: &'a str,
+}
+
+/// Render an unscanned-download warning to stderr — same TTY-vs-pipe split
+/// as [`emit`].
+pub fn emit_unscanned(p: &UnscannedPanel<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    if stderr.is_terminal() {
+        let theme = scan::output::detect_theme();
+        drop(write_unscanned_pretty(&mut stderr, p, Palette::from(theme)));
+    } else {
+        drop(write_unscanned_plain(&mut stderr, p));
+    }
+}
+
+fn write_unscanned_pretty<W: Write>(
+    w: &mut W,
+    p: &UnscannedPanel<'_>,
+    c: Palette,
+) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {} {} {}",
+        fg(c.dim, "──"),
+        fg_bold(c.suspicious, "UNSCANNED"),
+        fg(c.chrome, &"─".repeat(62)),
+    )?;
+    writeln!(w, "  {}", fg_bold(c.suspicious, &unscanned_status(p)))?;
+    writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
+    writeln!(w)?;
+    write_command_hint(w, &c, "to scan:", &scan_limit_hint(p), p.invocation)?;
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
+    writeln!(w)
+}
+
+fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "{}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={} hint={}",
+        unscanned_status(p),
+        ShownUrl(p.url),
+        p.size
+            .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
+        p.limit,
+        scan_limit_hint(p),
+    )
+}
+
+fn unscanned_status(p: &UnscannedPanel<'_>) -> String {
+    let limit = human_size(p.limit);
+    let size = p.size.map_or_else(|| "it".to_owned(), human_size);
+    format!(
+        "⚠️ Atomdrift Hood forwarded this download unscanned — {size} is over the {limit} inspection limit"
+    )
+}
+
+/// The `HOOD_MAX_SCAN_MB` setting that would have scanned this download: its
+/// declared size, or twice the limit when the server did not say.
+fn scan_limit_hint(p: &UnscannedPanel<'_>) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let megabytes = p.size.map_or_else(
+        || (p.limit / MIB).saturating_mul(2),
+        |size| size.div_ceil(MIB),
+    );
+    format!("HOOD_MAX_SCAN_MB={megabytes}")
+}
+
+/// A byte count in binary megabytes or gigabytes, rounded to one decimal.
+fn human_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let (unit, name) = if bytes >= GIB {
+        (GIB, "GB")
+    } else {
+        (MIB, "MB")
+    };
+    let unit = u128::from(unit);
+    let tenths = (u128::from(bytes) * 10 + unit / 2) / unit;
+    format!("{}.{} {name}", tenths / 10, tenths % 10)
+}
+
 /// Failsafe panel: scanning was bypassed because the proxy couldn't start.
 /// Only emitted when `HOOD_BYPASS` is set; under strict policy a startup
 /// failure aborts the run before this is ever called.
@@ -626,7 +703,7 @@ pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
             invocation,
             policy,
             reason,
-            Palette::for_theme(theme),
+            Palette::from(theme),
         ));
     } else {
         drop(writeln!(
@@ -720,26 +797,60 @@ fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
     s
 }
 
+/// Unicode bidirectional formatting characters. They are not control
+/// characters, yet they reorder how the text after them is displayed, so an
+/// attacker-chosen string could make a panel read differently than it says
+/// ("Trojan Source").
+pub(crate) const fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// Neutralize control characters in an attacker-influenced string before it is
 /// written to a terminal or a single-line log record. A crafted URL, PURL, or
 /// scan-error message could otherwise embed an ANSI escape (recoloring or
-/// clearing the terminal, hiding text) or a newline (forging a second log line).
-/// Printable characters and tabs pass through; everything else becomes U+FFFD.
+/// clearing the terminal, hiding text), a newline (forging a second log line),
+/// or a bidi override (reordering what is shown). Printable characters and
+/// tabs pass through; everything else becomes U+FFFD.
 fn sanitize(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.chars().any(|c| c.is_control() && c != '\t') {
+    let unsafe_char = |c: char| (c.is_control() && c != '\t') || is_bidi_control(c);
+    if !s.chars().any(unsafe_char) {
         return std::borrow::Cow::Borrowed(s);
     }
     std::borrow::Cow::Owned(
         s.chars()
-            .map(|c| {
-                if c.is_control() && c != '\t' {
-                    '\u{fffd}'
-                } else {
-                    c
-                }
-            })
+            .map(|c| if unsafe_char(c) { '\u{fffd}' } else { c })
             .collect(),
     )
+}
+
+/// A URL as hood shows it, in panels and logs: sanitized, and without the
+/// userinfo, query, and fragment that carry credentials and signatures —
+/// `?token=`, presigned object-storage links — into terminals and CI logs,
+/// which are often public. `?…` marks an elided query or fragment.
+pub(crate) struct ShownUrl<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for ShownUrl<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Ok(mut url) = url::Url::parse(self.0) else {
+            // Not a URL hood built; keep only what precedes any query.
+            let head = self.0.split(['?', '#']).next().unwrap_or_default();
+            return f.write_str(&sanitize(head));
+        };
+        let elided = url.query().is_some() || url.fragment().is_some();
+        url.set_query(None);
+        url.set_fragment(None);
+        // Both fail only for URLs that cannot carry userinfo at all.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        f.write_str(&sanitize(url.as_str()))?;
+        if elided {
+            f.write_str("?…")?;
+        }
+        Ok(())
+    }
 }
 
 fn fg(Rgb(r, g, b): Rgb, text: &str) -> String {
@@ -754,6 +865,26 @@ fn fg_bold(Rgb(r, g, b): Rgb, text: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shown_urls_drop_credentials_queries_and_fragments() {
+        assert_eq!(
+            ShownUrl("https://registry.example/pkg.tgz").to_string(),
+            "https://registry.example/pkg.tgz"
+        );
+        let shown =
+            ShownUrl("https://user:pw@bucket.example/a.tgz?X-Amz-Signature=sig&token=secret#frag")
+                .to_string();
+        assert_eq!(shown, "https://bucket.example/a.tgz?…");
+        assert_eq!(ShownUrl("not a url?token=secret").to_string(), "not a url");
+    }
+
+    #[test]
+    fn sanitize_neutralizes_bidi_overrides() {
+        let clean = sanitize("evil\u{202e}hs.tgz");
+        assert!(!clean.contains('\u{202e}'), "{clean:?}");
+        assert!(clean.contains("evil") && clean.contains("hs.tgz"));
+    }
 
     #[test]
     fn sanitize_strips_escape_and_newline_but_keeps_printable() {
@@ -1050,6 +1181,53 @@ mod tests {
         assert!(line.contains("hood known-bad"));
         assert!(line.contains("sha256=abc123"));
         assert!(line.contains("lab=https://lab.atomdrift.org/file/abc123"));
+    }
+
+    #[test]
+    fn unscanned_panel_names_size_limit_and_how_to_scan() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let p = UnscannedPanel {
+            url: "https://cdn.example/big.iso?signature=secret",
+            size: Some(3 * GIB + GIB / 10),
+            limit: 2 * GIB,
+            invocation: "curl -O https://cdn.example/big.iso",
+        };
+        let mut buf = Vec::new();
+        write_unscanned_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(s.contains("UNSCANNED"), "{s}");
+        assert!(
+            s.contains("3.1 GB is over the 2.0 GB inspection limit"),
+            "{s}"
+        );
+        assert!(s.contains("https://cdn.example/big.iso?…"), "{s}");
+        assert!(!s.contains("secret"), "{s}");
+        assert!(
+            s.contains("HOOD_MAX_SCAN_MB=3175 curl -O https://cdn.example/big.iso"),
+            "{s}"
+        );
+
+        let undeclared = UnscannedPanel { size: None, ..p };
+        let mut buf = Vec::new();
+        write_unscanned_plain(&mut buf, &undeclared).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert!(
+            line.contains("it is over the 2.0 GB inspection limit"),
+            "{line}"
+        );
+        assert!(
+            line.contains("hood forward url=https://cdn.example/big.iso?…"),
+            "{line}"
+        );
+        assert!(line.contains("size_bytes=unknown"), "{line}");
+        assert!(line.contains("hint=HOOD_MAX_SCAN_MB=4096"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn human_sizes_use_one_decimal() {
+        assert_eq!(human_size(512 * 1024 * 1024), "512.0 MB");
+        assert_eq!(human_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 
     #[test]

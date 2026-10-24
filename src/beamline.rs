@@ -25,8 +25,8 @@ const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(30);
 /// A measured assessment. Unrecognized statuses/severities never authorize release.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Assessment {
-    status: String,
-    severity: String,
+    status: Status,
+    severity: Severity,
     sha256: Option<String>,
     #[serde(default)]
     pub(crate) findings: Vec<Finding>,
@@ -40,25 +40,57 @@ pub(crate) struct Finding {
     pub(crate) desc: Option<String>,
 }
 
+/// How far Beamline got. Only a finished analysis carries a verdict; every
+/// other status, including ones added later, is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Status {
+    Analyzed,
+    #[serde(other)]
+    Other,
+}
+
+/// Beamline's verdict. A severity this build does not know is `Unknown`, and
+/// authorizes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Severity {
+    Benign,
+    Suspicious,
+    Hostile,
+    #[serde(other)]
+    Unknown,
+}
+
 impl Assessment {
+    /// The verdict, only if it is a finished analysis of exactly `sha256`.
     pub(crate) fn classification(&self, sha256: &str) -> Option<Classification> {
-        if self.status != "analyzed" || !self.sha256.as_ref()?.eq_ignore_ascii_case(sha256) {
+        if self.status != Status::Analyzed || !self.sha256.as_ref()?.eq_ignore_ascii_case(sha256) {
             return None;
         }
-        match self.severity.as_str() {
-            "benign" => Some(Classification::Benign),
-            "suspicious" => Some(Classification::Suspicious),
-            "hostile" => Some(Classification::Hostile),
-            _ => None,
+        match self.severity {
+            Severity::Benign => Some(Classification::Benign),
+            Severity::Suspicious => Some(Classification::Suspicious),
+            Severity::Hostile => Some(Classification::Hostile),
+            Severity::Unknown => None,
         }
     }
+}
+
+/// What a request asks Beamline about.
+#[derive(Debug, Clone, Copy)]
+enum Query<'a> {
+    /// A public package coordinate, analyzed on demand.
+    Purl(&'a str),
+    /// Exact bytes, looked up by digest.
+    Sha256(&'a str),
 }
 
 /// isotope13's API, and the only origin the subscription token is sent to.
 const API_URL: &str = "https://api.isotope13.ai";
 
 /// The isotope13 token for requests to `base`: `ISOTOPE13_TOKEN`, else the one
-/// `hood login` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
+/// `hood enrich` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
 /// pointing anywhere else gets no token, so redirecting the endpoint can never
 /// carry a subscriber's credential with it.
 fn isotope13_token(base: &str) -> Option<String> {
@@ -209,24 +241,28 @@ impl Client {
         };
         tokio::time::timeout(budget, async {
             if let Some(purl) = purl {
-                let result = self.request("purl", purl).await?;
-                if result.status != "analyzed" || result.classification(sha256).is_some() {
+                let result = self.request(Query::Purl(purl)).await?;
+                if result.status != Status::Analyzed || result.classification(sha256).is_some() {
                     return Ok(result);
                 }
                 // A release may resolve to another wheel or archive. Ask about our bytes.
             }
-            self.request("sha256", sha256).await
+            self.request(Query::Sha256(sha256)).await
         })
         .await
         .context("Beamline deadline exceeded")?
     }
 
-    async fn request(&self, kind: &str, value: &str) -> Result<Assessment> {
-        let analyze = kind == "purl";
+    async fn request(&self, query: Query<'_>) -> Result<Assessment> {
+        let (path, key, value) = match query {
+            Query::Purl(purl) => ("/v1/analyze", "purl", purl),
+            Query::Sha256(sha256) => ("/v1/lookup", "sha256", sha256),
+        };
+        let analyze = matches!(query, Query::Purl(_));
         let mut url = self.base.clone();
-        url.set_path(if analyze { "/v1/analyze" } else { "/v1/lookup" });
+        url.set_path(path);
         url.query_pairs_mut()
-            .append_pair(kind, value)
+            .append_pair(key, value)
             .append_pair("follow", FOLLOW)
             .append_pair("false_positive_budget", BUDGET);
         let http = self.http().await?;
@@ -346,10 +382,10 @@ fn server_message(body: &[u8]) -> Option<String> {
     (!message.is_empty()).then_some(message)
 }
 
-/// Keep at most 200 printable characters.
+/// Keep at most 200 printable characters, without bidi overrides.
 fn printable(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::output::is_bidi_control(c))
         .take(200)
         .collect::<String>()
         .trim()

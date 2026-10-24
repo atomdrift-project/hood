@@ -77,7 +77,11 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
 }
 
 async fn start_http_origin() -> Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    start_http_origin_at("127.0.0.1:0").await
+}
+
+async fn start_http_origin_at(bind: &str) -> Result<SocketAddr> {
+    let listener = TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         loop {
@@ -120,6 +124,7 @@ fn make_origin_tls() -> Result<OriginTls> {
     leaf_params.subject_alt_names = vec![
         SanType::DnsName(rcgen::string::Ia5String::try_from("localhost".to_owned())?),
         SanType::IpAddress("127.0.0.1".parse()?),
+        SanType::IpAddress("::1".parse()?),
     ];
     let leaf_cert = leaf_params.signed_by(&leaf_key, &root_issuer)?;
 
@@ -134,13 +139,17 @@ fn make_origin_tls() -> Result<OriginTls> {
 }
 
 async fn start_https_origin() -> Result<(SocketAddr, String)> {
+    start_https_origin_at("127.0.0.1:0").await
+}
+
+async fn start_https_origin_at(bind: &str) -> Result<(SocketAddr, String)> {
     let tls = make_origin_tls()?;
     let server_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(tls.cert_chain, tls.key_der)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     let root_pem = tls.root_pem.clone();
     tokio::spawn(async move {
@@ -499,6 +508,232 @@ async fn block_returns_451() -> Result<()> {
     assert_eq!(
         resp.headers().get("x-hood-block-reason").unwrap(),
         "hostile"
+    );
+
+    handle.stop().await;
+    Ok(())
+}
+
+/// A scanner that clears everything it inspects but keeps the default answer —
+/// withhold — for anything it cannot inspect. A 451 from it proves the payload
+/// was refused as uninspectable, not judged.
+#[derive(Debug)]
+struct ClearsInspected;
+
+#[async_trait::async_trait]
+impl Scanner for ClearsInspected {
+    async fn scan(&self, _req: ScanRequest) -> Result<Verdict> {
+        Ok(Verdict::Allow)
+    }
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
+        Ok(Verdict::Allow)
+    }
+}
+
+/// An origin that answers every connection with `response`, verbatim — for
+/// framings and headers a well-behaved server would not send.
+async fn start_raw_origin(response: Vec<u8>) -> Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let response = Arc::new(response);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let response = Arc::clone(&response);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                drop(stream.write_all(&response).await);
+            });
+        }
+    });
+    Ok(addr)
+}
+
+/// [`big_payload`] as a chunked response, so its length is never declared.
+fn chunked_big_response() -> Vec<u8> {
+    let mut response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    for chunk in big_payload().chunks(16 * 1024) {
+        response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        response.extend_from_slice(chunk);
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"0\r\n\r\n");
+    response
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeclared_oversized_body_streams_through_intact_when_allowed() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // Past the 16 KiB scan limit hood stops spilling and streams the rest
+    // straight from upstream; the client must still get every byte, in order.
+    let origin_addr = start_raw_origin(chunked_big_response()).await?;
+    let cfg = Config::default().with_scan_limits(4096, 16 * 1024)?;
+    let proxy = Proxy::new(Arc::new(AllowAll), cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let resp = client
+        .get(format!("http://{origin_addr}/big"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await?.as_ref(), big_payload().as_slice());
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undeclared_oversized_body_follows_the_scanner_decision() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let origin_addr = start_raw_origin(chunked_big_response()).await?;
+    let cfg = Config::default().with_scan_limits(4096, 16 * 1024)?;
+    let proxy = Proxy::new(Arc::new(ClearsInspected), cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let resp = client
+        .get(format!("http://{origin_addr}/big"))
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 451);
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_response_cannot_pass_as_inspected() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // hood asked for `identity`; a server that compresses anyway would have
+    // the scanner read compressed bytes while a decoding client runs the
+    // expanded payload.
+    let encoded = format!(
+        "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        PAYLOAD.len()
+    );
+    let mut response = encoded.into_bytes();
+    response.extend_from_slice(PAYLOAD);
+    let origin_addr = start_raw_origin(response).await?;
+    let proxy = Proxy::new(Arc::new(ClearsInspected), Config::default())?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let resp = client
+        .get(format!("http://{origin_addr}/x.tgz"))
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 451);
+
+    handle.stop().await;
+    Ok(())
+}
+
+/// Whether this host can listen on the IPv6 loopback; some containers cannot.
+async fn ipv6_loopback() -> bool {
+    let available = TcpListener::bind("[::1]:0").await.is_ok();
+    if !available {
+        eprintln!("no IPv6 loopback here; skipping");
+    }
+    available
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_literal_origin_round_trips_over_http() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+    if !ipv6_loopback().await {
+        return Ok(());
+    }
+
+    let origin_addr = start_http_origin_at("[::1]:0").await?;
+    let proxy = Proxy::new(Arc::new(AllowAll), Config::default())?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let resp = client
+        .get(format!("http://{origin_addr}/hello"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await?.as_ref(), PAYLOAD);
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_literal_origin_round_trips_over_https_without_sni() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+    if !ipv6_loopback().await {
+        return Ok(());
+    }
+
+    // An IP-literal URL carries no SNI, so the leaf must be named for the
+    // CONNECT target; hood then dials and verifies the bare IPv6 address.
+    let (origin_addr, origin_ca_pem) = start_https_origin_at("[::1]:0").await?;
+    let cfg = Config::default().with_extra_upstream_roots(roots_from_pem(&origin_ca_pem));
+    let proxy = Proxy::new(Arc::new(AllowAll), cfg)?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+
+    // reqwest 0.12 cannot tunnel TLS to an IPv6 literal (it hands the
+    // bracketed host to `ServerName`), so the client side is driven by hand.
+    let mut tunnel = TcpStream::connect(handle.addr).await?;
+    tunnel
+        .write_all(
+            format!("CONNECT {origin_addr} HTTP/1.1\r\nHost: {origin_addr}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(tunnel.read(&mut byte).await?, 1, "proxy closed the CONNECT");
+        head.push(byte[0]);
+    }
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in roots_from_pem(&hood_ca) {
+        roots.add(cert)?;
+    }
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::IpAddress(origin_addr.ip().into());
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
+        .connect(server_name, tunnel)
+        .await?;
+    tls.write_all(
+        format!("GET /hello HTTP/1.1\r\nHost: {origin_addr}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await?;
+    let mut response = Vec::new();
+    // The proxy may close without a TLS close_notify; what arrived is enough.
+    drop(tls.read_to_end(&mut response).await);
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.ends_with(std::str::from_utf8(PAYLOAD)?),
+        "{response}"
     );
 
     handle.stop().await;

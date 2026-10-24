@@ -60,7 +60,7 @@ impl Cache {
         ])
         .to_string();
         let digest: [u8; 32] = Sha256::digest(scope.as_bytes()).into();
-        let namespace = crate::scanner::hex32(&digest);
+        let namespace = crate::scanner::hex(&digest);
         root.push(namespace);
         Self {
             directory: root,

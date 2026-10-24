@@ -129,7 +129,14 @@ pub fn install(force: bool) -> Result<i32> {
     let hood_bin = std::env::current_exe().context("resolve current_exe")?;
     // A canonical target keeps every shim stable regardless of how Hood ran.
     let hood_bin = hood_bin.canonicalize().unwrap_or(hood_bin);
-    let report = install_at(&layout, &hood_bin, force, std::env::consts::OS)?;
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    let report = install_at(
+        &layout,
+        &hood_bin,
+        force,
+        std::env::consts::OS,
+        &search_path,
+    )?;
     print_install_report(&layout, &hood_bin, &report);
     Ok(0)
 }
@@ -146,10 +153,11 @@ pub struct InstallReport {
     pub touched_files: Vec<PathBuf>,
 }
 
-/// Install hood shims using an explicit [`Layout`] and hood binary path.
+/// Install hood shims using an explicit [`Layout`], hood binary path, and
+/// `search_path` (the `PATH` probed for each tool).
 ///
-/// The public [`install`] derives the layout from the user's
-/// real home and passes [`std::env::consts::OS`]. Tests should use this entry
+/// The public [`install`] derives the layout from the user's real home and
+/// passes [`std::env::consts::OS`] and `$PATH`. Tests should use this entry
 /// point.
 ///
 /// `os` gates which tools are candidates: a tool is shimmed when it is present
@@ -166,16 +174,6 @@ pub fn install_at(
     hood_bin: &Path,
     force: bool,
     os: &str,
-) -> Result<InstallReport> {
-    let search_path = std::env::var_os("PATH").unwrap_or_default();
-    install_at_with_path(layout, hood_bin, force, os, &search_path)
-}
-
-fn install_at_with_path(
-    layout: &Layout,
-    hood_bin: &Path,
-    force: bool,
-    os: &str,
     search_path: &OsStr,
 ) -> Result<InstallReport> {
     fs::create_dir_all(&layout.shim_dir)
@@ -184,7 +182,9 @@ fn install_at_with_path(
     let mut report = InstallReport::default();
     for tool in Tool::SHIMMABLE {
         let name = tool.name();
-        if is_tool_present(name, &layout.shim_dir, search_path) {
+        // Look past our own shim directory so a stale shim is not mistaken
+        // for the tool itself.
+        if resolve_binary_in_path(name, search_path, Some(&layout.shim_dir), None).is_some() {
             // Present on PATH — it exists here, so shim it whatever the platform.
             install_link(&layout.shim_dir, name, hood_bin, force)
                 .with_context(|| format!("install shim for {name}"))?;
@@ -282,7 +282,13 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
                 format!("read directory entry in {}", layout.shim_dir.display())
             })?;
             let path = entry.path();
-            if is_shim_name(&path) && is_hood_shim(&path) {
+            // Only names hood installs: a user may keep other links here, and
+            // their target being named `hood` is not enough to make them ours.
+            let shim_name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| tool_from_argv0(name).is_some());
+            if shim_name && is_hood_shim(&path) {
                 fs::remove_file(&path)
                     .with_context(|| format!("remove shim {}", path.display()))?;
                 report.removed_shims = report.removed_shims.saturating_add(1);
@@ -299,23 +305,6 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
         }
     }
     Ok(report)
-}
-
-/// Restrict uninstall to names hood actually installs. A user may keep other
-/// links in the same directory; their target being named `hood` is not enough
-/// to make them ours.
-fn is_shim_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let name = name.strip_suffix(".exe").unwrap_or(name);
-    Tool::SHIMMABLE.iter().any(|tool| tool.name() == name)
-}
-
-/// Probe whether a tool binary exists somewhere on `PATH` *other than* our
-/// own shim directory (to avoid claiming success based on stale shims).
-fn is_tool_present(name: &str, skip_dir: &Path, search_path: &OsStr) -> bool {
-    resolve_binary_in_path(name, search_path, Some(skip_dir), None).is_some()
 }
 
 /// True iff `path` is a hood-managed shim. We never remove anything outside
@@ -925,7 +914,7 @@ mod tests {
         fs::write(home.join(".zshrc"), "echo hi\n").unwrap();
         let layout = Layout::at_home(&home);
 
-        let report = install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
+        let report = install_at(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
         assert!(report.installed.contains(&"cargo"));
         assert!(report.skipped.contains(&"npm")); // not on staged PATH
         assert!(report.touched_files.iter().any(|p| p.ends_with(".zshrc")));
@@ -955,7 +944,7 @@ mod tests {
         let layout = Layout::at_home(&home);
 
         // On macOS, Linux/BSD system managers are not candidates at all.
-        let mac = install_at_with_path(&layout, &hood, false, "macos", empty_path).unwrap();
+        let mac = install_at(&layout, &hood, false, "macos", empty_path).unwrap();
         for absent in ["pacman", "yay", "makepkg", "dnf", "rpm", "apk", "pkg"] {
             assert!(
                 !mac.skipped.contains(&absent),
@@ -967,7 +956,7 @@ mod tests {
 
         // On Linux the Arch/RPM/Alpine managers are candidates; FreeBSD's pkg
         // is not.
-        let linux = install_at_with_path(&layout, &hood, false, "linux", empty_path).unwrap();
+        let linux = install_at(&layout, &hood, false, "linux", empty_path).unwrap();
         for present in ["pacman", "dnf", "rpm", "apk", "brew"] {
             assert!(
                 linux.skipped.contains(&present),
@@ -993,7 +982,7 @@ mod tests {
         let layout = Layout::at_home(&home);
 
         // pacman is implausible on macOS, but it's present, so it's installed.
-        let report = install_at_with_path(&layout, &hood, false, "macos", bin.as_os_str()).unwrap();
+        let report = install_at(&layout, &hood, false, "macos", bin.as_os_str()).unwrap();
         assert!(report.installed.contains(&"pacman"));
         assert!(!report.skipped.contains(&"pacman"));
     }
@@ -1016,8 +1005,8 @@ mod tests {
         let layout = Layout::at_home(&home);
 
         // Install twice — second call should be idempotent.
-        install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
-        install_at_with_path(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
+        install_at(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
+        install_at(&layout, &hood, false, "linux", bin.as_os_str()).unwrap();
         let after_install = fs::read_to_string(&zshrc).unwrap();
         assert_eq!(after_install.matches(MARK_BEGIN).count(), 1);
         assert!(layout.shim_dir.join("go").exists());
@@ -1045,7 +1034,7 @@ mod tests {
         fs::create_dir_all(&fish_dir).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at_with_path(&layout, &hood, false, "linux", empty_path).unwrap();
+        install_at(&layout, &hood, false, "linux", empty_path).unwrap();
         let fish_cfg = fish_dir.join("config.fish");
         let content = fs::read_to_string(&fish_cfg).unwrap();
         assert!(content.contains("fish_add_path"));
@@ -1071,11 +1060,11 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let layout = Layout::at_home(&home);
 
-        install_at_with_path(&layout, &hood1, false, "linux", bin.as_os_str()).unwrap();
+        install_at(&layout, &hood1, false, "linux", bin.as_os_str()).unwrap();
         let target1 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target1, hood1);
 
-        install_at_with_path(&layout, &hood2, true, "linux", bin.as_os_str()).unwrap();
+        install_at(&layout, &hood2, true, "linux", bin.as_os_str()).unwrap();
         let target2 = fs::read_link(layout.shim_dir.join("npm")).unwrap();
         assert_eq!(target2, hood2);
     }

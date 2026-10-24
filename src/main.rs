@@ -249,11 +249,13 @@ enum Command {
     },
     /// Remove hood shims and shell-rc entries.
     Uninstall,
-    /// Sign in to isotope13 Enriched: paste a token from `dash.isotope13.io`.
-    /// Afterwards hood checks downloads with the
-    /// Enriched rules, fresh the hour they clear QA, and sends the token to
-    /// Beamline. To sign out, delete the saved token file.
-    Login,
+    /// Switch on isotope13 Enriched: approve the code shown at
+    /// `dash.isotope13.io/device`. Afterwards hood checks downloads with the
+    /// latest rules, the moment they clear QA, and sends the token to
+    /// Beamline. To switch it off, delete the saved token file.
+    Enrich,
+    /// Show hood's version and which rules it checks downloads with.
+    Version,
 }
 
 fn main() {
@@ -342,10 +344,22 @@ async fn run(cli: Cli) -> Result<i32> {
         Action::Run { program, argv } => (program, argv),
         Action::Install { force } => return hood::install::install(force),
         Action::Uninstall => return hood::install::uninstall(),
-        Action::Login => {
+        Action::Enrich => {
             // Blocking HTTP and a terminal read: off the async runtime.
-            tokio::task::spawn_blocking(cleave::rule_update::login).await??;
-            println!("Signed in to isotope13 Enriched.");
+            tokio::task::spawn_blocking(cleave::rule_update::enrich).await??;
+            return Ok(0);
+        }
+        Action::Version => {
+            // The rules a check would use right now, as a check decides them —
+            // minus the refresh, because `version` reports and does not fetch.
+            hood::scanner::select_rules();
+            scan::traits_repo::prepare_runtime_env();
+            // Loads the rule engines to count them: off the async runtime.
+            let report = tokio::task::spawn_blocking(|| {
+                cleave::version_report("hood", env!("CARGO_PKG_VERSION"))
+            })
+            .await?;
+            println!("{report}");
             return Ok(0);
         }
     };
@@ -463,14 +477,10 @@ async fn setup_proxy(
 /// Build a single-line shell command that reproduces what the user typed.
 /// Used inside the bypass hint so the user can copy/paste a working command.
 fn format_invocation(program: &Program, args: &[OsString]) -> String {
-    let head = match program {
+    let mut out = match program {
         Program::Tool(tool) => tool.name().to_owned(),
         Program::Command(path) => sh_quote(&path.to_string()),
     };
-    if args.is_empty() {
-        return head;
-    }
-    let mut out = head;
     let mut redact_next = false;
     for a in args {
         out.push(' ');
@@ -622,7 +632,8 @@ enum Action {
         force: bool,
     },
     Uninstall,
-    Login,
+    Enrich,
+    Version,
 }
 
 impl TryFrom<Command> for Action {
@@ -672,7 +683,8 @@ impl TryFrom<Command> for Action {
             }
             Command::Install { force } => return Ok(Self::Install { force }),
             Command::Uninstall => return Ok(Self::Uninstall),
-            Command::Login => return Ok(Self::Login),
+            Command::Enrich => return Ok(Self::Enrich),
+            Command::Version => return Ok(Self::Version),
         };
         Ok(Self::Run {
             program: tool.into(),
@@ -726,8 +738,7 @@ fn build_scanner(
     }
     hood::scanner::prepare(model_dir.as_deref());
     Ok(Arc::new(
-        AtomScanner::load_with_status(model_dir, policy, invocation, status)
-            .context("load scan scanner")?,
+        AtomScanner::load(model_dir, policy, invocation, status).context("load scan scanner")?,
     ))
 }
 

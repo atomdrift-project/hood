@@ -43,6 +43,6 @@ Commands that fetch are intercepted; local operations such as `go test`, `cargo 
 
 1. **Local Bloom filters** from Atomdrift Scan. Package URL and content hash must both be known good to skip inspection. Known-bad blocks at once.
 2. **Beamline assessment.** Public packages are assessed by package URL, everything else by SHA-256. Verified results are cached for 30 days.
-3. **Local analysis** for anything still unresolved, including API outages and rate limits. Downloads larger than `HOOD_MAX_SCAN_MB` (default 2 GB) follow the `HOOD_BYPASS` policy.
+3. **Local analysis** for anything still unresolved, including API outages and rate limits. Downloads larger than `HOOD_MAX_SCAN_MB` (default 2 GB) are forwarded unscanned, with a warning that says how to scan them. A response compressed despite hood asking for `identity` follows the `HOOD_BYPASS` policy, because hood cannot inspect what the tool will decode.
 
-`hood login` enables the isotope13 Enriched rules; `ISOTOPE13_TOKEN` overrides the saved token, and a lapsed token is a warning, never a failed install. `HOOD_BEAMLINE_URL` points at an alternate API origin (HTTPS required except on loopback).
+`hood enrich` enables the isotope13 Enriched rules; `ISOTOPE13_TOKEN` overrides the saved token, and a lapsed token is a warning, never a failed install. `hood version` says which rules a check uses, Enriched or open source, and their revision. `HOOD_BEAMLINE_URL` points at an alternate API origin (HTTPS required except on loopback).

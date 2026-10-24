@@ -24,11 +24,12 @@
 //! to `identity` on outbound so we never have to decompress for scanning.
 //!
 //! Response bodies are held until assessment. A body within the configured
-//! in-memory limit is buffered and
-//! scanned in RAM; a larger one spills to a temp file and is scanned from disk
-//! (cleave memory-maps it) up to the configured scan limit; past that it is
-//! handled by the scanner's failure policy. Forwarded large bodies stream back from the spill file,
-//! so a multi-gigabyte transfer never materializes whole in RAM.
+//! in-memory limit is buffered and scanned in RAM; a larger one spills to a
+//! temp file and is scanned from disk (cleave memory-maps it) up to the
+//! configured scan limit. Past that limit nothing more is written, and the
+//! scanner decides the download unscanned ([`Scanner::scan_limit`]). Forwarded
+//! large bodies stream back from the spill file, so a multi-gigabyte transfer
+//! never materializes whole in RAM.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -40,14 +41,14 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName,
-    HeaderValue, LOCATION, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, HeaderMap,
+    HeaderName, HeaderValue, LOCATION, USER_AGENT,
 };
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -64,6 +65,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::ca::{Ca, CaResolver};
 use crate::go_bridge;
+use crate::output::ShownUrl;
 use crate::scanner::{BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
 
 /// The proxy's response body. A [`BoxBody`] so one return type covers three
@@ -79,7 +81,7 @@ fn full_body(bytes: Bytes) -> ProxyBody {
 }
 
 /// Stream an upstream body straight through to the client without buffering —
-/// used for empty responses and explicitly allowed inspection failures.
+/// used only for inspection failures the scanner's policy explicitly allows.
 fn passthrough_body(body: Incoming) -> ProxyBody {
     body.map_err(std::io::Error::other).boxed()
 }
@@ -94,27 +96,9 @@ const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 /// Upper bound on a response body scanned *from disk*. Between
 /// [`MAX_BODY_BYTES_DEFAULT`] and this, the body is streamed to a temp file and
 /// scanned there (cleave memory-maps it, so RAM stays bounded). Past this, the
-/// body is too large to scan and follows the scanner's failure policy.
+/// body is too large to scan and is decided by [`Scanner::scan_limit`].
 /// Tunable via `HOOD_MAX_SCAN_MB`.
 const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Generate an independent 128-bit route token for the loopback Go bridge.
-/// This must not be derived from the public CA certificate: the certificate is
-/// deliberately shared with the child process and is not secret key material.
-fn bridge_token() -> Result<String> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut random = [0_u8; 16];
-    rustls::crypto::ring::default_provider()
-        .secure_random
-        .fill(&mut random)
-        .map_err(|error| anyhow!("generate Go bridge route token: {error:?}"))?;
-    let mut out = String::with_capacity(32);
-    for byte in random {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Ok(out)
-}
 
 /// Read a megabyte-valued env var and convert it to bytes.
 fn mb_env(name: &str) -> Result<Option<u64>> {
@@ -155,7 +139,8 @@ pub struct Config {
     /// Maximum response body buffered in RAM for scanning. Larger responses
     /// spill to disk and are scanned from there.
     max_body_bytes: u64,
-    /// Maximum response body inspected. Larger responses follow failure policy.
+    /// Maximum response body inspected. Larger responses are decided by
+    /// [`Scanner::scan_limit`].
     max_scan_bytes: u64,
     /// Bind address. Forced to a loopback address for safety.
     bind: SocketAddr,
@@ -260,7 +245,6 @@ pub struct Proxy {
 struct Inner {
     scanner: Arc<dyn Scanner>,
     ca: Ca,
-    tls_acceptor: TlsAcceptor,
     /// Built on first use: loading platform roots takes ~130 ms on macOS,
     /// longer than many child commands run. See [`Inner::upstream_tls`].
     upstream_tls: tokio::sync::OnceCell<Arc<ClientConfig>>,
@@ -283,22 +267,23 @@ impl Proxy {
     ///
     /// # Errors
     ///
-    /// Returns an error if certificate generation or TLS setup fails.
+    /// Returns an error if certificate or route-token generation fails.
     pub fn new(scanner: Arc<dyn Scanner>, config: Config) -> Result<Self> {
         let ca = Ca::generate()?;
-        let go_bridge_token = bridge_token()?;
-        let resolver = Arc::new(CaResolver::new(ca.clone()));
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        // An independent 128-bit route token for the loopback Go bridge. It
+        // must not be derived from the CA certificate, which is deliberately
+        // shared with the child process and is not secret key material.
+        let mut random = [0_u8; 16];
+        rustls::crypto::ring::default_provider()
+            .secure_random
+            .fill(&mut random)
+            .map_err(|error| anyhow!("generate Go bridge route token: {error:?}"))?;
+        let go_bridge_token = crate::scanner::hex(&random);
 
         Ok(Self {
             inner: Arc::new(Inner {
                 scanner,
                 ca,
-                tls_acceptor,
                 upstream_tls: tokio::sync::OnceCell::new(),
                 go_bridge_token,
                 config,
@@ -449,10 +434,7 @@ async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: Arc<Notify>)
             acc = listener.accept() => match acc {
                 Ok((stream, peer)) => {
                     tracing::trace!(%peer, "accept");
-                    let proxy = proxy.clone();
-                    tokio::spawn(async move {
-                        serve_inbound_plain(stream, proxy).await;
-                    });
+                    tokio::spawn(serve_inbound_plain(stream, proxy.clone()));
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
@@ -465,9 +447,8 @@ async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: Arc<Notify>)
 /// Serve an inbound plaintext connection. Handles both plain HTTP forwarding
 /// and CONNECT upgrades (which transition into the TLS-MITM path).
 async fn serve_inbound_plain(stream: TcpStream, proxy: Proxy) {
-    let proxy_clone = proxy.clone();
     let svc = service_fn(move |req| {
-        let proxy = proxy_clone.clone();
+        let proxy = proxy.clone();
         async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, None).await) }
     });
     if let Err(e) = server_http1::Builder::new()
@@ -487,10 +468,9 @@ async fn serve_inbound_tunnel<IO>(stream: IO, proxy: Proxy, origin: String)
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let proxy_clone = proxy.clone();
     let origin = Arc::<str>::from(origin);
     let svc = service_fn(move |req| {
-        let proxy = proxy_clone.clone();
+        let proxy = proxy.clone();
         let origin = Arc::clone(&origin);
         async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(origin)).await) }
     });
@@ -513,7 +493,14 @@ impl Proxy {
     ) -> Response<ProxyBody> {
         // CONNECT only ever arrives on the plaintext side.
         if req.method() == Method::CONNECT && tunnel_origin.is_none() {
-            if self.inner.config.zig_clients && is_zig_client(req.headers()) {
+            // Zig's CONNECT never carries caller headers, so it always sends
+            // the default `zig/<version> (std.http)` user agent.
+            let zig = req
+                .headers()
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|agent| agent.starts_with("zig/"));
+            if self.inner.config.zig_clients && zig {
                 // A 4xx, not 5xx: Zig treats a server error as possibly
                 // transient and keeps trying to tunnel.
                 tracing::debug!(authority = ?req.uri().authority(), "refuse Zig CONNECT; expecting absolute-form https");
@@ -571,16 +558,24 @@ impl Proxy {
         let Some(authority) = req.uri().authority().cloned() else {
             return error_response(StatusCode::BAD_REQUEST, "CONNECT requires authority");
         };
-        let authority = authority.to_string();
+        // The leaf's name when the client sends no SNI: the bare host, since
+        // an IPv6 literal is bracketed in an authority but not in a SAN.
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
         let proxy = self.clone();
         // Take the OnUpgrade future before spawning so the spawned task does
         // not need to hold the Request<Incoming> across .await.
         let on_upgrade = hyper::upgrade::on(&mut req);
-        tokio::spawn(run_mitm_after_upgrade(proxy, on_upgrade, authority));
-        Response::builder()
-            .status(StatusCode::OK)
-            .body(full_body(Bytes::new()))
-            .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "build resp"))
+        tokio::spawn(run_mitm_after_upgrade(
+            proxy,
+            on_upgrade,
+            authority.to_string(),
+            host,
+        ));
+        Response::new(full_body(Bytes::new()))
     }
 }
 
@@ -588,6 +583,7 @@ async fn run_mitm_after_upgrade(
     proxy: Proxy,
     on_upgrade: hyper::upgrade::OnUpgrade,
     authority: String,
+    host: String,
 ) {
     let upgraded = match on_upgrade.await {
         Ok(u) => u,
@@ -617,7 +613,12 @@ async fn run_mitm_after_upgrade(
         serve_inbound_tunnel(io, proxy, format!("http://{authority}")).await;
         return;
     }
-    let tls = match proxy.inner.tls_acceptor.accept(io).await {
+    let resolver = CaResolver::new(proxy.inner.ca.clone(), host);
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls = match TlsAcceptor::from(Arc::new(server_config)).accept(io).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(authority, error = %e, "tls accept failed");
@@ -690,16 +691,21 @@ impl Proxy {
             tunnel_origin.as_deref(),
             go_bridge_request || self.inner.config.zig_clients,
         )?;
-        let redirect_base = target_url.clone();
+        // A Go bridge redirect resolves against the request as configured,
+        // credentials included; see `take_url_authorization`.
+        let redirect_base = go_bridge_request.then(|| target_url.clone());
         let allow_purl = permits_public_coordinate(req.method(), req.headers(), &target_url);
         let url_authorization = take_url_authorization(&mut target_url)?;
         // Captured before `req` is consumed by the upstream call: a HEAD request
         // never carries a response body to scan.
         let method = req.method().clone();
-        let host = target_url
-            .host_str()
-            .ok_or_else(|| anyhow!("no host"))?
-            .to_owned();
+        // The bare address to dial and verify: `host_str()` brackets an IPv6
+        // literal, a form neither the socket nor the TLS server name accepts.
+        let host = match target_url.host().ok_or_else(|| anyhow!("no host"))? {
+            url::Host::Domain(domain) => domain.to_owned(),
+            url::Host::Ipv4(ip) => ip.to_string(),
+            url::Host::Ipv6(ip) => ip.to_string(),
+        };
         let is_https = target_url.scheme() == "https";
         let port = target_url.port().unwrap_or(if is_https { 443 } else { 80 });
 
@@ -727,38 +733,48 @@ impl Proxy {
         // Open upstream connection (no pool for v1; one TCP per request).
         let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
         let (mut parts, body) = response.into_parts();
-        if go_bridge_request {
-            rewrite_go_bridge_location(
-                &mut parts.headers,
-                &redirect_base,
-                &self.inner.go_bridge_token,
-            );
+        if let Some(base) = &redirect_base {
+            rewrite_go_bridge_location(&mut parts.headers, base, &self.inner.go_bridge_token);
         }
 
         // A response with no body — a HEAD reply, a 204/304, or an explicit zero
-        // length — has nothing to scan. Forward it as-is (preserving upstream
-        // headers, e.g. a HEAD's echoed Content-Length); handing an empty buffer
-        // to the analyzer just yields a spurious "unexpected end of file" block.
+        // length — has nothing to scan; handing an empty buffer to the analyzer
+        // just yields a spurious "unexpected end of file" block. Its headers are
+        // kept (a HEAD's echoed Content-Length), but its body is sent empty, not
+        // streamed: whatever upstream framing might still deliver is unscanned.
         if method == Method::HEAD
             || parts.status == StatusCode::NO_CONTENT
             || parts.status == StatusCode::NOT_MODIFIED
             || content_length(&parts.headers) == Some(0)
         {
-            tracing::debug!(url = %scan_url, "forward (no body to scan)");
-            return build_response(parts.status, &parts.headers, passthrough_body(body), None);
+            tracing::debug!(url = %ShownUrl(&scan_url), "forward (no body to scan)");
+            drop(body);
+            return build_response(parts.status, parts.headers, full_body(Bytes::new()), None);
         }
 
         let ram_cap = self.inner.config.max_body_bytes;
         let disk_cap = self.inner.config.max_scan_bytes;
 
-        // Apply failure policy before buffering a declared oversized download.
-        if content_length(&parts.headers).is_some_and(|len| len > disk_cap) {
-            return match self.inner.scanner.scan_limit(&scan_url) {
-                Verdict::Block(reason) => Ok(blocked_response(&scan_url, &reason)),
-                Verdict::Allow => {
-                    build_response(parts.status, &parts.headers, passthrough_body(body), None)
-                }
-            };
+        // The request asked for `identity`. A server that encodes anyway would
+        // have hood inspect compressed bytes while a decoding client runs what
+        // they expand to, so an encoded body is one hood cannot inspect.
+        if let Some(encoding) = content_encoding(&parts.headers) {
+            let why = format!("response is {encoding}-encoded despite an identity request");
+            let verdict = self.inner.scanner.uninspectable(&scan_url, &why);
+            return uninspected(verdict, &scan_url, parts.status, parts.headers, || {
+                Ok(passthrough_body(body))
+            });
+        }
+
+        // A declared oversized download is never buffered.
+        if let Some(len) = content_length(&parts.headers).filter(|&len| len > disk_cap) {
+            let verdict = self
+                .inner
+                .scanner
+                .scan_limit(&scan_url, disk_cap, Some(len));
+            return uninspected(verdict, &scan_url, parts.status, parts.headers, || {
+                Ok(passthrough_body(body))
+            });
         }
 
         let buffered = collect_or_spill(body, &scan_url, ram_cap, disk_cap).await?;
@@ -767,7 +783,7 @@ impl Proxy {
             &scan_url,
             allow_purl && parts.status.is_success(),
             parts.status,
-            &parts.headers,
+            parts.headers,
         )
         .await
     }
@@ -778,11 +794,11 @@ impl Proxy {
         scan_url: &str,
         allow_purl: bool,
         status: StatusCode,
-        headers: &HeaderMap,
+        headers: HeaderMap,
     ) -> Result<Response<ProxyBody>> {
         match buffered {
             Buffered::Memory(bytes) if bytes.is_empty() => {
-                tracing::debug!(url = scan_url, "forward (empty body)");
+                tracing::debug!(url = %ShownUrl(scan_url), "forward (empty body)");
                 build_response(status, headers, full_body(bytes), Some(0))
             }
             Buffered::Memory(bytes) => {
@@ -792,7 +808,7 @@ impl Proxy {
                     .scan(ScanRequest {
                         url: scan_url.to_owned(),
                         allow_purl,
-                        body: bytes.to_vec(),
+                        body: bytes.clone(),
                     })
                     .await
                     .context("scanner")?;
@@ -800,7 +816,7 @@ impl Proxy {
                     Verdict::Allow => {
                         let len = bytes.len() as u64;
                         tracing::debug!(
-                            url = scan_url,
+                            url = %ShownUrl(scan_url),
                             status = status.as_u16(),
                             bytes = len,
                             "forward"
@@ -808,54 +824,39 @@ impl Proxy {
                         build_response(status, headers, full_body(bytes), Some(len))
                     }
                     Verdict::Block(reason) => {
-                        tracing::warn!(url = scan_url, verdict = reason.label(), "block");
+                        tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
                         Ok(blocked_response(scan_url, &reason))
                     }
                 }
             }
-            Buffered::Spilled {
-                tmp,
-                path,
-                sha256,
-                len,
-                scan,
-            } => {
-                let verdict = if scan {
-                    self.inner
-                        .scanner
-                        .scan_disk(DiskScanRequest {
-                            url: scan_url.to_owned(),
-                            allow_purl,
-                            path: path.clone(),
-                            sha256,
-                        })
-                        .await
-                        .context("disk scanner")?
-                } else {
-                    self.inner.scanner.scan_limit(scan_url)
-                };
+            Buffered::Spilled { tmp, sha256, len } => {
+                let verdict = self
+                    .inner
+                    .scanner
+                    .scan_disk(DiskScanRequest {
+                        url: scan_url.to_owned(),
+                        allow_purl,
+                        path: tmp.path().to_path_buf(),
+                        sha256,
+                    })
+                    .await
+                    .context("disk scanner")?;
                 match verdict {
                     Verdict::Allow => {
-                        let file = tokio::fs::File::open(&path)
-                            .await
-                            .context("reopen spill file for forwarding")?;
                         tracing::debug!(
-                            url = scan_url,
+                            url = %ShownUrl(scan_url),
                             status = status.as_u16(),
                             bytes = len,
                             "forward (from disk)"
                         );
-                        // Stream the open, unlinked spill file; the descriptor
-                        // keeps it alive until the response body is consumed.
-                        let body =
-                            StreamBody::new(ReaderStream::new(file).map_ok(Frame::data)).boxed();
+                        let body = BodyExt::boxed(StreamBody::new(spill_stream(&tmp)?));
                         let response = build_response(status, headers, body, Some(len));
                         drop(tmp);
                         response
                     }
                     Verdict::Block(reason) => {
                         tracing::warn!(
-                            url = scan_url,
+                            url = %ShownUrl(scan_url),
                             bytes = len,
                             verdict = reason.label(),
                             "block"
@@ -864,17 +865,76 @@ impl Proxy {
                     }
                 }
             }
+            Buffered::Oversized {
+                tmp,
+                overflow,
+                rest,
+            } => {
+                let limit = self.inner.config.max_scan_bytes;
+                let verdict = self.inner.scanner.scan_limit(scan_url, limit, None);
+                uninspected(verdict, scan_url, status, headers, || {
+                    // What was spilled, then the frame that crossed the limit,
+                    // then the rest of the upstream body, unread by hood.
+                    let body = spill_stream(&tmp)?
+                        .chain(futures_util::stream::iter([Ok(Frame::data(overflow))]))
+                        .chain(TryStreamExt::map_err(
+                            BodyStream::new(rest),
+                            std::io::Error::other,
+                        ));
+                    Ok(BodyExt::boxed(StreamBody::new(body)))
+                })
+            }
         }
     }
 }
 
-/// True for Zig's `std.http` client. Its CONNECT never carries caller headers,
-/// so it always sends the default `zig/<version> (std.http)` user agent.
-fn is_zig_client(headers: &HeaderMap) -> bool {
-    headers
-        .get(USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|agent| agent.starts_with("zig/"))
+/// Answer for a body hood does not scan, as the scanner decided: withheld, or
+/// streamed through as `body` builds it.
+fn uninspected(
+    verdict: Verdict,
+    scan_url: &str,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: impl FnOnce() -> Result<ProxyBody>,
+) -> Result<Response<ProxyBody>> {
+    match verdict {
+        Verdict::Block(reason) => {
+            tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
+            Ok(blocked_response(scan_url, &reason))
+        }
+        Verdict::Allow => {
+            tracing::debug!(url = %ShownUrl(scan_url), status = status.as_u16(), "forward (unscanned)");
+            build_response(status, headers, body()?, None)
+        }
+    }
+}
+
+/// Stream a spill file back out. It is reopened through the temp file's own
+/// handle, which refuses a file swapped in at its path since it was written;
+/// the open descriptor keeps it alive after the path is unlinked.
+fn spill_stream(
+    tmp: &tempfile::NamedTempFile,
+) -> Result<impl futures_util::Stream<Item = std::io::Result<Frame<Bytes>>> + use<>> {
+    let file = tmp.reopen().context("reopen spill file for forwarding")?;
+    Ok(ReaderStream::new(tokio::fs::File::from_std(file)).map_ok(Frame::data))
+}
+
+/// The codings a response's `Content-Encoding` applies beyond `identity`, if
+/// any. A value that is not ASCII is one hood cannot read, so it counts too.
+fn content_encoding(headers: &HeaderMap) -> Option<String> {
+    let mut codings = Vec::new();
+    for value in headers.get_all(CONTENT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            return Some("unreadably".to_owned());
+        };
+        codings.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")),
+        );
+    }
+    (!codings.is_empty()).then(|| codings.join("+"))
 }
 
 /// Build the upstream URL and Host header value for a request.
@@ -912,8 +972,8 @@ fn resolve_target(
     Ok((url, host_header))
 }
 
-/// Render an HTTP Host value, retaining the brackets required around IPv6
-/// literals. `Url::host_str()` intentionally omits those brackets.
+/// Render an HTTP Host value: the host as a URL writes it, IPv6 literals in
+/// brackets, plus any explicit port.
 fn authority_header(url: &url::Url) -> Result<String> {
     let host = url
         .host()
@@ -932,7 +992,7 @@ async fn upstream_request(
 ) -> Result<Response<Incoming>> {
     let tcp = TcpStream::connect((host, port))
         .await
-        .with_context(|| format!("connect {host}:{port}"))?;
+        .with_context(|| format!("connect {host} port {port}"))?;
     // TCP_NODELAY is advisory — some platforms reject; not fatal.
     drop(tcp.set_nodelay(true));
 
@@ -963,8 +1023,7 @@ where
             tracing::trace!(error = %e, "upstream connection driver");
         }
     });
-    let resp = sender.send_request(req).await.context("send_request")?;
-    Ok(resp)
+    sender.send_request(req).await.context("send_request")
 }
 
 /// Capture provenance before URL credentials are moved into headers.
@@ -980,34 +1039,45 @@ fn permits_public_coordinate(method: &Method, headers: &HeaderMap, url: &url::Ur
 enum Buffered {
     /// Fit within the in-RAM cap — buffered whole and scanned in memory.
     Memory(Bytes),
-    /// Spilled to a temporary file (dropping `tmp` unlinks it). `scan` is true
-    /// when the payload is within the disk-scan cap; false when it must follow
-    /// the scanner's inspection-failure policy.
+    /// Fit within the disk-scan cap — spilled whole to a temporary file
+    /// (dropping `tmp` unlinks it) and scanned from there.
     Spilled {
         tmp: tempfile::NamedTempFile,
-        path: std::path::PathBuf,
         sha256: [u8; 32],
         len: u64,
-        scan: bool,
+    },
+    /// Crossed the disk-scan cap. Reading stopped there, so a hostile server
+    /// cannot fill the disk: `tmp` holds what came before `overflow`, the frame
+    /// that crossed, and `rest` is the upstream body not yet read. The scanner
+    /// decides it unscanned ([`Scanner::scan_limit`]).
+    Oversized {
+        tmp: tempfile::NamedTempFile,
+        overflow: Bytes,
+        rest: Incoming,
     },
 }
 
+/// The next data frame of an upstream body, skipping trailers.
+async fn next_data(body: &mut Incoming) -> Result<Option<Bytes>> {
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.context("read upstream frame")?.into_data() {
+            return Ok(Some(data));
+        }
+    }
+    Ok(None)
+}
+
 /// Read an upstream body, buffering it in RAM up to `ram_cap`, then spilling the
-/// remainder to a temp file (up to and past `disk_cap`). The SHA-256 is computed
-/// while streaming so the disk path never re-reads the payload just to hash it.
+/// remainder to a temp file up to `disk_cap`. The SHA-256 is computed while
+/// streaming so the disk path never re-reads the payload just to hash it.
 async fn collect_or_spill(
-    body: Incoming,
+    mut body: Incoming,
     url: &str,
     ram_cap: u64,
     disk_cap: u64,
 ) -> Result<Buffered> {
-    let mut body = body;
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.context("read upstream frame")?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
+    while let Some(data) = next_data(&mut body).await? {
         if buf.len() as u64 + data.len() as u64 > ram_cap {
             // Cross into spill mode, carrying the RAM prefix and the frame that
             // tipped us over the cap.
@@ -1018,7 +1088,8 @@ async fn collect_or_spill(
     Ok(Buffered::Memory(Bytes::from(buf)))
 }
 
-/// Drain the rest of an oversized body to a temp file, hashing as we go.
+/// Drain the rest of a body too large for RAM to a temp file, hashing as we
+/// go, and stop at `disk_cap`.
 async fn spill_to_disk(
     mut body: Incoming,
     url: &str,
@@ -1031,36 +1102,35 @@ async fn spill_to_disk(
         .suffix(&temp_suffix(url))
         .tempfile()
         .context("create spill file")?;
-    let path = tmp.path().to_path_buf();
     let mut file = tokio::fs::File::from_std(tmp.reopen().context("reopen spill file")?);
 
     let mut hasher = Sha256::new();
-    let mut len: u64 = 0;
-    for chunk in [prefix.as_slice(), overflow.as_ref()] {
-        hasher.update(chunk);
-        file.write_all(chunk).await.context("write spill file")?;
+    hasher.update(&prefix);
+    file.write_all(&prefix).await.context("write spill file")?;
+    let mut len = prefix.len() as u64;
+    let mut chunk = overflow;
+    loop {
+        if len + chunk.len() as u64 > disk_cap {
+            file.flush().await.context("flush spill file")?;
+            return Ok(Buffered::Oversized {
+                tmp,
+                overflow: chunk,
+                rest: body,
+            });
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.context("write spill file")?;
         len += chunk.len() as u64;
-    }
-    while let Some(frame) = body.frame().await {
-        let frame = frame.context("read upstream frame")?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        hasher.update(&data);
-        file.write_all(&data).await.context("write spill file")?;
-        len += data.len() as u64;
+        match next_data(&mut body).await? {
+            Some(next) => chunk = next,
+            None => break,
+        }
     }
     file.flush().await.context("flush spill file")?;
     drop(file); // close the write handle before the file is read back for scanning
 
     let sha256: [u8; 32] = hasher.finalize().into();
-    Ok(Buffered::Spilled {
-        tmp,
-        path,
-        sha256,
-        len,
-        scan: len <= disk_cap,
-    })
+    Ok(Buffered::Spilled { tmp, sha256, len })
 }
 
 /// Derive a filename suffix from a URL so a spill file carries the payload's real
@@ -1092,30 +1162,24 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Build a forwarded response: copy the upstream status and headers minus
-/// hop-by-hop, and — when the body length is known exactly (a buffered or
-/// disk-forwarded body) — set a fresh `Content-Length`, overriding any inherited
-/// one. Pass `content_length: None` to stream through with the upstream framing.
+/// Build a forwarded response from the upstream status and headers, minus
+/// hop-by-hop ones. When the body length is known exactly (a buffered or
+/// disk-forwarded body) it replaces any inherited `Content-Length`; `None`
+/// streams through with the upstream framing.
 fn build_response(
     status: StatusCode,
-    headers: &hyper::HeaderMap,
+    mut headers: HeaderMap,
     body: ProxyBody,
     content_length: Option<u64>,
 ) -> Result<Response<ProxyBody>> {
-    let mut builder = Response::builder().status(status);
-    let mut headers = headers.clone();
     strip_hop_by_hop(&mut headers).context("sanitize upstream response headers")?;
-    for (k, v) in &headers {
-        // When we set our own length, drop the inherited one to avoid duplicates.
-        if content_length.is_some() && *k == CONTENT_LENGTH {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
     if let Some(len) = content_length {
-        builder = builder.header(CONTENT_LENGTH, len);
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
     }
-    builder.body(body).context("build response")
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    Ok(response)
 }
 
 /// Convert credentials embedded in a configured GOPROXY/GOSUMDB URL into an
@@ -1199,9 +1263,8 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) -> Result<()> {
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    HOP_BY_HOP
-        .iter()
-        .any(|h| name.as_str().eq_ignore_ascii_case(h))
+    // Header names are stored lowercase, as the list is.
+    HOP_BY_HOP.contains(&name.as_str())
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
@@ -1228,9 +1291,8 @@ fn blocked_response(url: &str, reason: &BlockReason) -> Response<ProxyBody> {
         "hood blocked this response.\nurl: {url}\nverdict: {}\n",
         reason.label(),
     );
-    let status = StatusCode::from_u16(451).unwrap_or(StatusCode::FORBIDDEN);
     Response::builder()
-        .status(status)
+        .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)
         .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header("x-hood-block-reason", reason.label())
         .body(full_body(Bytes::from(body)))
@@ -1313,6 +1375,22 @@ mod tests {
         assert!(is_hop_by_hop(&HeaderName::from_static("transfer-encoding")));
         assert!(is_hop_by_hop(&HeaderName::from_static("upgrade")));
         assert!(!is_hop_by_hop(&HeaderName::from_static("content-type")));
+    }
+
+    #[test]
+    fn only_identity_content_encoding_is_inspectable() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(content_encoding(&headers), None);
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("Identity"));
+        assert_eq!(content_encoding(&headers), None);
+        headers.append(CONTENT_ENCODING, HeaderValue::from_static("gzip, br"));
+        assert_eq!(content_encoding(&headers).as_deref(), Some("gzip+br"));
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_bytes(b"\xffzip").unwrap(),
+        );
+        assert!(content_encoding(&opaque).is_some());
     }
 
     #[test]

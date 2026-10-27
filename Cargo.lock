@@ -323,7 +323,7 @@ dependencies = [
  "colored",
  "ctrlc",
  "dashmap",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "fletch",
  "form_urlencoded",
@@ -950,7 +950,7 @@ dependencies = [
  "ctrlc",
  "cu-bincode",
  "des",
- "dirs",
+ "dirs 6.0.0",
  "dmgwiz",
  "encoding_rs",
  "filefacts",
@@ -1678,6 +1678,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1972,7 +1981,7 @@ dependencies = [
  "cms",
  "crc32fast",
  "der 0.7.10",
- "dirs",
+ "dirs 6.0.0",
  "flate2",
  "gimli 0.32.3",
  "goblin",
@@ -2087,7 +2096,7 @@ source = "git+https://github.com/atomdrift-project/fletch.git#4cdf6209b6038043c3
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "flate2",
  "hex",
@@ -2514,7 +2523,7 @@ dependencies = [
  "bytes",
  "clap",
  "cleave",
- "dirs",
+ "dirs 7.0.0",
  "flate2",
  "fletch",
  "futures-util",
@@ -2541,7 +2550,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "zip 8.6.0",
+ "zip 9.1.0",
 ]
 
 [[package]]
@@ -5624,7 +5633,7 @@ dependencies = [
  "clap",
  "data-encoding",
  "des",
- "dirs",
+ "dirs 6.0.0",
  "flate2",
  "goblin",
  "iced-x86",
@@ -7735,7 +7744,7 @@ dependencies = [
  "yara-x-macros",
  "yara-x-parser",
  "yara-x-proto",
- "zip 9.1.2",
+ "zip 9.1.0",
 ]
 
 [[package]]
@@ -7966,9 +7975,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.2"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
+checksum = "2886b00003a72c4ccee3f42cfc34908d33b2508a74d827dc2a4244706475c704"
 dependencies = [
  "crc32fast",
  "flate2",

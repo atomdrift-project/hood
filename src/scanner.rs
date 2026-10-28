@@ -347,8 +347,10 @@ impl AtomScanner {
                         scan::model::DEFAULT_SEVERITY_LEVEL == HOOD_SCAN_LEVEL,
                         "scan default severity changed from L25"
                     );
+                    // `load` classifies at the default level, which the check
+                    // above pins to hood's own.
                     Analyzer::load(model_dir)
-                        .map(|analyzer| Arc::new(analyzer.with_level(Some(HOOD_SCAN_LEVEL))))
+                        .map(Arc::new)
                         .context("load scan analyzer")
                 })
                 .await
@@ -625,7 +627,9 @@ fn refresh_bloom() {
     {
         return;
     }
-    if let Err(error) = scan::bloom_update::update(&scan::bloom_repo::install_dir(), false, true) {
+    if let Err(error) = scan::bloom_repo::install_dir()
+        .and_then(|dir| scan::bloom_update::update(&dir, false, true))
+    {
         tracing::warn!(%error, "Bloom refresh failed; using installed bundle if available");
     }
 }

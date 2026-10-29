@@ -310,7 +310,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "2.13.0"
-source = "git+https://github.com/atomdrift-project/scan.git#f5bc7acaaa94805d0d501ee120acdf3438e5c9a5"
+source = "git+https://github.com/atomdrift-project/scan.git#e40948fd2526b8a14ecd9da1f5bc9f6e776d9ac0"
 dependencies = [
  "anyhow",
  "axum",
@@ -927,7 +927,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 [[package]]
 name = "cleave"
 version = "3.0.0-beta.2"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -1017,7 +1017,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3314,7 +3314,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 
 [[package]]
 name = "lzxd"
@@ -3331,7 +3331,7 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 [[package]]
 name = "malecule"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 dependencies = [
  "rustc-hash 2.1.3",
  "serde",
@@ -4327,7 +4327,7 @@ dependencies = [
 [[package]]
 name = "pyinstx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 dependencies = [
  "flate2",
  "memchr",
@@ -5103,7 +5103,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "scpt"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -5752,7 +5752,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 
 [[package]]
 name = "tap"
@@ -7649,7 +7649,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#d076e47bfbbdb24229e2030031db3a6ff4879074"
+source = "git+https://github.com/atomdrift-project/cleave.git#0cae638f63303488b20330696ea94496883aa475"
 
 [[package]]
 name = "yara-x"

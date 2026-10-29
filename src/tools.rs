@@ -361,11 +361,12 @@ pub enum Dispatch {
     Passthrough(Vec<OsString>),
 }
 
-/// Classify a tool invocation: should it go through the proxy or pass straight
-/// through? `enable_scripts` only affects npm/pnpm/yarn/bun (controls whether
-/// `--ignore-scripts` is injected).
+/// Classify a tool invocation: through the proxy, or straight through?
+///
+/// npm, pnpm, yarn and bun installs also get `--ignore-scripts`, unless the
+/// user already chose: in `args`, or in their environment (`scripts_chosen`).
 #[must_use]
-pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispatch {
+pub fn dispatch(tool: Tool, args: Vec<OsString>, scripts_chosen: bool) -> Dispatch {
     // Downloaders, package-executable runners, and Rush script/custom-command
     // runners can fetch without a stable leading verb. Keep them inside the
     // proxy environment for every invocation; local-only runs pay only proxy
@@ -411,7 +412,7 @@ pub fn dispatch(tool: Tool, args: Vec<OsString>, enable_scripts: bool) -> Dispat
     let runs_install_scripts = matches!(tool, Tool::Npm | Tool::Pnpm | Tool::Yarn | Tool::Bun)
         && leading_subcommand.is_some_and(|sub| sub != "x" && is_fetching_subcommand(tool, &sub));
     let final_args = if runs_install_scripts {
-        maybe_add_ignore_scripts(args, enable_scripts)
+        maybe_add_ignore_scripts(args, scripts_chosen)
     } else {
         args
     };
@@ -639,11 +640,18 @@ fn short_flag_group(arg: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn maybe_add_ignore_scripts(mut args: Vec<OsString>, enable_scripts: bool) -> Vec<OsString> {
-    let already = args
-        .iter()
-        .any(|a| a == "--ignore-scripts" || a == "--ignore-scripts=true");
-    if !enable_scripts && !already {
+/// Add `--ignore-scripts` unless the user already chose either way, in the
+/// environment or with any spelling of the flag (`--ignore-scripts=false`,
+/// `--no-ignore-scripts`).
+fn maybe_add_ignore_scripts(mut args: Vec<OsString>, scripts_chosen: bool) -> Vec<OsString> {
+    let chosen_in_args = args.iter().any(|a| {
+        a.to_str().is_some_and(|a| {
+            a == "--ignore-scripts"
+                || a == "--no-ignore-scripts"
+                || a.starts_with("--ignore-scripts=")
+        })
+    });
+    if !scripts_chosen && !chosen_in_args {
         args.push(OsString::from("--ignore-scripts"));
     }
     args
@@ -1349,10 +1357,21 @@ mod tests {
     }
 
     #[test]
-    fn npm_install_respects_enable_scripts() {
+    fn npm_install_respects_a_choice_made_in_the_environment() {
         let d = dispatch(Tool::Npm, vec![os("install"), os("lodash")], true);
         let args = intercept_args(d);
         assert!(!args.contains(&os("--ignore-scripts")));
+    }
+
+    #[test]
+    fn npm_install_respects_a_choice_made_in_args() {
+        for choice in ["--ignore-scripts=false", "--no-ignore-scripts"] {
+            let args = vec![os("install"), os("lodash"), os(choice)];
+            assert_eq!(
+                intercept_args(dispatch(Tool::Npm, args.clone(), false)),
+                args
+            );
+        }
     }
 
     #[test]

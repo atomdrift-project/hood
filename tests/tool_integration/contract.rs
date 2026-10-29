@@ -125,9 +125,7 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
             .beamline
             .set(Beamline::Assesses, Some(sha256_hex(TOOL_MARKER.as_bytes())));
         let blocked = invocation(name, args, "known-bad", &url)?;
-        let (output, _) = harness
-            .hood(name, &blocked, &harness.no_models, None)
-            .await?;
+        let (output, _) = harness.hood(name, &blocked, &harness.no_models).await?;
         assert_blocked(name, &output, &url, "hostile");
         assert!(
             !blocked.cwd.join("out").is_file(),
@@ -137,9 +135,7 @@ async fn every_supported_command_is_intercepted_with_stand_ins() -> Result<()> {
         harness.beamline.set(Beamline::Assesses, None);
         let allowed = invocation(name, args, "known-good", &url)?;
         let dir = allowed.cwd.clone();
-        let (output, _) = harness
-            .hood(name, &allowed, &harness.no_models, None)
-            .await?;
+        let (output, _) = harness.hood(name, &allowed, &harness.no_models).await?;
         assert_success(name, &output);
         assert_forwarded(name, &output, &url);
         assert_eq!(fs::read_to_string(dir.join("out"))?, TOOL_MARKER, "{name}");

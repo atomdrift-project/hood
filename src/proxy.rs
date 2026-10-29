@@ -88,37 +88,15 @@ fn passthrough_body(body: Incoming) -> ProxyBody {
 
 /// Upper bound on a response body buffered *in memory* for scanning. Larger
 /// responses spill to a temp file and are scanned from disk instead (up to
-/// [`MAX_SCAN_BYTES_DEFAULT`]). Tunable via `HOOD_MAX_BODY_MB`; the default is
-/// generous enough for npm tarballs and binary installers, low enough that a
-/// single in-RAM response can't OOM the host.
+/// [`MAX_SCAN_BYTES_DEFAULT`]). Generous enough for npm tarballs and binary
+/// installers, low enough that a single in-RAM response can't OOM the host.
 const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 
 /// Upper bound on a response body scanned *from disk*. Between
 /// [`MAX_BODY_BYTES_DEFAULT`] and this, the body is streamed to a temp file and
 /// scanned there (cleave memory-maps it, so RAM stays bounded). Past this, the
 /// body is too large to scan and is decided by [`Scanner::scan_limit`].
-/// Tunable via `HOOD_MAX_SCAN_MB`.
 const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Read a megabyte-valued env var and convert it to bytes.
-fn mb_env(name: &str) -> Result<Option<u64>> {
-    let Some(value) = std::env::var_os(name) else {
-        return Ok(None);
-    };
-    let value = value
-        .to_str()
-        .ok_or_else(|| anyhow!("{name} is not valid UTF-8"))?;
-    Ok(Some(megabytes_to_bytes(name, value)?))
-}
-
-fn megabytes_to_bytes(name: &str, value: &str) -> Result<u64> {
-    let megabytes = value
-        .parse::<u64>()
-        .with_context(|| format!("parse {name}={value:?} as megabytes"))?;
-    megabytes
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| anyhow!("{name}={value:?} exceeds the supported byte range"))
-}
 
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
 const HOP_BY_HOP: &[&str] = &[
@@ -165,17 +143,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Build configuration using Hood's environment overrides.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configured limits are zero or out of order.
-    pub fn from_env() -> Result<Self> {
-        let max_body_bytes = mb_env("HOOD_MAX_BODY_MB")?.unwrap_or(MAX_BODY_BYTES_DEFAULT);
-        let max_scan_bytes = mb_env("HOOD_MAX_SCAN_MB")?.unwrap_or(MAX_SCAN_BYTES_DEFAULT);
-        Self::default().with_scan_limits(max_body_bytes, max_scan_bytes)
-    }
-
     /// Set the in-memory and total scan limits.
     ///
     /// # Errors
@@ -1338,12 +1305,6 @@ mod tests {
     fn rejects_invalid_scan_limits() {
         assert!(Config::default().with_scan_limits(0, 1).is_err());
         assert!(Config::default().with_scan_limits(2, 1).is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_environment_limits() {
-        assert!(megabytes_to_bytes("LIMIT", "not-a-number").is_err());
-        assert!(megabytes_to_bytes("LIMIT", &u64::MAX.to_string()).is_err());
     }
 
     #[test]

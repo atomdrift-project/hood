@@ -3,14 +3,13 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AllowAll, AtomScanner, ScanPolicy, ScanStats, Scanner};
+use hood::scanner::{AtomScanner, ScanPolicy, ScanStats, Scanner};
 use hood::tools::{
     Dispatch, PreparedChildEnv, Program, Tool, dispatch, prepare_child_env, resolve_real_binary,
     run_child, run_passthrough,
@@ -21,18 +20,6 @@ use hood::tools::{
 #[command(version)]
 #[command(about = "Scan HTTP(S) payloads before they reach package managers and installers")]
 struct Cli {
-    /// Override scan model directory (default: auto-resolve via atomscan models repo).
-    #[arg(long)]
-    model_dir: Option<PathBuf>,
-
-    /// Verbose logging (debug level for hood; info for everything else).
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// For npm/pnpm: allow lifecycle scripts (off by default — pnpm-style).
-    #[arg(long)]
-    enable_scripts: bool,
-
     #[command(subcommand)]
     command: Command,
 }
@@ -280,9 +267,9 @@ fn main() {
 /// files all drop before this returns.
 fn hood_main() -> u8 {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let mut cli = Cli::parse_from(rewrite_argv_for_shim(argv));
-    cli.verbose = resolve_verbose(cli.verbose);
-    init_logging(cli.verbose);
+    let cli = Cli::parse_from(rewrite_argv_for_shim(argv));
+    let verbose = verbose_from_env();
+    init_logging(verbose);
 
     // Install Ring before rustls needs default crypto. An existing process-wide
     // provider is already usable.
@@ -304,7 +291,7 @@ fn hood_main() -> u8 {
         }
     };
 
-    match rt.block_on(run(cli)) {
+    match rt.block_on(run(cli.command, verbose)) {
         Ok(code) => u8::try_from(code).unwrap_or(1),
         Err(e) => {
             eprintln!("hood: {e:#}");
@@ -333,13 +320,7 @@ fn rewrite_argv_for_shim(argv: Vec<OsString>) -> Vec<OsString> {
     synth
 }
 
-async fn run(cli: Cli) -> Result<i32> {
-    let Cli {
-        model_dir,
-        verbose,
-        enable_scripts,
-        command,
-    } = cli;
+async fn run(command: Command, verbose: bool) -> Result<i32> {
     let (program, initial_args) = match Action::try_from(command)? {
         Action::Run { program, argv } => (program, argv),
         Action::Install { force } => return hood::install::install(force),
@@ -369,7 +350,7 @@ async fn run(cli: Cli) -> Result<i32> {
     // Pass-through: skip proxy startup entirely for `npm test`, `cargo build`,
     // `go run`, etc. Hot path; no model load, no listener, no env injection.
     let dispatched = match program.tool() {
-        Some(tool) => dispatch(tool, initial_args, enable_scripts),
+        Some(tool) => dispatch(tool, initial_args, scripts_chosen_in_env()),
         None => Dispatch::Intercept(initial_args),
     };
     let child_args = match dispatched {
@@ -403,15 +384,8 @@ async fn run(cli: Cli) -> Result<i32> {
 
     // Zig cannot trust hood's CA on any platform; see `Tool::Zig`.
     let zig_clients = program.tool() == Some(Tool::Zig);
-    let setup_result = setup_proxy(
-        model_dir,
-        policy,
-        invocation.clone(),
-        go_bridge,
-        zig_clients,
-        verbose,
-    )
-    .await;
+    let setup_result =
+        setup_proxy(policy, invocation.clone(), go_bridge, zig_clients, verbose).await;
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
         Err(e) if matches!(policy, ScanPolicy::Bypass) => {
@@ -439,7 +413,6 @@ struct ProxySetup {
 /// Build the scanner, construct the proxy, spawn it, and prepare the child
 /// env. Returns one struct holding everything the run loop needs.
 async fn setup_proxy(
-    model_dir: Option<PathBuf>,
     policy: ScanPolicy,
     invocation: String,
     go_bridge: Option<GoBridge>,
@@ -449,13 +422,11 @@ async fn setup_proxy(
     let stats = show_passes.then(|| Arc::new(ScanStats::default()));
     let scanner = {
         let stats = stats.clone();
-        tokio::task::spawn_blocking(move || build_scanner(model_dir, policy, invocation, stats))
+        tokio::task::spawn_blocking(move || build_scanner(policy, invocation, stats))
             .await
             .context("build scanner task")??
     };
-    let config = Config::from_env()
-        .context("read proxy configuration")?
-        .with_zig_clients(zig_clients);
+    let config = Config::default().with_zig_clients(zig_clients);
     let proxy = Proxy::new(scanner, config).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let go_bridge_token = proxy.go_bridge_token().to_owned();
@@ -721,39 +692,40 @@ fn resolve_policy() -> ScanPolicy {
 }
 
 /// Build the live scanner, first fetching anything it lacks (blocking; see
-/// [`hood::scanner::prepare`]). `HOOD_NO_SCAN=1` is a debug-only escape hatch
-/// (loud WARN, transparent forwarding) deliberately kept off the CLI surface.
+/// [`hood::scanner::prepare`]).
 fn build_scanner(
-    model_dir: Option<PathBuf>,
     policy: ScanPolicy,
     invocation: String,
     status: Option<Arc<ScanStats>>,
 ) -> Result<Arc<dyn Scanner>> {
-    if let Some(value) = std::env::var_os("HOOD_NO_SCAN") {
-        if value == "1" {
-            tracing::warn!("HOOD_NO_SCAN=1 — payloads forwarded without inspection");
-            return Ok(Arc::new(AllowAll));
-        }
-        tracing::warn!("invalid HOOD_NO_SCAN value ignored; scanning remains enabled");
-    }
-    hood::scanner::prepare(model_dir.as_deref());
+    hood::scanner::prepare();
     Ok(Arc::new(
-        AtomScanner::load(model_dir, policy, invocation, status).context("load scan scanner")?,
+        AtomScanner::load(policy, invocation, status).context("load scan scanner")?,
     ))
 }
 
-/// `HOOD_VERBOSE=1` is the environment equivalent of `-v/--verbose`. Invalid
-/// values fail closed to normal verbosity rather than treating every non-empty
-/// string (including `0`) as an opt-in.
-fn resolve_verbose(cli_verbose: bool) -> bool {
+/// `HOOD_VERBOSE=1` prints a verdict per download and a summary. Any value but
+/// `0` or `1` is reported and read as off.
+fn verbose_from_env() -> bool {
     match std::env::var_os("HOOD_VERBOSE") {
-        None => cli_verbose,
         Some(value) if value == "1" => true,
-        Some(_) => {
-            eprintln!("hood: invalid HOOD_VERBOSE value ignored (expected 1)");
-            cli_verbose
+        Some(value) if value != "0" => {
+            eprintln!("hood: invalid HOOD_VERBOSE value ignored (expected 0 or 1)");
+            false
         }
+        _ => false,
     }
+}
+
+/// Whether the user already chose, in their own environment, whether package
+/// lifecycle scripts run. hood then leaves `--ignore-scripts` to them; npm reads
+/// its `npm_config_*` variables case-insensitively.
+fn scripts_chosen_in_env() -> bool {
+    std::env::vars_os().any(|(name, _)| {
+        name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case("npm_config_ignore_scripts") || name == "YARN_ENABLE_SCRIPTS"
+        })
+    })
 }
 
 fn init_logging(verbose: bool) {
@@ -799,24 +771,20 @@ mod tests {
     #[test]
     fn tool_flags_reach_the_tool_not_hood() {
         // A shim rewrites `npm -v` to `hood npm -v`; npm must receive it.
-        for flag in [
-            "-v",
-            "--verbose",
-            "--help",
-            "-h",
-            "--enable-scripts",
-            "--model-dir",
-        ] {
+        for flag in ["-v", "--verbose", "--help", "-h", "--version", "-V"] {
             let cli = Cli::try_parse_from(["hood", "npm", flag, "x"]).unwrap();
-            assert!(!cli.verbose && !cli.enable_scripts && cli.model_dir.is_none());
             match cli.command {
                 Command::Npm { args } => assert_eq!(args, vec![flag, "x"]),
                 other => panic!("unexpected command: {other:?}"),
             }
         }
-        let cli =
-            Cli::try_parse_from(["hood", "-v", "--enable-scripts", "npm", "install"]).unwrap();
-        assert!(cli.verbose && cli.enable_scripts);
+    }
+
+    #[test]
+    fn hood_takes_no_flags_before_the_tool() {
+        for flag in ["-v", "--verbose", "--enable-scripts", "--model-dir"] {
+            assert!(Cli::try_parse_from(["hood", flag, "npm", "install"]).is_err());
+        }
     }
 
     #[test]

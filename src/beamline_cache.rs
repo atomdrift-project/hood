@@ -14,14 +14,13 @@ use sha2::{Digest, Sha256};
 
 use crate::beamline::Assessment;
 
-const DEFAULT_TTL: Duration = Duration::from_hours(30 * 24);
+const TTL: Duration = Duration::from_hours(30 * 24);
 const UNMEASURED_TTL: Duration = Duration::from_secs(60);
 const MAX_ENTRY_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct Cache {
     directory: PathBuf,
-    ttl: Duration,
     cleanup: Once,
 }
 
@@ -32,24 +31,7 @@ struct Entry {
 }
 
 impl Cache {
-    pub(crate) fn from_env(base: &str, token: Option<&str>) -> Result<Option<Self>> {
-        let ttl = match std::env::var("HOOD_BEAMLINE_CACHE_TTL_SECS") {
-            Ok(value) => Duration::from_secs(
-                value
-                    .parse()
-                    .context("invalid HOOD_BEAMLINE_CACHE_TTL_SECS")?,
-            ),
-            Err(std::env::VarError::NotPresent) => DEFAULT_TTL,
-            Err(error) => return Err(error).context("read HOOD_BEAMLINE_CACHE_TTL_SECS"),
-        };
-        if ttl.is_zero() {
-            return Ok(None);
-        }
-        Ok(dirs::cache_dir()
-            .map(|root| Self::new(root.join("atomdrift/hood/beamline/v1"), ttl, base, token)))
-    }
-
-    pub(crate) fn new(mut root: PathBuf, ttl: Duration, base: &str, token: Option<&str>) -> Self {
+    pub(crate) fn new(mut root: PathBuf, base: &str, token: Option<&str>) -> Self {
         // Keep different endpoints, credentials, and assessment policies isolated.
         // Neither credentials nor PURLs appear in paths or stored cache metadata.
         let scope = serde_json::json!([
@@ -64,7 +46,6 @@ impl Cache {
         root.push(namespace);
         Self {
             directory: root,
-            ttl,
             cleanup: Once::new(),
         }
     }
@@ -96,7 +77,7 @@ impl Cache {
             return None;
         }
         let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-        if !self.fresh(&entry, SystemTime::now()) || entry.assessment.classification(sha).is_none()
+        if !Self::fresh(&entry, SystemTime::now()) || entry.assessment.classification(sha).is_none()
         {
             // Leave removal to pruning: another process may have replaced this entry.
             return None;
@@ -104,16 +85,16 @@ impl Cache {
         Some(entry.assessment)
     }
 
-    fn fresh(&self, entry: &Entry, now: SystemTime) -> bool {
+    fn fresh(entry: &Entry, now: SystemTime) -> bool {
         let ttl = if entry
             .assessment
             .engine_version
             .as_ref()
             .is_some_and(|version| !version.is_empty())
         {
-            self.ttl
+            TTL
         } else {
-            self.ttl.min(UNMEASURED_TTL)
+            UNMEASURED_TTL
         };
         now.duration_since(UNIX_EPOCH)
             .ok()
@@ -122,7 +103,7 @@ impl Cache {
     }
 
     pub(crate) fn put(&self, sha: &str, assessment: Assessment) -> Result<()> {
-        if self.ttl.is_zero() || assessment.classification(sha).is_none() {
+        if assessment.classification(sha).is_none() {
             return Ok(());
         }
         let Some(path) = self.path(sha) else {
@@ -174,7 +155,7 @@ impl Cache {
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age >= self.ttl)
+                .is_some_and(|age| age >= TTL)
             {
                 drop(std::fs::remove_file(entry.path()));
             }
@@ -199,18 +180,16 @@ mod tests {
     }
 
     fn cache(root: &std::path::Path) -> Cache {
-        Cache::new(root.into(), DEFAULT_TTL, "https://api.example", None)
+        Cache::new(root.into(), "https://api.example", None)
     }
 
     #[test]
     fn thirty_day_lifetime_is_fixed_and_rejects_future_timestamps() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = cache(tmp.path());
         let entry = Entry {
             stored_at: 1_000,
             assessment: assessment(),
         };
-        assert_eq!(DEFAULT_TTL.as_secs(), 2_592_000);
+        assert_eq!(TTL.as_secs(), 2_592_000);
         for (now, expected) in [
             (999, false),
             (1000, true),
@@ -218,25 +197,24 @@ mod tests {
             (2_593_000, false),
         ] {
             assert_eq!(
-                cache.fresh(&entry, UNIX_EPOCH + Duration::from_secs(now)),
+                Cache::fresh(&entry, UNIX_EPOCH + Duration::from_secs(now)),
                 expected
             );
         }
     }
 
     #[test]
-    fn unmeasured_evidence_has_short_lifetime_and_override_can_shorten_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut cache = cache(tmp.path());
+    fn unmeasured_evidence_has_short_lifetime() {
         let mut entry = Entry {
             stored_at: 1_000,
             assessment: assessment(),
         };
         entry.assessment.engine_version = None;
-        assert!(cache.fresh(&entry, UNIX_EPOCH + Duration::from_secs(1059)));
-        assert!(!cache.fresh(&entry, UNIX_EPOCH + Duration::from_secs(1060)));
-        cache.ttl = Duration::from_secs(10);
-        assert!(!cache.fresh(&entry, UNIX_EPOCH + Duration::from_secs(1010)));
+        assert!(Cache::fresh(&entry, UNIX_EPOCH + Duration::from_secs(1059)));
+        assert!(!Cache::fresh(
+            &entry,
+            UNIX_EPOCH + Duration::from_secs(1060)
+        ));
     }
 
     #[test]
@@ -258,7 +236,7 @@ mod tests {
             ("https://other.example", None),
             ("https://api.example", Some("secret-token")),
         ] {
-            let isolated = Cache::new(tmp.path().into(), DEFAULT_TTL, base, token);
+            let isolated = Cache::new(tmp.path().into(), base, token);
             assert!(isolated.get(SHA).is_none());
             assert!(
                 !isolated
@@ -297,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_reclaims_expired_files_and_disabled_cache_stores_nothing() {
+    fn pruning_reclaims_expired_files() {
         let tmp = tempfile::tempdir().unwrap();
         let writer = cache(tmp.path());
         writer.put(SHA, assessment()).unwrap();
@@ -316,14 +294,6 @@ mod tests {
             .unwrap();
         let reader = cache(tmp.path());
         assert!(reader.get(SHA).is_none());
-        assert!(!path.exists());
-        let disabled = Cache::new(
-            tmp.path().into(),
-            Duration::ZERO,
-            "https://api.example",
-            None,
-        );
-        disabled.put(SHA, assessment()).unwrap();
         assert!(!path.exists());
     }
 

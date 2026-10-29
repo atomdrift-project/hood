@@ -106,6 +106,16 @@ fn isotope13_token(base: &str) -> Option<String> {
     }
 }
 
+/// True when `url` names this machine: `localhost` or a loopback IP literal.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 pub(crate) struct Client {
     /// Built on first use with the process-wide roots the proxy prefetches,
     /// so intercepted commands never wait on a root-store load up front.
@@ -130,25 +140,23 @@ impl Client {
         }
         let base = std::env::var("HOOD_BEAMLINE_URL").unwrap_or_else(|_| API_URL.to_owned());
         let mut client = Self::new(&base, isotope13_token(&base))?;
-        client.cache = match Cache::from_env(client.base.as_str(), client.token.as_deref()) {
-            Ok(cache) => cache.map(Arc::new),
-            Err(error) => {
-                tracing::warn!(%error, "Beamline cache disabled; remote assessment remains enabled");
-                None
-            }
-        };
+        // A loopback endpoint is a development or test server; its answers
+        // are not worth keeping across runs.
+        if !is_loopback(&client.base) {
+            client.cache = dirs::cache_dir().map(|root| {
+                Arc::new(Cache::new(
+                    root.join("atomdrift/hood/beamline/v1"),
+                    client.base.as_str(),
+                    client.token.as_deref(),
+                ))
+            });
+        }
         Ok(Some(client))
     }
 
     pub(crate) fn new(base: &str, token: Option<String>) -> Result<Self> {
         let base = Url::parse(base).context("invalid Beamline endpoint")?;
-        let loopback = base.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if (base.scheme() != "https" && !(base.scheme() == "http" && loopback))
+        if (base.scheme() != "https" && !(base.scheme() == "http" && is_loopback(&base)))
             || !base.username().is_empty()
             || base.password().is_some()
             || base.query().is_some()
@@ -447,7 +455,6 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
 pub(crate) mod test_support {
     use super::{Cache, Client};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -520,7 +527,6 @@ pub(crate) mod test_support {
         let mut client = Client::new(endpoint, None).unwrap();
         client.cache = Some(Arc::new(Cache::new(
             root.into(),
-            Duration::from_hours(30 * 24),
             client.base.as_str(),
             None,
         )));
@@ -546,6 +552,20 @@ mod tests {
             "https://api.isotope13.ai:8443",
         ] {
             assert_eq!(isotope13_token(base), None, "{base}");
+        }
+    }
+
+    #[test]
+    fn plain_http_is_allowed_only_on_loopback() {
+        for base in [
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://[::1]:8787",
+        ] {
+            assert!(Client::new(base, None).is_ok(), "{base}");
+        }
+        for base in ["http://beamline.example", "http://10.0.0.1:8787"] {
+            assert!(Client::new(base, None).is_err(), "{base}");
         }
     }
 

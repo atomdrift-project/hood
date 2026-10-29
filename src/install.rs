@@ -33,10 +33,10 @@ const MARK_BEGIN: &str = "# >>> hood shim (added by `hood install`) >>>";
 const MARK_END: &str = "# <<< hood shim <<<";
 
 /// Resolve the directory where hood installs its busybox-style symlinks.
-/// Defaults to `~/.hood/bin`. Honors `HOOD_HOME` for test/sandbox use.
+/// `~/.hood/bin`.
 ///
 /// # Errors
-/// Returns an error if `$HOME` (or `$HOOD_HOME`) cannot be resolved.
+/// Returns an error if `$HOME` cannot be resolved.
 pub fn shim_dir() -> Result<PathBuf> {
     Ok(layout_default()?.shim_dir)
 }
@@ -70,13 +70,10 @@ impl Layout {
     }
 }
 
-/// Resolve the platform default layout: `HOME` (or `HOOD_HOME` override) plus the
-/// standard `<home>/.hood/bin` shim directory. The Documents folder follows
-/// the platform's own answer, since Windows lets users and folder redirection move it.
+/// Resolve the platform default layout: `HOME` plus the standard
+/// `<home>/.hood/bin` shim directory. The Documents folder follows the
+/// platform's own answer, since Windows lets users and folder redirection move it.
 fn layout_default() -> Result<Layout> {
-    if let Some(home) = std::env::var_os("HOOD_HOME") {
-        return Ok(Layout::at_home(PathBuf::from(home)));
-    }
     let home = dirs::home_dir().context("HOME not set; cannot resolve home directory")?;
     let mut layout = Layout::at_home(home);
     if let Some(documents) = dirs::document_dir() {

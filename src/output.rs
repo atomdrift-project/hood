@@ -597,8 +597,8 @@ fn write_known_bad_pretty<W: Write>(
 /// Context for an unscanned-download panel.
 ///
 /// A download past the inspection limit is forwarded without a verdict. It is
-/// not a block, so it carries no policy — only what went through, how large it
-/// was, and how to have it scanned.
+/// not a block, so it carries no policy — only what went through and how large
+/// it was.
 #[derive(Debug)]
 pub struct UnscannedPanel<'a> {
     /// URL the tool fetched.
@@ -606,10 +606,8 @@ pub struct UnscannedPanel<'a> {
     /// Size the server declared, when it declared one; otherwise the download
     /// is known only to be past `limit`.
     pub size: Option<u64>,
-    /// The inspection limit in bytes (`HOOD_MAX_SCAN_MB`).
+    /// The inspection limit in bytes.
     pub limit: u64,
-    /// Shell-quoted reproducer for the "to scan" hint.
-    pub invocation: &'a str,
 }
 
 /// Render an unscanned-download warning to stderr — same TTY-vs-pipe split
@@ -639,8 +637,6 @@ fn write_unscanned_pretty<W: Write>(
     )?;
     writeln!(w, "  {}", fg_bold(c.suspicious, &unscanned_status(p)))?;
     writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
-    writeln!(w)?;
-    write_command_hint(w, &c, "to scan:", &scan_limit_hint(p), p.invocation)?;
     writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
     writeln!(w)
 }
@@ -648,13 +644,12 @@ fn write_unscanned_pretty<W: Write>(
 fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> std::io::Result<()> {
     writeln!(
         w,
-        "{}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={} hint={}",
+        "{}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={}",
         unscanned_status(p),
         ShownUrl(p.url),
         p.size
             .map_or_else(|| "unknown".to_owned(), |size| size.to_string()),
         p.limit,
-        scan_limit_hint(p),
     )
 }
 
@@ -664,17 +659,6 @@ fn unscanned_status(p: &UnscannedPanel<'_>) -> String {
     format!(
         "⚠️ Atomdrift Hood forwarded this download unscanned — {size} is over the {limit} inspection limit"
     )
-}
-
-/// The `HOOD_MAX_SCAN_MB` setting that would have scanned this download: its
-/// declared size, or twice the limit when the server did not say.
-fn scan_limit_hint(p: &UnscannedPanel<'_>) -> String {
-    const MIB: u64 = 1024 * 1024;
-    let megabytes = p.size.map_or_else(
-        || (p.limit / MIB).saturating_mul(2),
-        |size| size.div_ceil(MIB),
-    );
-    format!("HOOD_MAX_SCAN_MB={megabytes}")
 }
 
 /// A byte count in binary megabytes or gigabytes, rounded to one decimal.
@@ -1184,13 +1168,12 @@ mod tests {
     }
 
     #[test]
-    fn unscanned_panel_names_size_limit_and_how_to_scan() {
+    fn unscanned_panel_names_size_and_limit() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let p = UnscannedPanel {
             url: "https://cdn.example/big.iso?signature=secret",
             size: Some(3 * GIB + GIB / 10),
             limit: 2 * GIB,
-            invocation: "curl -O https://cdn.example/big.iso",
         };
         let mut buf = Vec::new();
         write_unscanned_pretty(&mut buf, &p, Palette::dark()).unwrap();
@@ -1202,10 +1185,6 @@ mod tests {
         );
         assert!(s.contains("https://cdn.example/big.iso?…"), "{s}");
         assert!(!s.contains("secret"), "{s}");
-        assert!(
-            s.contains("HOOD_MAX_SCAN_MB=3175 curl -O https://cdn.example/big.iso"),
-            "{s}"
-        );
 
         let undeclared = UnscannedPanel { size: None, ..p };
         let mut buf = Vec::new();
@@ -1220,7 +1199,6 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("size_bytes=unknown"), "{line}");
-        assert!(line.contains("hint=HOOD_MAX_SCAN_MB=4096"), "{line}");
         assert_eq!(line.lines().count(), 1);
     }
 

@@ -1,7 +1,7 @@
 //! Local Bloom gate, minimal-disclosure Beamline assessment, and lazy local analysis.
 //! Every available identity participates in the Bloom decision before any API call.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -126,7 +126,7 @@ pub trait Scanner: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Trivial scanner that allows everything. For tests and `--no-scan`.
+/// Trivial scanner that allows everything. For tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllowAll;
 
@@ -174,6 +174,8 @@ pub enum ScanPolicy {
 /// analyzer are initialized once, shared by concurrent downloads.
 pub struct AtomScanner {
     analyzer: OnceCell<std::result::Result<Arc<Analyzer>, String>>,
+    /// Where the models are. `None` resolves them through scan, which honors
+    /// `SCAN_MODELS_DIR`; unit tests name a directory with none.
     model_dir: Option<PathBuf>,
     remote: Option<beamline::Client>,
     policy: ScanPolicy,
@@ -288,11 +290,9 @@ impl std::fmt::Debug for AtomScanner {
 }
 
 impl AtomScanner {
-    /// Prepare a scanner; model loading is deferred until local analysis is needed.
-    ///
-    /// `model_dir` is the same directory passed to `atomscan --model-dir`;
-    /// when `None`, the scan `models_repo` resolver is used (auto-clone on
-    /// first call).
+    /// Prepare a scanner; model loading is deferred until local analysis is
+    /// needed, and resolved through scan (`SCAN_MODELS_DIR`, else the
+    /// installed models).
     ///
     /// `invocation` is the shell-quoted command the user ran (e.g.
     /// `"curl -fsSL https://x"`), surfaced in the bypass hint of the
@@ -305,7 +305,6 @@ impl AtomScanner {
     /// Reserved for initialization failures. Local analyzer failures are handled
     /// per download under the configured policy.
     pub fn load(
-        model_dir: Option<PathBuf>,
         policy: ScanPolicy,
         invocation: String,
         status: Option<Arc<ScanStats>>,
@@ -319,7 +318,7 @@ impl AtomScanner {
         };
         Ok(Self {
             analyzer: OnceCell::new(),
-            model_dir,
+            model_dir: None,
             remote,
             policy,
             invocation,
@@ -604,16 +603,9 @@ const fn gate_outcome(decision: Decision, policy: ScanPolicy) -> GateOutcome {
     }
 }
 
-/// Load the bloom filters, honoring `HOOD_NO_BLOOM` and dropping an empty
-/// (unsynced) set so the gate is a no-op rather than a wasted hash per payload.
+/// Load the bloom filters, dropping an empty (unsynced) set so the gate is a
+/// no-op rather than a wasted hash per payload.
 fn load_bloom() -> Option<Lookup> {
-    if let Some(value) = std::env::var_os("HOOD_NO_BLOOM") {
-        if value == "1" {
-            tracing::debug!("HOOD_NO_BLOOM=1 — bloom fast path disabled");
-            return None;
-        }
-        tracing::warn!("invalid HOOD_NO_BLOOM value ignored; bloom gate remains enabled");
-    }
     refresh_bloom();
     let lookup = Lookup::load();
     lookup.is_active().then_some(lookup)
@@ -621,10 +613,7 @@ fn load_bloom() -> Option<Lookup> {
 
 /// Reuse scan's verified atomic updater, at most once per day, including failures.
 fn refresh_bloom() {
-    if std::env::var_os("HOOD_NO_BLOOM").is_some_and(|value| value == "1")
-        || std::env::var_os("SCAN_BLOOM_DIR").is_some()
-        || !due_today("bloom-checked")
-    {
+    if !due_today("bloom-checked") {
         return;
     }
     if let Err(error) = scan::bloom_repo::install_dir()
@@ -643,13 +632,12 @@ fn refresh_bloom() {
 /// analyzer load, which applies the scan policy per download.
 ///
 /// Blocking: network and disk I/O.
-pub fn prepare(model_dir: Option<&Path>) {
+pub fn prepare() {
     // Before anything resolves a rules tree: logged in means the Enriched one.
     activate_enriched();
     refresh_bloom();
-    if model_dir.is_none()
-        && let Err(error) = scan::models_repo::ensure_model_dir()
-    {
+    // `SCAN_MODELS_DIR` names models scan uses as they are, never fetching.
+    if let Err(error) = scan::models_repo::ensure_model_dir() {
         tracing::warn!(error = %format!("{error:#}"), "model install failed before the command started");
     }
     install_traits();
@@ -729,9 +717,9 @@ fn installed_or_open_source() -> bool {
 
 /// Whether a once-a-day job named `name` is due, stamping it when it is.
 /// Failures stamp too, so an offline host does not retry on every command;
-/// `SCAN_NO_UPDATE` turns every refresh off.
+/// `HOOD_NO_UPDATE=1` turns every refresh off.
 fn due_today(name: &str) -> bool {
-    if std::env::var_os("SCAN_NO_UPDATE").is_some() {
+    if std::env::var_os("HOOD_NO_UPDATE").is_some_and(|value| value == "1") {
         return false;
     }
     let Some(cache) = dirs::cache_dir() else {
@@ -802,12 +790,7 @@ impl Scanner for AtomScanner {
     /// The panel says plainly that it went unscanned and how to scan it.
     fn scan_limit(&self, url: &str, limit: u64, size: Option<u64>) -> Verdict {
         tracing::debug!(url = %crate::output::ShownUrl(url), limit, size, "over inspection limit");
-        crate::output::emit_unscanned(&crate::output::UnscannedPanel {
-            url,
-            size,
-            limit,
-            invocation: &self.invocation,
-        });
+        crate::output::emit_unscanned(&crate::output::UnscannedPanel { url, size, limit });
         Verdict::Allow
     }
 

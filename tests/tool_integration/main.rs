@@ -13,15 +13,13 @@
 //! - quota exceeded: Beamline answers 429, so hood shows why and scans
 //!   locally. Both local scans get [`LOCAL_SLOWDOWN`] plus
 //!   [`LOCAL_SCAN_ALLOWANCE`] for the analyzer's start-up.
-//! - Bloom known good: hood's local filter blesses the payload, so it is
-//!   forwarded without asking Beamline, which here would block it.
-//! - Bloom known bad: the local filter lists the payload. Hood must block it
-//!   with the filter's `known-bad` verdict; Beamline, which hood may still
-//!   consult for details, agrees it is hostile.
 //!
-//! Beamline is a local fake, so tests are hermetic: isolated caches, no
-//! public registry. Local scans use the installed scan models, downloaded once
-//! outside any timed run if missing.
+//! Beamline is a local fake on loopback, which hood never caches, so tests
+//! are hermetic: isolated caches, no public registry, no daily refreshes
+//! (`HOOD_NO_UPDATE=1`). Fixtures are synthetic, so no Bloom filter lists
+//! them; the scanner's unit tests cover the Bloom gate over real filters.
+//! Local scans use the installed scan models, downloaded once outside any
+//! timed run if missing.
 //!
 //! Missing tools are skipped during a normal `cargo test`; strict mode
 //! (`HOOD_REQUIRE_TOOL_INTEGRATION`, set by `make test-tools` and CI) treats a
@@ -518,46 +516,10 @@ impl ToolHarness {
         self.beamline
             .set(Beamline::Assesses, Some(sha256_hex(payload.bytes)));
         let (bad, _) = self
-            .run_hood(tool, "known-bad", &prepare, &self.no_models, None)
+            .run_hood(tool, "known-bad", &prepare, &self.no_models)
             .await?;
         assert_blocked(tool, &bad.output, payload.url, "hostile");
         assert!(!accepted(&bad), "{tool} accepted a blocked payload");
-
-        // Bloom known good: the local blessing must skip a Beamline that
-        // would block the payload.
-        let sha256: [u8; 32] = sha2::Sha256::digest(payload.bytes).into();
-        let bloom = self.dir(&format!("{tool}-bloom-good-filters"));
-        bloom_bundle(&bloom, burton::Tier::Good, sha256)?;
-        let (blessed, _) = self
-            .run_hood(tool, "bloom-good", &prepare, &self.no_models, Some(&bloom))
-            .await?;
-        assert_success(tool, &blessed.output);
-        assert!(
-            blessed.output.stderr.contains("bloom known-good skip"),
-            "hood+{tool} did not skip the blessed payload:\n{}",
-            blessed.output.stderr
-        );
-        assert!(
-            accepted(&blessed),
-            "{tool} did not accept the blessed payload"
-        );
-
-        // Bloom known bad: the block carries the filter's verdict, not
-        // Beamline's, and shows Beamline's explanation, which agrees.
-        let bloom = self.dir(&format!("{tool}-bloom-bad-filters"));
-        bloom_bundle(&bloom, burton::Tier::Bad, sha256)?;
-        let (listed, _) = self
-            .run_hood(tool, "bloom-bad", &prepare, &self.no_models, Some(&bloom))
-            .await?;
-        assert_blocked(tool, &listed.output, payload.url, "known-bad");
-        for detail in [HOSTILE_REASON, HOSTILE_FINDING] {
-            assert!(
-                listed.output.stderr.contains(detail),
-                "hood+{tool} did not explain the known-bad block with {detail:?}:\n{}",
-                listed.output.stderr
-            );
-        }
-        assert!(!accepted(&listed), "{tool} accepted a known-bad payload");
         drop(shared);
 
         let models = match scan_models().await {
@@ -638,7 +600,6 @@ impl ToolHarness {
                     &format!("known-good-{attempt}"),
                     &prepare,
                     &self.no_models,
-                    None,
                 )
                 .await?;
             let failed = !run.output.status.success();
@@ -689,7 +650,7 @@ impl ToolHarness {
         let mut first = None;
         for attempt in 0..TIMING_ATTEMPTS {
             let (run, elapsed) = self
-                .run_hood(tool, &format!("{label}-{attempt}"), &prepare, models, None)
+                .run_hood(tool, &format!("{label}-{attempt}"), &prepare, models)
                 .await?;
             let failed = !run.output.status.success();
             if first.is_none() {
@@ -721,7 +682,6 @@ impl ToolHarness {
         label: &str,
         prepare: F,
         models: &Path,
-        bloom: Option<&Path>,
     ) -> Result<(Run, Duration)>
     where
         F: Fn(&Path) -> Result<Invocation> + Sync,
@@ -729,7 +689,7 @@ impl ToolHarness {
         let dir = self.dir(&format!("{tool}-{label}"));
         fs::create_dir_all(&dir)?;
         let invocation = prepare(&dir)?;
-        let (output, elapsed) = self.hood(tool, &invocation, models, bloom).await?;
+        let (output, elapsed) = self.hood(tool, &invocation, models).await?;
         Ok((Run { output, dir }, elapsed))
     }
 
@@ -749,35 +709,25 @@ impl ToolHarness {
         tool: &str,
         invocation: &Invocation,
         models: &Path,
-        bloom: Option<&Path>,
     ) -> Result<(Output, Duration)> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hood"));
         command
-            .arg("--verbose")
-            .arg("--model-dir")
-            .arg(models)
             .arg(tool)
             .args(&invocation.args)
-            .env("HOOD_HOME", self.dir("hood-home"))
+            .env("HOOD_VERBOSE", "1")
+            .env("SCAN_MODELS_DIR", models)
             .env("HOOD_BEAMLINE_URL", self.beamline.url())
-            .env("HOOD_BEAMLINE_CACHE_TTL_SECS", "0");
+            .env("HOOD_NO_UPDATE", "1");
         for key in [
             "HOOD_LOCAL",
-            "HOOD_NO_SCAN",
-            "HOOD_NO_BLOOM",
             "HOOD_BYPASS",
             "ISOTOPE13_TOKEN",
-            "SCAN_MODELS_DIR",
-            "SCAN_BLOOM_DIR",
+            "npm_config_ignore_scripts",
+            "NPM_CONFIG_IGNORE_SCRIPTS",
+            "YARN_ENABLE_SCRIPTS",
         ] {
             command.env_remove(key);
         }
-        match bloom {
-            Some(bundle) => command
-                .env("SCAN_BLOOM_DIR", bundle)
-                .env("SCAN_NO_UPDATE", "1"),
-            None => command.env("HOOD_NO_BLOOM", "1"),
-        };
         self.execute(command, invocation).await
     }
 
@@ -959,28 +909,6 @@ fn assert_blocked(tool: &str, output: &Output, url: &str, verdict: &str) {
         output.stdout,
         output.stderr,
     );
-}
-
-/// Write a Bloom bundle listing `sha256` in `tier`, as scan's updater installs
-/// one, for `SCAN_BLOOM_DIR`.
-fn bloom_bundle(dir: &Path, tier: burton::Tier, sha256: [u8; 32]) -> Result<()> {
-    fs::create_dir_all(dir)?;
-    let mut sets = burton::KeySets::new();
-    sets.insert(
-        tier,
-        burton::Record {
-            purl: None,
-            sha256: Some(sha256),
-        },
-    );
-    burton::build::write_bundle(
-        dir,
-        &sets.into_filters(1e-9),
-        "2026-10-22",
-        scan::bloom_repo::KEY_SCHEME,
-    )
-    .map_err(|error| anyhow!("write Bloom bundle: {error:?}"))?;
-    Ok(())
 }
 
 /// Return the first file below `dir` whose name satisfies `matches`.

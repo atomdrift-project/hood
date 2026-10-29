@@ -1,9 +1,5 @@
 //! Minimal-disclosure Beamline transport. Never accepts artifact bytes or URLs.
 
-// Explicit crate visibility satisfies rustc's unreachable_pub lint; Clippy's
-// redundant_pub_crate recommendation conflicts with it in this internal module.
-#![allow(clippy::redundant_pub_crate)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +16,18 @@ pub(crate) const BUDGET: &str = "25";
 
 const MAX_LINE: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(30);
+/// Beamline lookups in flight at once; a package manager's parallel
+/// downloads queue here rather than flood the API.
+const MAX_CONCURRENT_LOOKUPS: usize = 4;
+/// How long a TCP and TLS connection to Beamline may take before local
+/// analysis takes over.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The whole budget for a package analysis, then for a hash lookup. hood holds
+/// the response while it asks, and the tool waiting on it sees silence:
+/// pacman gives up after 10 s, pip after 15 s. Past these, local analysis
+/// decides instead.
+const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(8);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A measured assessment. Unrecognized statuses/severities never authorize release.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -100,7 +107,7 @@ fn isotope13_token(base: &str) -> Option<String> {
     match cleave::enriched::token() {
         Ok(found) => found.map(|(token, _)| token.secret().to_owned()),
         Err(error) => {
-            tracing::warn!(%error, "isotope13 token unusable; asking Beamline without one");
+            tracing::warn!(error = %format!("{error:#}"), "isotope13 token unusable; asking Beamline without one");
             None
         }
     }
@@ -169,7 +176,7 @@ impl Client {
             http: tokio::sync::OnceCell::new(),
             base,
             token,
-            slots: Semaphore::new(4),
+            slots: Semaphore::new(MAX_CONCURRENT_LOOKUPS),
             cache: None,
         })
     }
@@ -188,7 +195,7 @@ impl Client {
                         let builder = reqwest::Client::builder()
                             .no_proxy()
                             .redirect(reqwest::redirect::Policy::none())
-                            .connect_timeout(Duration::from_secs(5));
+                            .connect_timeout(CONNECT_TIMEOUT);
                         // A plain-HTTP endpoint (loopback only) needs no roots.
                         let builder = if https {
                             let mut tls = rustls::ClientConfig::builder()
@@ -212,10 +219,14 @@ impl Client {
         if let Some(cache) = &self.cache {
             let cache = Arc::clone(cache);
             let sha = sha256.to_owned();
-            if let Ok(Some(assessment)) = tokio::task::spawn_blocking(move || cache.get(&sha)).await
-            {
-                tracing::debug!("using cached Beamline assessment");
-                return Ok(assessment);
+            // Every cache failure is a miss; the join error is only logged.
+            match tokio::task::spawn_blocking(move || cache.get(&sha)).await {
+                Ok(Some(assessment)) => {
+                    tracing::debug!("using cached Beamline assessment");
+                    return Ok(assessment);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(%error, "Beamline cache read failed"),
             }
         }
         let result = self.assess_remote(purl, sha256).await?;
@@ -228,9 +239,9 @@ impl Client {
             if let Err(error) = tokio::task::spawn_blocking(move || cache.put(&sha, stored))
                 .await
                 .context("Beamline cache write task")
-                .and_then(std::convert::identity)
+                .flatten()
             {
-                tracing::debug!(%error, "could not cache Beamline assessment");
+                tracing::debug!(error = %format!("{error:#}"), "could not cache Beamline assessment");
             }
         }
         Ok(result)
@@ -245,7 +256,7 @@ impl Client {
         let budget = if purl.is_some() {
             ANALYSIS_TIMEOUT
         } else {
-            IDLE_TIMEOUT
+            LOOKUP_TIMEOUT
         };
         tokio::time::timeout(budget, async {
             if let Some(purl) = purl {

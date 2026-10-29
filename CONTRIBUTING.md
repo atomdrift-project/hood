@@ -11,8 +11,7 @@ review.
 3. Run the same checks as CI:
 
    ```sh
-   cargo fmt --check
-   make lint
+   make lint   # rustfmt and clippy
    make test
    ```
 

@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -11,15 +12,20 @@ use scan::Analyzer;
 use scan::bloom_repo::{Decision, Lookup};
 use scan::engine::ScanResult;
 use scan::model::Classification;
-use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 
 use crate::beamline;
+use crate::output::Disposition;
 
-const HOOD_SCAN_LEVEL: u16 = 25;
+// `Analyzer::load` classifies at scan's default severity; hood's verdicts,
+// panels and Beamline budget are all calibrated for L25.
+const _: () = assert!(
+    scan::model::DEFAULT_SEVERITY_LEVEL == 25,
+    "scan's default severity changed from L25"
+);
 
 /// How long a Bloom known-bad block waits for Beamline's explanation.
-const KNOWN_BAD_DETAILS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const KNOWN_BAD_DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of scanning a single payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,10 +53,10 @@ pub enum BlockReason {
 impl Verdict {
     /// What the verdict does with the payload.
     #[must_use]
-    pub const fn disposition(&self) -> crate::output::Disposition {
+    pub const fn disposition(&self) -> Disposition {
         match self {
-            Self::Allow => crate::output::Disposition::Forwarded,
-            Self::Block(_) => crate::output::Disposition::Blocked,
+            Self::Allow => Disposition::Forwarded,
+            Self::Block(_) => Disposition::Blocked,
         }
     }
 }
@@ -58,7 +64,7 @@ impl Verdict {
 impl BlockReason {
     /// Short human-readable label for log and error messages.
     #[must_use]
-    pub const fn label(&self) -> &str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::KnownBad(_) => "known-bad",
             Self::Hostile => "hostile",
@@ -79,6 +85,8 @@ pub struct ScanRequest {
     /// Full payload body. Shared with the response hood forwards, so only a
     /// local analysis, which needs bytes of its own, ever copies it.
     pub body: Bytes,
+    /// SHA-256 of `body`, computed while it streamed in.
+    pub sha256: [u8; 32],
 }
 
 /// A payload too large to buffer in RAM, spilled to a temporary file.
@@ -94,36 +102,32 @@ pub struct DiskScanRequest {
     pub allow_purl: bool,
     /// On-disk file holding the full payload. Named with the payload's real
     /// extension so cleave's type detection matches an in-memory scan.
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     /// SHA-256 of the payload, computed while it streamed to disk.
     pub sha256: [u8; 32],
 }
 
 /// A scanner backend.
+///
+/// Every method decides; none can fail. A backend that cannot inspect a
+/// payload says what its policy does with that, so no caller has to guess
+/// whether an error forwards or blocks. No method has a default, so a new
+/// backend cannot inherit a decision it did not make.
 #[async_trait::async_trait]
 pub trait Scanner: Send + Sync + std::fmt::Debug {
-    /// Inspect an in-memory payload and return a verdict.
-    async fn scan(&self, req: ScanRequest) -> Result<Verdict>;
+    /// Decide an in-memory payload.
+    async fn scan(&self, req: ScanRequest) -> Verdict;
+
+    /// Decide a payload spilled to disk, too large to buffer in RAM.
+    async fn scan_disk(&self, req: DiskScanRequest) -> Verdict;
 
     /// Decide a payload too large to inspect: larger than `limit` bytes, and
-    /// `size` bytes when the server declared it. The default withholds it.
-    fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
-        Verdict::Block(BlockReason::ScanError(
-            "download exceeds inspection limit".to_owned(),
-        ))
-    }
+    /// `size` bytes when the server declared it.
+    fn scan_limit(&self, url: &str, limit: u64, size: Option<u64>) -> Verdict;
 
-    /// Apply policy to a payload hood cannot inspect for the reason `why`,
-    /// such as an encoding it does not decode.
-    fn uninspectable(&self, _url: &str, why: &str) -> Verdict {
-        Verdict::Block(BlockReason::ScanError(why.to_owned()))
-    }
-
-    /// Scan a payload spilled to disk (too large to buffer in RAM). The default
-    /// backend has no model, so it forwards the payload unscanned.
-    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Allow)
-    }
+    /// Decide a payload hood cannot inspect for the reason `why`, such as an
+    /// encoding it does not decode.
+    fn uninspectable(&self, url: &str, why: &str) -> Verdict;
 }
 
 /// Trivial scanner that allows everything. For tests.
@@ -132,14 +136,17 @@ pub struct AllowAll;
 
 #[async_trait::async_trait]
 impl Scanner for AllowAll {
+    async fn scan(&self, _req: ScanRequest) -> Verdict {
+        Verdict::Allow
+    }
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Verdict {
+        Verdict::Allow
+    }
     fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
         Verdict::Allow
     }
     fn uninspectable(&self, _url: &str, _why: &str) -> Verdict {
         Verdict::Allow
-    }
-    async fn scan(&self, _req: ScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Allow)
     }
 }
 
@@ -236,19 +243,14 @@ impl ScanSummary {
 }
 
 impl ScanStats {
-    fn record(&self, classification: Classification, disposition: crate::output::Disposition) {
+    fn record(&self, classification: Classification, disposition: Disposition) {
         let counter = match (classification, disposition) {
             (Classification::Benign, _) => &self.passed,
-            (Classification::Suspicious, crate::output::Disposition::Blocked) => {
-                &self.suspicious_blocked
-            }
-            (Classification::Suspicious, crate::output::Disposition::Forwarded) => {
-                &self.suspicious_forwarded
-            }
-            (Classification::Hostile, crate::output::Disposition::Blocked) => &self.hostile_blocked,
-            (Classification::Hostile, crate::output::Disposition::Forwarded) => {
-                &self.hostile_forwarded
-            }
+            (Classification::Suspicious, Disposition::Blocked) => &self.suspicious_blocked,
+            (Classification::Suspicious, Disposition::Forwarded) => &self.suspicious_forwarded,
+            (Classification::Hostile, Disposition::Blocked) => &self.hostile_blocked,
+            (Classification::Hostile, Disposition::Forwarded) => &self.hostile_forwarded,
+            // `Classification` is non-exhaustive; an unknown one is an error.
             _ => {
                 self.record_error(disposition);
                 return;
@@ -257,10 +259,10 @@ impl ScanStats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_error(&self, disposition: crate::output::Disposition) {
+    fn record_error(&self, disposition: Disposition) {
         let counter = match disposition {
-            crate::output::Disposition::Blocked => &self.errors_blocked,
-            crate::output::Disposition::Forwarded => &self.errors_forwarded,
+            Disposition::Blocked => &self.errors_blocked,
+            Disposition::Forwarded => &self.errors_forwarded,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -299,24 +301,16 @@ impl AtomScanner {
     /// stderr panel so they can copy/paste a working command.
     ///
     /// `status`, when present, collects counters for verbose status reporting.
-    ///
-    /// # Errors
-    ///
-    /// Reserved for initialization failures. Local analyzer failures are handled
-    /// per download under the configured policy.
-    pub fn load(
-        policy: ScanPolicy,
-        invocation: String,
-        status: Option<Arc<ScanStats>>,
-    ) -> Result<Self> {
+    #[must_use]
+    pub fn new(policy: ScanPolicy, invocation: String, status: Option<Arc<ScanStats>>) -> Self {
         let remote = match beamline::Client::from_env() {
             Ok(client) => client,
             Err(error) => {
-                tracing::warn!(%error, "Beamline configuration unavailable; using local analysis");
+                tracing::warn!(error = %format!("{error:#}"), "Beamline configuration unavailable; using local analysis");
                 None
             }
         };
-        Ok(Self {
+        Self {
             analyzer: OnceCell::new(),
             model_dir: None,
             remote,
@@ -324,7 +318,7 @@ impl AtomScanner {
             invocation,
             status,
             bloom: OnceCell::new(),
-        })
+        }
     }
 
     async fn analyzer(&self) -> Result<Arc<Analyzer>> {
@@ -342,19 +336,14 @@ impl AtomScanner {
                         None => scan::models_repo::ensure_model_dir()
                             .context("resolve scan model dir")?,
                     };
-                    anyhow::ensure!(
-                        scan::model::DEFAULT_SEVERITY_LEVEL == HOOD_SCAN_LEVEL,
-                        "scan default severity changed from L25"
-                    );
-                    // `load` classifies at the default level, which the check
-                    // above pins to hood's own.
                     Analyzer::load(model_dir)
                         .map(Arc::new)
                         .context("load scan analyzer")
                 })
                 .await
                 .context("load analyzer task")
-                .and_then(std::convert::identity)
+                .flatten()
+                // Cached once for every download, so kept as its rendered chain.
                 .map_err(|error| format!("{error:#}"))
             })
             .await;
@@ -362,6 +351,22 @@ impl AtomScanner {
             .as_ref()
             .cloned()
             .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    /// Run `job` on the local analyzer, off the async runtime, and decide its
+    /// result under policy.
+    async fn analyze<F>(&self, url: &str, job: F) -> Verdict
+    where
+        F: FnOnce(&Analyzer) -> Result<ScanResult> + Send + 'static,
+    {
+        let result = match self.analyzer().await {
+            Ok(analyzer) => tokio::task::spawn_blocking(move || job(&analyzer))
+                .await
+                .context("scan task join")
+                .flatten(),
+            Err(error) => Err(error),
+        };
+        self.classify_result(url, result)
     }
 
     async fn gate(&self, url: &str, allow_purl: bool, sha: &[u8; 32]) -> Option<Verdict> {
@@ -380,31 +385,11 @@ impl AtomScanner {
             })
             .await;
         // Bloom revocations must take precedence over even a fresh benign cache entry.
-        if let Some(lookup) = bloom
-            && let Some(verdict) = bloom_gate_sha(lookup, self.policy, url, purl.as_deref(), sha)
-        {
-            let known_bad = lookup.decide_any(purl.as_deref(), Some(sha)) == Decision::KnownBad;
-            if known_bad {
-                let explanation = self.known_bad_explanation(sha).await;
-                crate::output::emit_known_bad(&crate::output::KnownBadPanel {
-                    url,
-                    sha256: &hex(sha),
-                    purl: None,
-                    policy: self.policy,
-                    disposition: verdict.disposition(),
-                    invocation: &self.invocation,
-                    beamline: &explanation,
-                });
+        if let Some(lookup) = bloom {
+            let decision = lookup.decide_any(purl.as_deref(), Some(sha));
+            if let Some(verdict) = bloom_verdict(decision, self.policy, url, sha) {
+                return Some(self.report_bloom(decision, verdict, url, sha).await);
             }
-            if let Some(status) = &self.status {
-                let classification = if known_bad {
-                    Classification::Hostile
-                } else {
-                    Classification::Benign
-                };
-                status.record(classification, verdict.disposition());
-            }
-            return Some(verdict);
         }
         let client = self.remote.as_ref()?;
         let purl = allow_purl.then(|| beamline::public_purl(url)).flatten();
@@ -430,10 +415,41 @@ impl AtomScanner {
                 Some(verdict)
             }
             Err(error) => {
-                tracing::warn!(%error, "Beamline unavailable; scanning locally");
+                tracing::warn!(error = %format!("{error:#}"), "Beamline unavailable; scanning locally");
                 None
             }
         }
+    }
+
+    /// Show and count a decision the Bloom filter made on its own.
+    async fn report_bloom(
+        &self,
+        decision: Decision,
+        verdict: Verdict,
+        url: &str,
+        sha: &[u8; 32],
+    ) -> Verdict {
+        let known_bad = decision == Decision::KnownBad;
+        if known_bad {
+            let explanation = self.known_bad_explanation(sha).await;
+            crate::output::emit_known_bad(&crate::output::KnownBadPanel {
+                url,
+                sha256: &hex(sha),
+                policy: self.policy,
+                disposition: verdict.disposition(),
+                invocation: &self.invocation,
+                beamline: &explanation,
+            });
+        }
+        if let Some(status) = &self.status {
+            let classification = if known_bad {
+                Classification::Hostile
+            } else {
+                Classification::Benign
+            };
+            status.record(classification, verdict.disposition());
+        }
+        verdict
     }
 
     /// Beamline's explanation of a payload the Bloom filter has already
@@ -455,7 +471,7 @@ impl AtomScanner {
         {
             Ok(Ok(assessment)) => assessment,
             Ok(Err(error)) => {
-                tracing::debug!(%error, "no Beamline details for known-bad payload");
+                tracing::debug!(error = %format!("{error:#}"), "no Beamline details for known-bad payload");
                 return Vec::new();
             }
             Err(_) => {
@@ -522,9 +538,6 @@ impl AtomScanner {
                     let reasons = r.reasons.get(..3).unwrap_or(&r.reasons);
                     crate::output::emit(&crate::output::Panel {
                         classification: r.classification,
-                        // The scan backend no longer exposes a pre-upgrade
-                        // classification, so there is nothing to attribute here.
-                        original: None,
                         disposition,
                         policy: self.policy,
                         probability: r.probability,
@@ -560,16 +573,15 @@ impl AtomScanner {
     }
 }
 
-/// Consult the shared combined identity decision; no independent allowlist
-/// logic. Pure: the caller reports known-bad matches.
-fn bloom_gate_sha(
-    lookup: &Lookup,
+/// The verdict a Bloom decision settles on its own, if any. Pure: the caller
+/// reports known-bad matches.
+fn bloom_verdict(
+    decision: Decision,
     policy: ScanPolicy,
     url: &str,
-    purl: Option<&str>,
     sha: &[u8; 32],
 ) -> Option<Verdict> {
-    match gate_outcome(lookup.decide_any(purl, Some(sha)), policy) {
+    match gate_outcome(decision, policy) {
         GateOutcome::Scan => None,
         GateOutcome::Skip => {
             tracing::debug!(url = %crate::output::ShownUrl(url), "bloom known-good skip");
@@ -619,7 +631,7 @@ fn refresh_bloom() {
     if let Err(error) = scan::bloom_repo::install_dir()
         .and_then(|dir| scan::bloom_update::update(&dir, false, true))
     {
-        tracing::warn!(%error, "Bloom refresh failed; using installed bundle if available");
+        tracing::warn!(error = %format!("{error:#}"), "Bloom refresh failed; using installed bundle if available");
     }
 }
 
@@ -668,21 +680,19 @@ fn install_traits() {
 /// there are none yet.
 fn activate_enriched() {
     static ACTIVATE: std::sync::Once = std::sync::Once::new();
-    ACTIVATE.call_once(activate_enriched_once);
-}
-
-fn activate_enriched_once() {
-    // The refresh is what first installs the Enriched tree after `hood enrich`,
-    // so it runs before the installed tree is checked. A refused token falls
-    // the run back to the open-source rules inside the refresh, with its own
-    // warning; what is left to say is a network failure.
-    if token_selects_enriched()
-        && due_today("traits-enriched-checked")
-        && let Err(error) = scan::traits_repo::update(false, true)
-    {
-        tracing::warn!(error = %format!("{error:#}"), "Enriched rules refresh failed; using installed rules");
-    }
-    installed_or_open_source();
+    ACTIVATE.call_once(|| {
+        // The refresh is what first installs the Enriched tree after `hood
+        // enrich`, so it runs before the installed tree is checked. A refused
+        // token falls the run back to the open-source rules inside the refresh,
+        // with its own warning; what is left to say is a network failure.
+        if token_selects_enriched()
+            && due_today("traits-enriched-checked")
+            && let Err(error) = scan::traits_repo::update(false, true)
+        {
+            tracing::warn!(error = %format!("{error:#}"), "Enriched rules refresh failed; using installed rules");
+        }
+        installed_or_open_source();
+    });
 }
 
 /// Choose the rules a check uses, with no network.
@@ -699,20 +709,19 @@ pub fn select_rules() {
 /// Whether this host's token, or its absence, selects the Enriched rules.
 fn token_selects_enriched() -> bool {
     if let Err(error) = cleave::enriched::resolve(false) {
-        tracing::warn!(%error, "isotope13 token unusable; checking with open-source rules");
+        tracing::warn!(error = %format!("{error:#}"), "isotope13 token unusable; checking with open-source rules");
         return false;
     }
     cleave::enriched::enabled()
 }
 
 /// Keep Enriched only if its tree is on disk; a check never runs on no rules.
-fn installed_or_open_source() -> bool {
+fn installed_or_open_source() {
     let installed = cleave::traits_repo::installed_dir(true);
     if cleave::enriched::enabled() && cleave::rule_update::installed(&installed).is_none() {
         tracing::warn!(dir = %installed.display(), "no Enriched rules installed; checking with open-source rules");
         cleave::enriched::set_enabled(false);
     }
-    cleave::enriched::enabled()
 }
 
 /// Whether a once-a-day job named `name` is due, stamping it when it is.
@@ -730,7 +739,7 @@ fn due_today(name: &str) -> bool {
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age < std::time::Duration::from_hours(24))
+        .is_some_and(|age| age < Duration::from_hours(24))
     {
         return false;
     }
@@ -785,9 +794,41 @@ const fn policy_allows_error(policy: ScanPolicy) -> bool {
 
 #[async_trait::async_trait]
 impl Scanner for AtomScanner {
+    async fn scan(&self, req: ScanRequest) -> Verdict {
+        let ScanRequest {
+            url,
+            allow_purl,
+            body,
+            sha256,
+        } = req;
+        if let Some(verdict) = self.gate(&url, allow_purl, &sha256).await {
+            return verdict;
+        }
+        let name = url.clone();
+        self.analyze(&url, move |analyzer| {
+            analyzer.scan_bytes(body.into(), &name)
+        })
+        .await
+    }
+
+    async fn scan_disk(&self, req: DiskScanRequest) -> Verdict {
+        let DiskScanRequest {
+            url,
+            allow_purl,
+            path,
+            sha256,
+        } = req;
+        if let Some(verdict) = self.gate(&url, allow_purl, &sha256).await {
+            return verdict;
+        }
+        let name = url.clone();
+        self.analyze(&url, move |analyzer| analyzer.scan_file(&path, &name))
+            .await
+    }
+
     /// A download past the inspection limit is forwarded, never failed: the
     /// limit bounds hood's own disk and time, not what the user may install.
-    /// The panel says plainly that it went unscanned and how to scan it.
+    /// The panel says plainly that it went unscanned.
     fn scan_limit(&self, url: &str, limit: u64, size: Option<u64>) -> Verdict {
         tracing::debug!(url = %crate::output::ShownUrl(url), limit, size, "over inspection limit");
         crate::output::emit_unscanned(&crate::output::UnscannedPanel { url, size, limit });
@@ -797,40 +838,6 @@ impl Scanner for AtomScanner {
     fn uninspectable(&self, url: &str, why: &str) -> Verdict {
         self.classify_result(url, Err(anyhow::anyhow!("{why}")))
     }
-
-    async fn scan(&self, req: ScanRequest) -> Result<Verdict> {
-        let sha: [u8; 32] = Sha256::digest(&req.body).into();
-        if let Some(verdict) = self.gate(&req.url, req.allow_purl, &sha).await {
-            return Ok(verdict);
-        }
-        let analyzer = match self.analyzer().await {
-            Ok(analyzer) => analyzer,
-            Err(error) => return Ok(self.classify_result(&req.url, Err(error))),
-        };
-        let url = req.url.clone();
-        let result =
-            tokio::task::spawn_blocking(move || analyzer.scan_bytes(req.body.into(), &req.url))
-                .await
-                .context("scan task join")
-                .and_then(std::convert::identity);
-        Ok(self.classify_result(&url, result))
-    }
-
-    async fn scan_disk(&self, req: DiskScanRequest) -> Result<Verdict> {
-        if let Some(verdict) = self.gate(&req.url, req.allow_purl, &req.sha256).await {
-            return Ok(verdict);
-        }
-        let analyzer = match self.analyzer().await {
-            Ok(analyzer) => analyzer,
-            Err(error) => return Ok(self.classify_result(&req.url, Err(error))),
-        };
-        let url = req.url.clone();
-        let result = tokio::task::spawn_blocking(move || analyzer.scan_file(&req.path, &url))
-            .await
-            .context("disk scan task join")
-            .and_then(std::convert::identity);
-        Ok(self.classify_result(&req.url, result))
-    }
 }
 
 #[cfg(test)]
@@ -838,6 +845,7 @@ impl Scanner for AtomScanner {
 mod tests {
     use super::*;
     use burton::{KeySets, Record, Tier};
+    use sha2::{Digest, Sha256};
 
     #[tokio::test]
     async fn allow_all_allows() {
@@ -847,9 +855,9 @@ mod tests {
                 url: "http://x".into(),
                 allow_purl: false,
                 body: Bytes::from_static(b"hi"),
+                sha256: [0; 32],
             })
-            .await
-            .unwrap();
+            .await;
         assert_eq!(v, Verdict::Allow);
     }
 
@@ -865,26 +873,12 @@ mod tests {
     }
 
     #[test]
-    fn hood_uses_scan_l25_default() {
-        assert_eq!(scan::model::DEFAULT_SEVERITY_LEVEL, 25);
-    }
-
-    #[test]
     fn scan_stats_separate_verdicts_from_policy_actions() {
         let stats = ScanStats::default();
-        stats.record(
-            Classification::Benign,
-            crate::output::Disposition::Forwarded,
-        );
-        stats.record(
-            Classification::Suspicious,
-            crate::output::Disposition::Blocked,
-        );
-        stats.record(
-            Classification::Suspicious,
-            crate::output::Disposition::Forwarded,
-        );
-        stats.record_error(crate::output::Disposition::Blocked);
+        stats.record(Classification::Benign, Disposition::Forwarded);
+        stats.record(Classification::Suspicious, Disposition::Blocked);
+        stats.record(Classification::Suspicious, Disposition::Forwarded);
+        stats.record_error(Disposition::Blocked);
         assert_eq!(
             stats.snapshot(),
             ScanSummary {
@@ -898,6 +892,16 @@ mod tests {
     }
 
     // ----- bloom gate ------------------------------------------------------
+
+    fn bloom_gate_sha(
+        lookup: &Lookup,
+        policy: ScanPolicy,
+        url: &str,
+        purl: Option<&str>,
+        sha: &[u8; 32],
+    ) -> Option<Verdict> {
+        bloom_verdict(lookup.decide_any(purl, Some(sha)), policy, url, sha)
+    }
 
     #[test]
     fn gate_enforces_shared_decision() {
@@ -1109,10 +1113,10 @@ mod tests {
             .scan(ScanRequest {
                 url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
                 allow_purl: true,
+                sha256: sha_of(&body),
                 body: body.into(),
             })
-            .await
-            .unwrap();
+            .await;
         assert_eq!(verdict, Verdict::Allow);
         assert!(scanner.analyzer.get().is_none());
         assert!(mock.requests.lock().unwrap().is_empty());
@@ -1169,10 +1173,10 @@ mod tests {
                     .scan(ScanRequest {
                         url: url.into(),
                         allow_purl: true,
+                        sha256: sha_of(&body),
                         body: body.clone().into(),
                     })
-                    .await
-                    .unwrap(),
+                    .await,
                 expected
             );
             let path = bundle.path().join("artifact.tgz");
@@ -1185,8 +1189,7 @@ mod tests {
                         path,
                         sha256: sha,
                     })
-                    .await
-                    .unwrap(),
+                    .await,
                 expected
             );
             assert!(scanner.analyzer.get().is_none());
@@ -1229,10 +1232,10 @@ mod tests {
                 .scan(ScanRequest {
                     url: "https://private.example/private.tar.gz?token=secret".into(),
                     allow_purl: false,
+                    sha256: sha_of(&body),
                     body: body.clone().into(),
                 })
-                .await
-                .unwrap();
+                .await;
             assert_eq!(verdict, expected);
             assert!(scanner.analyzer.get().is_none());
             let requests = mock.requests.lock().unwrap().clone();
@@ -1317,9 +1320,9 @@ mod tests {
                         url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
                         allow_purl: true,
                         body: Bytes::from_static(b"unknown"),
+                        sha256: sha_of(b"unknown"),
                     })
-                    .await
-                    .unwrap();
+                    .await;
                 assert!(
                     matches!(scanner.analyzer.get(), Some(Err(_))),
                     "local initialization was not attempted"
@@ -1356,8 +1359,7 @@ mod tests {
                 path,
                 sha256: sha,
             })
-            .await
-            .unwrap();
+            .await;
         assert_eq!(verdict, Verdict::Allow);
         assert!(scanner.analyzer.get().is_none());
         let requests = mock.requests.lock().unwrap().clone();

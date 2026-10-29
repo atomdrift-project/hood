@@ -27,9 +27,6 @@
 //! containers and VMs; see `.github/workflows/ci.yml` and `tests/distro/`.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-// Modules share items with this crate root as `pub(crate)`; `pub` would trip
-// `unreachable_pub` in a binary crate, which this nursery lint contradicts.
-#![allow(clippy::redundant_pub_crate)]
 
 mod alpine;
 mod arch;
@@ -92,7 +89,7 @@ const LOCAL_SCAN_ALLOWANCE: Duration = Duration::from_secs(8);
 const TIMING_ATTEMPTS: usize = 3;
 
 /// Upper bound for any single command.
-const RUN_TIMEOUT: Duration = Duration::from_secs(180);
+const RUN_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Keeps parallel tests from distorting each other's measurements. A timed
 /// section holds it exclusively; every other command this test binary runs
@@ -834,8 +831,30 @@ fn skip<T>(name: &str, reason: &str) -> Result<Option<T>> {
     Ok(None)
 }
 
+/// The tools `HOOD_REQUIRE_TOOL_INTEGRATION` selects. An empty or misspelled
+/// list would select nothing and pass vacuously, so it fails instead.
 fn required_tools() -> Option<String> {
-    std::env::var_os("HOOD_REQUIRE_TOOL_INTEGRATION").map(|value| value.to_string_lossy().into())
+    let list = std::env::var_os("HOOD_REQUIRE_TOOL_INTEGRATION")?
+        .to_string_lossy()
+        .into_owned();
+    if !matches!(list.as_str(), "1" | "all") {
+        let names: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "HOOD_REQUIRE_TOOL_INTEGRATION is set but names no tool"
+        );
+        for name in names {
+            assert!(
+                hood::tools::Tool::from_name(name).is_some(),
+                "HOOD_REQUIRE_TOOL_INTEGRATION names {name:?}, which hood does not run"
+            );
+        }
+    }
+    Some(list)
 }
 
 fn tool_is_required(name: &str) -> bool {

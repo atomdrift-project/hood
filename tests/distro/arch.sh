@@ -22,8 +22,11 @@ as_builder rustup default stable
 # each PKGBUILD names against its recorded checksum. paru builds from source:
 # paru-bin 2.1.0, the latest, links libalpm.so.15, older than this image's.
 build_aur() {
-	as_builder sh -euc "cd /tmp && git clone -q https://aur.archlinux.org/$1.git \
-		&& cd $1 && git checkout -q $2 && makepkg --syncdeps --install --noconfirm"
+	# The package and commit reach the inner shell as arguments, not as text.
+	# shellcheck disable=SC2016 # expanded by the inner shell, on purpose
+	as_builder sh -euc 'cd /tmp && git clone -q "https://aur.archlinux.org/$1.git" \
+		&& cd "$1" && git checkout -q "$2" && makepkg --syncdeps --install --noconfirm' \
+		build_aur "$1" "$2"
 }
 build_aur yay-bin 13e0a4754d106a9252b7479bf1b370fbe454fc48
 # "Add support for libalpm16"
@@ -38,8 +41,15 @@ for tool in $(echo "$HOOD_REQUIRE_TOOL_INTEGRATION" | tr ',' ' '); do
 	esac
 done
 
-# The unprivileged pass builds the suite; the root pass reuses that build.
-as_builder env HOOD_REQUIRE_TOOL_INTEGRATION="${user_tools#,}" \
-	cargo test --locked --release --test tool_integration -- --test-threads=1
-RUSTUP_HOME=/home/builder/.rustup CARGO_HOME=/home/builder/.cargo \
-	run_tests "${root_tools#,}"
+# The unprivileged pass builds the suite; the root pass reuses that build. A
+# pass with no tools to require is skipped, since an empty list is an error.
+if [ -n "$user_tools" ]; then
+	as_builder env HOOD_REQUIRE_TOOL_INTEGRATION="${user_tools#,}" \
+		cargo test --locked --release --test tool_integration -- --test-threads=1
+else
+	as_builder cargo test --locked --release --test tool_integration --no-run
+fi
+if [ -n "$root_tools" ]; then
+	RUSTUP_HOME=/home/builder/.rustup CARGO_HOME=/home/builder/.cargo \
+		run_tests "${root_tools#,}"
+fi

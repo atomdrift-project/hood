@@ -24,7 +24,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::tools::{Tool, resolve_binary_in_path};
 
@@ -45,20 +45,20 @@ pub fn shim_dir() -> Result<PathBuf> {
 /// into a struct (rather than threaded as separate args) so tests can build
 /// a synthetic layout pointing at a tempdir.
 #[derive(Debug, Clone)]
-pub struct Layout {
+pub(crate) struct Layout {
     /// User's home directory; rc files are discovered relative to this.
-    pub home: PathBuf,
+    pub(crate) home: PathBuf,
     /// User's Documents folder, where PowerShell keeps its profiles.
-    pub documents: PathBuf,
+    pub(crate) documents: PathBuf,
     /// Directory the busybox-style shims live in.
-    pub shim_dir: PathBuf,
+    pub(crate) shim_dir: PathBuf,
 }
 
 impl Layout {
     /// Layout rooted at an arbitrary `home`. The shim directory follows the
     /// `<home>/.hood/bin` convention used by the platform-default layout.
     #[must_use]
-    pub fn at_home(home: impl Into<PathBuf>) -> Self {
+    pub(crate) fn at_home(home: impl Into<PathBuf>) -> Self {
         let home = home.into();
         let documents = home.join("Documents");
         let shim_dir = home.join(".hood").join("bin");
@@ -82,14 +82,6 @@ fn layout_default() -> Result<Layout> {
     Ok(layout)
 }
 
-/// Names hood will respond to when invoked via a symlink. Mirrors
-/// [`Tool::SHIMMABLE`] but lifted into a slice of `&'static str` for easy
-/// matching against `argv[0]`.
-#[must_use]
-pub fn shim_names() -> Vec<&'static str> {
-    Tool::SHIMMABLE.iter().map(|t| t.name()).collect()
-}
-
 /// If `argv0` (basename) is a shimmed tool name, return the matching tool.
 ///
 /// Used by `main.rs` to translate `npm install foo` into the `hood npm install foo`
@@ -101,11 +93,7 @@ pub fn tool_from_argv0(argv0: &str) -> Option<Tool> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(argv0);
-    let stripped = base.strip_suffix(".exe").unwrap_or(base);
-    Tool::SHIMMABLE
-        .iter()
-        .copied()
-        .find(|t| t.name() == stripped)
+    Tool::from_name(base.strip_suffix(".exe").unwrap_or(base))
 }
 
 /// Run the installer:
@@ -120,8 +108,8 @@ pub fn tool_from_argv0(argv0: &str) -> Option<Tool> {
 /// # Errors
 /// Surfaces filesystem errors and missing-HOME conditions; partial state is
 /// possible if a write fails mid-loop, but each operation is itself atomic
-/// (symlink-and-rename for links; append-or-replace bracketed block for rc).
-pub fn install(force: bool) -> Result<i32> {
+/// (symlink-and-rename for Unix links; append-or-replace bracketed block for rc).
+pub fn install(force: bool) -> Result<()> {
     let layout = layout_default()?;
     let hood_bin = std::env::current_exe().context("resolve current_exe")?;
     // A canonical target keeps every shim stable regardless of how Hood ran.
@@ -135,25 +123,27 @@ pub fn install(force: bool) -> Result<i32> {
         &search_path,
     )?;
     print_install_report(&layout, &hood_bin, &report);
-    Ok(0)
+    Ok(())
 }
 
 /// Summary of what `install_at` did. Captured separately so tests can assert
 /// outcomes without parsing stderr.
 #[derive(Debug, Default)]
-pub struct InstallReport {
+pub(crate) struct InstallReport {
     /// Tool names that received a symlink in this run.
-    pub installed: Vec<&'static str>,
+    pub(crate) installed: Vec<&'static str>,
     /// Tool names skipped because the binary wasn't on `PATH`.
-    pub skipped: Vec<&'static str>,
-    /// Shell rc files that were updated.
-    pub touched_files: Vec<PathBuf>,
+    pub(crate) skipped: Vec<&'static str>,
+    /// Shell rc files that now carry the hood block.
+    pub(crate) touched_files: Vec<PathBuf>,
+    /// Shell rc files hood left alone, and why.
+    pub(crate) untouched_files: Vec<(PathBuf, &'static str)>,
 }
 
 /// Install hood shims using an explicit [`Layout`], hood binary path, and
 /// `search_path` (the `PATH` probed for each tool).
 ///
-/// The public [`install`] derives the layout from the user's real home and
+/// [`install`] derives the layout from the user's real home and
 /// passes [`std::env::consts::OS`] and `$PATH`. Tests should use this entry
 /// point.
 ///
@@ -166,7 +156,7 @@ pub struct InstallReport {
 /// # Errors
 /// Filesystem errors creating the shim directory, symlinking, or writing
 /// shell rc files.
-pub fn install_at(
+pub(crate) fn install_at(
     layout: &Layout,
     hood_bin: &Path,
     force: bool,
@@ -195,11 +185,21 @@ pub fn install_at(
     }
 
     for rc in shell_configs(layout) {
-        write_shell_block(&rc, &layout.shim_dir)
-            .with_context(|| format!("update {}", rc.display()))?;
-        report.touched_files.push(rc);
+        match write_shell_block(&rc, &layout.shim_dir)
+            .with_context(|| format!("update {}", rc.display()))?
+        {
+            Outcome::Written | Outcome::Unchanged => report.touched_files.push(rc),
+            Outcome::Skipped(why) => report.untouched_files.push((rc, why)),
+        }
     }
     Ok(report)
+}
+
+/// Warn about each shell config hood would not edit; the user has to.
+fn print_untouched(untouched: &[(PathBuf, &str)]) {
+    for (file, why) in untouched {
+        eprintln!("  left alone: {} — {why}", file.display());
+    }
 }
 
 fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport) {
@@ -212,6 +212,7 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
     if !report.skipped.is_empty() {
         eprintln!("  skipped (not on PATH): {}", report.skipped.join(", "));
     }
+    print_untouched(&report.untouched_files);
     if report.touched_files.is_empty() {
         eprintln!(
             "\nNo shell rc file was updated. Add this line to your shell rc manually:\n  export PATH={}:\"$PATH\"",
@@ -227,9 +228,38 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
                 "\nRestart PowerShell to activate. cmd.exe is not covered; put {} first in your PATH for it.",
                 layout.shim_dir.display()
             );
+            #[cfg(windows)]
+            warn_if_profiles_blocked();
         } else {
             eprintln!("\nRestart your shell (or `source` the rc file) to activate.");
         }
+    }
+}
+
+/// Windows PowerShell runs no profile at all under the `Restricted` execution
+/// policy, the Windows client default, and no unsigned one under `AllSigned`.
+/// Say so now, rather than leave an error on every PowerShell launch.
+#[cfg(windows)]
+fn warn_if_profiles_blocked() {
+    let Ok(output) = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-ExecutionPolicy",
+        ])
+        .output()
+    else {
+        return;
+    };
+    let policy = String::from_utf8_lossy(&output.stdout);
+    let policy = policy.trim();
+    if matches!(policy, "Restricted" | "AllSigned") {
+        eprintln!(
+            "\nWindows PowerShell's execution policy is {policy}, so it will not run the profile hood wrote.\n\
+             Allow it with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`."
+        );
     }
 }
 
@@ -241,7 +271,7 @@ fn print_install_report(layout: &Layout, hood_bin: &Path, report: &InstallReport
 ///
 /// # Errors
 /// Surfaces filesystem errors on link removal and rc-file rewrites.
-pub fn uninstall() -> Result<i32> {
+pub fn uninstall() -> Result<()> {
     let layout = layout_default()?;
     let report = uninstall_at(&layout)?;
     eprintln!("hood uninstall complete.");
@@ -252,16 +282,19 @@ pub fn uninstall() -> Result<i32> {
             eprintln!("    {}", f.display());
         }
     }
-    Ok(0)
+    print_untouched(&report.untouched_files);
+    Ok(())
 }
 
 /// Summary of what `uninstall_at` did.
 #[derive(Debug, Default)]
-pub struct UninstallReport {
+pub(crate) struct UninstallReport {
     /// Count of shim files removed from the shim directory.
-    pub removed_shims: usize,
+    pub(crate) removed_shims: usize,
     /// Shell rc files that had their hood block stripped.
-    pub cleaned_files: Vec<PathBuf>,
+    pub(crate) cleaned_files: Vec<PathBuf>,
+    /// Shell rc files hood left alone, and why.
+    pub(crate) untouched_files: Vec<(PathBuf, &'static str)>,
 }
 
 /// Uninstall hood shims using an explicit [`Layout`]. Tests should use this
@@ -269,7 +302,7 @@ pub struct UninstallReport {
 ///
 /// # Errors
 /// Filesystem errors when reading the shim directory or rewriting rc files.
-pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
+pub(crate) fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
     let mut report = UninstallReport::default();
     if layout.shim_dir.is_dir() {
         for entry in fs::read_dir(&layout.shim_dir)
@@ -297,8 +330,10 @@ pub fn uninstall_at(layout: &Layout) -> Result<UninstallReport> {
         }
     }
     for rc in shell_configs(layout) {
-        if remove_shell_block(&rc).context("strip shim block")? {
-            report.cleaned_files.push(rc);
+        match remove_shell_block(&rc).context("strip shim block")? {
+            Outcome::Written => report.cleaned_files.push(rc),
+            Outcome::Unchanged => {}
+            Outcome::Skipped(why) => report.untouched_files.push((rc, why)),
         }
     }
     Ok(report)
@@ -335,18 +370,24 @@ fn install_link(dir: &Path, tool: &str, hood_bin: &Path, force: bool) -> Result<
                 return Ok(());
             }
             if !is_hood_shim(&link) {
-                return Err(anyhow::anyhow!(
-                    "refusing to replace unrelated file {}",
-                    link.display(),
-                ));
+                bail!("refusing to replace unrelated file {}", link.display());
             }
-            fs::remove_file(&link).with_context(|| format!("remove stale {}", link.display()))?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("inspect {}", link.display())),
     }
-    std::os::unix::fs::symlink(hood_bin, &link)
-        .with_context(|| format!("symlink {} -> {}", link.display(), hood_bin.display()))
+    // Built beside the shim and renamed over it, so a replaced shim is never
+    // missing, even if this fails halfway.
+    let staged = dir.join(format!(".{tool}.hood-new"));
+    match fs::remove_file(&staged) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove leftover {}", staged.display()));
+        }
+        _ => {}
+    }
+    std::os::unix::fs::symlink(hood_bin, &staged)
+        .with_context(|| format!("symlink {} -> {}", staged.display(), hood_bin.display()))?;
+    fs::rename(&staged, &link).with_context(|| format!("move {} into place", link.display()))
 }
 
 #[cfg(windows)]
@@ -355,10 +396,7 @@ fn install_link(dir: &Path, tool: &str, hood_bin: &Path, force: bool) -> Result<
     match fs::symlink_metadata(&link) {
         Ok(_) => {
             if !is_hood_shim(&link) {
-                return Err(anyhow::anyhow!(
-                    "refusing to replace unrelated file {}",
-                    link.display(),
-                ));
+                bail!("refusing to replace unrelated file {}", link.display());
             }
             // Upgrading hood replaces hood.exe. A symlink follows that; a hard
             // link or copy keeps the old bytes, so it is re-linked here.
@@ -468,25 +506,62 @@ fn powershell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Add (or replace) the hood-marked block in `rc_file`. Idempotent.
-fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
-    let extension = rc_file.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_fish = extension.eq_ignore_ascii_case("fish");
-    let is_powershell = extension.eq_ignore_ascii_case("ps1");
+/// What editing one shell config came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// The file now says what it should, and had to be rewritten to.
+    Written,
+    /// The file already said what it should.
+    Unchanged,
+    /// hood left the file alone, for this reason; the user has to look.
+    Skipped(&'static str),
+}
 
-    let existing = match fs::read_to_string(rc_file) {
+/// Read `rc_file`, strip any hood block, let `render` produce the new text,
+/// and write it back if that changed anything. A missing file reads as empty.
+///
+/// A file hood cannot read as text, or whose markers do not pair up, is left
+/// exactly as it is: rewriting either could destroy lines the user wrote.
+fn edit_shell_config(rc_file: &Path, render: impl FnOnce(String) -> String) -> Result<Outcome> {
+    let existing = match fs::read(rc_file) {
         Ok(existing) => existing,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e).with_context(|| format!("read {}", rc_file.display())),
     };
-    let mut filtered = strip_block(&existing);
+    let Ok(existing) = String::from_utf8(existing) else {
+        return Ok(Outcome::Skipped(
+            "not UTF-8 text (a PowerShell profile saved as UTF-16?)",
+        ));
+    };
+    let Some(stripped) = strip_block(&existing) else {
+        return Ok(Outcome::Skipped(
+            "its hood markers do not pair up; remove them by hand",
+        ));
+    };
+    let updated = render(stripped);
+    if updated == existing {
+        return Ok(Outcome::Unchanged);
+    }
+    if let Some(parent) = rc_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create shell config directory {}", parent.display()))?;
+    }
+    atomic_write(rc_file, updated.as_bytes())
+        .with_context(|| format!("write {}", rc_file.display()))?;
+    Ok(Outcome::Written)
+}
 
-    let block = if is_fish {
+/// Add (or replace) the hood-marked block in `rc_file`. Idempotent.
+fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<Outcome> {
+    let extension = rc_file.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let block = if extension.eq_ignore_ascii_case("fish") {
+        // `--path` sets this session's `$PATH` only: the default would store
+        // the directory in a universal variable that outlives `hood uninstall`.
         let dir = fish_quote(&shim_dir.to_string_lossy());
         format!(
-            "{MARK_BEGIN}\nif type -q fish_add_path\n    fish_add_path -p {dir}\nelse\n    set -gx PATH {dir} $PATH\nend\n{MARK_END}\n",
+            "{MARK_BEGIN}\nif type -q fish_add_path\n    fish_add_path --path --prepend --move {dir}\nelse\n    set -gx PATH {dir} $PATH\nend\n{MARK_END}\n",
         )
-    } else if is_powershell {
+    } else if extension.eq_ignore_ascii_case("ps1") {
         let dir = powershell_quote(&shim_dir.to_string_lossy());
         format!("{MARK_BEGIN}\n$env:Path = {dir} + ';' + $env:Path\n{MARK_END}\n")
     } else {
@@ -495,71 +570,42 @@ fn write_shell_block(rc_file: &Path, shim_dir: &Path) -> Result<()> {
         let dir = posix_quote(&shim_dir.to_string_lossy());
         format!("{MARK_BEGIN}\nexport PATH={dir}:\"$PATH\"\n{MARK_END}\n")
     };
-
-    if !filtered.is_empty() && !filtered.ends_with('\n') {
-        filtered.push('\n');
-    }
-    filtered.push_str(&block);
-
-    if let Some(parent) = rc_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create shell config directory {}", parent.display()))?;
-    }
-    atomic_write(rc_file, filtered.as_bytes())
-        .with_context(|| format!("write {}", rc_file.display()))
+    edit_shell_config(rc_file, |mut text| {
+        // Match the file's own line endings; Windows profiles are often CRLF.
+        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push_str(eol);
+        }
+        text.push_str(&block.replace('\n', eol));
+        text
+    })
 }
 
-/// Remove the hood-marked block, if any. Returns whether anything changed.
-fn remove_shell_block(rc_file: &Path) -> Result<bool> {
-    let existing = match fs::read_to_string(rc_file) {
-        Ok(existing) => existing,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e).with_context(|| format!("read {}", rc_file.display())),
-    };
-    let stripped = strip_block(&existing);
-    if stripped == existing {
-        return Ok(false);
-    }
-    atomic_write(rc_file, stripped.as_bytes())
-        .with_context(|| format!("rewrite {}", rc_file.display()))?;
-    Ok(true)
+/// Remove the hood-marked block, if any.
+fn remove_shell_block(rc_file: &Path) -> Result<Outcome> {
+    edit_shell_config(rc_file, |text| text)
 }
 
-/// Remove everything between `MARK_BEGIN` and `MARK_END` (inclusive), supporting
-/// multiple blocks (defensive against hand-pasted duplicates).
-fn strip_block(input: &str) -> String {
+/// Remove every `MARK_BEGIN`…`MARK_END` block (inclusive), keeping every other
+/// line byte for byte, its line ending included. Several blocks are tolerated,
+/// as from a hand-pasted duplicate.
+///
+/// `None` when the markers do not pair up — a begin with no end, or a begin
+/// inside a block. That may be user text or a damaged file, and neither is
+/// permission to discard what follows the marker.
+fn strip_block(input: &str) -> Option<String> {
     let mut out = String::with_capacity(input.len());
-    let mut pending = String::new();
     let mut in_block = false;
-    for line in input.lines() {
-        let t = line.trim();
-        if !in_block && t == MARK_BEGIN {
-            in_block = true;
-            pending.push_str(line);
-            pending.push('\n');
-            continue;
+    for line in input.split_inclusive('\n') {
+        match (in_block, line.trim()) {
+            (false, MARK_BEGIN) => in_block = true,
+            (true, MARK_BEGIN) => return None,
+            (true, MARK_END) => in_block = false,
+            (true, _) => {}
+            (false, _) => out.push_str(line),
         }
-        if in_block {
-            pending.push_str(line);
-            pending.push('\n');
-            if t == MARK_END {
-                in_block = false;
-                pending.clear();
-            }
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
     }
-    // An unmatched begin marker may be user-authored text or a truncated file.
-    // Never interpret it as permission to discard the remainder of the rc file.
-    if in_block {
-        out.push_str(&pending);
-    }
-    if !input.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    (!in_block).then_some(out)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -574,9 +620,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
     };
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let permissions = fs::metadata(&destination)
-        .ok()
-        .map(|metadata| metadata.permissions());
+    let original = fs::metadata(&destination).ok();
 
     // tempfile uses an unpredictable create-new name, closing the predictable
     // `<rc>.hood-tmp` symlink-clobber race. Persist is an atomic rename within
@@ -591,15 +635,36 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp.as_file()
         .sync_all()
         .context("sync temporary shell config")?;
-    if let Some(permissions) = permissions {
+    if let Some(original) = &original {
         tmp.as_file()
-            .set_permissions(permissions)
+            .set_permissions(original.permissions())
             .context("preserve shell config permissions")?;
+        #[cfg(unix)]
+        preserve_owner(tmp.as_file(), original);
     }
     tmp.persist(&destination)
         .map_err(|e| e.error)
         .with_context(|| format!("replace {}", destination.display()))?;
     Ok(())
+}
+
+/// Give the replacement the original's owner. The rename would otherwise hand
+/// a `sudo hood install` user's `.zshrc` to root. Only root can change an
+/// owner, and only a run as another user needs to; anyone else's attempt
+/// fails harmlessly and is logged.
+#[cfg(unix)]
+fn preserve_owner(file: &fs::File, original: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = file.metadata() else {
+        return;
+    };
+    if (current.uid(), current.gid()) == (original.uid(), original.gid()) {
+        return;
+    }
+    if let Err(error) = std::os::unix::fs::fchown(file, Some(original.uid()), Some(original.gid()))
+    {
+        tracing::debug!(%error, "could not preserve shell config owner");
+    }
 }
 
 #[cfg(test)]
@@ -672,32 +737,80 @@ mod tests {
         // Idempotent: a second write replaces rather than appends.
         write_shell_block(&profile, Path::new("C:\\Users\\x\\.hood\\bin")).unwrap();
         assert_eq!(fs::read_to_string(&profile).unwrap(), body);
-        assert!(remove_shell_block(&profile).unwrap());
+        assert_eq!(remove_shell_block(&profile).unwrap(), Outcome::Written);
         assert_eq!(fs::read_to_string(&profile).unwrap(), "");
     }
 
     #[test]
     fn strip_block_removes_marked_section() {
         let input = format!("before\n{MARK_BEGIN}\nexport PATH=...\n{MARK_END}\nafter\n");
-        assert_eq!(strip_block(&input), "before\nafter\n");
+        assert_eq!(strip_block(&input).unwrap(), "before\nafter\n");
     }
 
     #[test]
     fn strip_block_removes_multiple_marked_sections() {
         let input = format!("a\n{MARK_BEGIN}\nx\n{MARK_END}\nb\n{MARK_BEGIN}\ny\n{MARK_END}\nc\n");
-        assert_eq!(strip_block(&input), "a\nb\nc\n");
+        assert_eq!(strip_block(&input).unwrap(), "a\nb\nc\n");
     }
 
+    /// An unpaired marker may be user text or a damaged file; neither is
+    /// permission to discard what follows it.
     #[test]
-    fn strip_block_preserves_unterminated_marker_and_trailing_content() {
-        let input = format!("before\n{MARK_BEGIN}\nuser data\n");
-        assert_eq!(strip_block(&input), input);
+    fn strip_block_refuses_unpaired_markers() {
+        let unterminated = format!("before\n{MARK_BEGIN}\nuser data\n");
+        assert_eq!(strip_block(&unterminated), None);
+        // An orphaned begin, then a complete block: stripping the outer pair
+        // would take the user's line with it.
+        let nested = format!("{MARK_BEGIN}\nuser data\n{MARK_BEGIN}\nx\n{MARK_END}\n");
+        assert_eq!(strip_block(&nested), None);
     }
 
     #[test]
     fn strip_block_is_noop_on_unmarked_input() {
         let input = "alpha\nbeta\ngamma\n";
-        assert_eq!(strip_block(input), input);
+        assert_eq!(strip_block(input).unwrap(), input);
+    }
+
+    #[test]
+    fn crlf_files_keep_their_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.ps1");
+        fs::write(&profile, "Set-Alias ll ls\r\n").unwrap();
+        write_shell_block(&profile, Path::new("C:\\hood")).unwrap();
+        let written = fs::read_to_string(&profile).unwrap();
+        assert!(written.starts_with("Set-Alias ll ls\r\n"));
+        assert_eq!(
+            written.matches('\n').count(),
+            written.matches("\r\n").count()
+        );
+        assert_eq!(remove_shell_block(&profile).unwrap(), Outcome::Written);
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "Set-Alias ll ls\r\n");
+        // Nothing of hood's left: nothing to do, and nothing reported.
+        assert_eq!(remove_shell_block(&profile).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn unreadable_or_unpaired_configs_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let utf16 = dir.path().join("utf16.ps1");
+        let bytes = [0xff, 0xfe, b'#', 0, b'\n', 0];
+        fs::write(&utf16, bytes).unwrap();
+        assert!(matches!(
+            write_shell_block(&utf16, Path::new("C:\\hood")).unwrap(),
+            Outcome::Skipped(_)
+        ));
+        assert_eq!(fs::read(&utf16).unwrap(), bytes);
+
+        let unpaired = dir.path().join(".zshrc");
+        let text = format!("{MARK_BEGIN}\nalias x=y\n");
+        fs::write(&unpaired, &text).unwrap();
+        for outcome in [
+            write_shell_block(&unpaired, Path::new("/hood")).unwrap(),
+            remove_shell_block(&unpaired).unwrap(),
+        ] {
+            assert!(matches!(outcome, Outcome::Skipped(_)), "{outcome:?}");
+        }
+        assert_eq!(fs::read_to_string(&unpaired).unwrap(), text);
     }
 
     #[test]
@@ -733,11 +846,11 @@ mod tests {
             "block must be replaced, not duplicated"
         );
 
-        assert!(remove_shell_block(&rc).unwrap());
+        assert_eq!(remove_shell_block(&rc).unwrap(), Outcome::Written);
         let after_remove = fs::read_to_string(&rc).unwrap();
         assert_eq!(after_remove, "echo hi\n");
 
-        assert!(!remove_shell_block(&rc).unwrap());
+        assert_eq!(remove_shell_block(&rc).unwrap(), Outcome::Unchanged);
     }
 
     #[cfg(unix)]
@@ -838,14 +951,13 @@ mod tests {
     }
 
     #[test]
-    fn shim_names_lists_every_tool_except_exec() {
-        let names = shim_names();
-        assert!(names.contains(&"npm"));
-        assert!(names.contains(&"cargo"));
-        assert!(names.contains(&"zig"));
-        assert!(names.contains(&"brew"));
-        assert!(!names.contains(&"exec"));
-        assert!(!names.contains(&"hood"));
+    fn argv0_names_only_shimmable_tools() {
+        for name in ["npm", "/home/u/.hood/bin/cargo", "zig", "brew.exe"] {
+            assert!(tool_from_argv0(name).is_some(), "{name}");
+        }
+        for name in ["exec", "hood", "npmx", ""] {
+            assert!(tool_from_argv0(name).is_none(), "{name}");
+        }
     }
 
     #[test]

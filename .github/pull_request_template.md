@@ -9,8 +9,7 @@ CA handling, proxying, scanner verdicts, or bypasses. Write “none” when appl
 
 ## Verification
 
-- [ ] `cargo fmt --check`
-- [ ] `make lint`
+- [ ] `make lint` (rustfmt and clippy)
 - [ ] `make test`
 - [ ] Documentation and tests cover changed behavior
 - [ ] No credentials, private payloads, registry URLs, or CA material are included

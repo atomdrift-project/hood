@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tokio::process::Command;
@@ -18,6 +18,9 @@ use url::Url;
 
 /// Prefix reserved for authenticated loopback Go bridge requests.
 pub(crate) const ROUTE_PREFIX: &str = "/__hood_go/";
+
+/// The longest `go env` may take; see [`GoBridge::query`].
+const GO_ENV_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 /// Effective Go network settings captured from `go env`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,18 +78,25 @@ impl GoBridge {
         if let (Some(goproxy), Some(gosumdb)) = (set("GOPROXY"), set("GOSUMDB")) {
             return Self::new(&goproxy, &gosumdb);
         }
-        let output = Command::new(go_binary)
-            .args(["env", "GOPROXY", "GOSUMDB"])
-            .output()
-            .await
-            .with_context(|| format!("run {} env", go_binary.display()))?;
+        // Generous: with `GOTOOLCHAIN=auto`, `go env` may first download a
+        // toolchain. Bounded all the same, so a wedged `go` cannot hang hood.
+        let output = tokio::time::timeout(
+            GO_ENV_TIMEOUT,
+            Command::new(go_binary)
+                .args(["env", "GOPROXY", "GOSUMDB"])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .with_context(|| format!("{} env timed out", go_binary.display()))?
+        .with_context(|| format!("run {} env", go_binary.display()))?;
         if !output.status.success() {
-            return Err(anyhow!(
+            bail!(
                 "{} env failed with status {}: {}",
                 go_binary.display(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim(),
-            ));
+            );
         }
         let stdout = String::from_utf8(output.stdout).context("go env output is not UTF-8")?;
         let mut lines = stdout.split('\n');
@@ -144,7 +154,7 @@ pub(crate) fn resolve_request(uri: &hyper::Uri, token: &str) -> Result<Option<Ur
     };
     let (encoded, suffix) = rest.split_once('/').unwrap_or((rest, ""));
     if encoded.is_empty() {
-        return Err(anyhow!("missing Go bridge target"));
+        bail!("missing Go bridge target");
     }
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
@@ -152,10 +162,7 @@ pub(crate) fn resolve_request(uri: &hyper::Uri, token: &str) -> Result<Option<Ur
     let raw = String::from_utf8(decoded).context("Go bridge target is not UTF-8")?;
     let mut base = Url::parse(&raw).context("parse Go bridge target")?;
     if !matches!(base.scheme(), "http" | "https") {
-        return Err(anyhow!(
-            "unsupported Go bridge target scheme: {}",
-            base.scheme()
-        ));
+        bail!("unsupported Go bridge target scheme: {}", base.scheme());
     }
     base.set_fragment(None);
     if suffix.is_empty() {
@@ -194,7 +201,7 @@ fn normalize_proxy_url(entry: &str) -> Result<Url> {
     };
     let url = Url::parse(&candidate).with_context(|| format!("invalid GOPROXY entry {entry:?}"))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(anyhow!("unsupported GOPROXY scheme: {}", url.scheme()));
+        bail!("unsupported GOPROXY scheme: {}", url.scheme());
     }
     Ok(url)
 }
@@ -222,7 +229,7 @@ fn parse_proxy_chain(value: &str) -> Result<Vec<ProxyEntry>> {
         })
         .collect::<Result<_>>()?;
     if entries.is_empty() {
-        return Err(anyhow!("GOPROXY must contain at least one entry"));
+        bail!("GOPROXY must contain at least one entry");
     }
     Ok(entries)
 }
@@ -237,7 +244,7 @@ fn parse_sumdb(value: &str) -> Result<SumDb> {
         .ok_or_else(|| anyhow!("invalid GOSUMDB value {value:?}"))?;
     let explicit_target = fields.next();
     if fields.next().is_some() {
-        return Err(anyhow!("invalid GOSUMDB value {value:?}"));
+        bail!("invalid GOSUMDB value {value:?}");
     }
 
     let identity = if raw_identity == "sum.golang.google.cn" {
@@ -247,10 +254,7 @@ fn parse_sumdb(value: &str) -> Result<SumDb> {
     };
     let target = sumdb_target(raw_identity, explicit_target)?;
     if !matches!(target.scheme(), "http" | "https") {
-        return Err(anyhow!(
-            "unsupported GOSUMDB URL scheme: {}",
-            target.scheme()
-        ));
+        bail!("unsupported GOSUMDB URL scheme: {}", target.scheme());
     }
     Ok(SumDb::Verify {
         identity: identity.to_owned(),

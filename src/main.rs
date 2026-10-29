@@ -6,13 +6,13 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AtomScanner, ScanPolicy, ScanStats, Scanner};
+use hood::scanner::{AtomScanner, ScanPolicy, ScanStats};
 use hood::tools::{
     Dispatch, PreparedChildEnv, Program, Tool, dispatch, prepare_child_env, resolve_real_binary,
-    run_child, run_passthrough,
+    run_tool,
 };
 
 #[derive(Parser, Debug)]
@@ -24,204 +24,15 @@ struct Cli {
     command: Command,
 }
 
-/// Hood's own flags precede the tool name (`hood -v npm install`). Each tool
-/// subcommand passes everything after its name to the tool verbatim, so a
-/// shimmed `npm -v` or `curl --help` reaches npm or curl, not hood.
+/// hood takes no options of its own before a tool's name, and passes every
+/// argument after it to the tool verbatim, so a shimmed `npm -v` or
+/// `curl --help` reaches npm or curl, not hood.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run `curl` through the proxy.
-    #[command(disable_help_flag = true)]
-    Curl {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `wget` through the proxy.
-    #[command(disable_help_flag = true)]
-    Wget {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `npm`. install/i/add/ci/update get `--ignore-scripts` by default;
-    /// `test`/`run` and friends pass straight through.
-    #[command(disable_help_flag = true)]
-    Npm {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `npx` through the proxy; argv is preserved exactly.
-    #[command(disable_help_flag = true)]
-    Npx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pnpm` (same intercept set as npm).
-    #[command(disable_help_flag = true)]
-    Pnpm {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pnpx` through the proxy; argv is preserved exactly.
-    #[command(disable_help_flag = true)]
-    Pnpx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `yarn` (same intercept set as npm).
-    #[command(disable_help_flag = true)]
-    Yarn {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `rush`; custom commands may provision autoinstallers.
-    #[command(disable_help_flag = true)]
-    Rush {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `rushx`; project scripts inherit hood's proxy environment.
-    #[command(disable_help_flag = true)]
-    Rushx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `bun`.
-    #[command(disable_help_flag = true)]
-    Bun {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `bunx` through the proxy; argv is preserved exactly.
-    #[command(disable_help_flag = true)]
-    Bunx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pip`. install/download/wheel are intercepted; everything else passes through.
-    #[command(disable_help_flag = true)]
-    Pip {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pip3` (same intercept set and trust model as pip).
-    #[command(disable_help_flag = true)]
-    Pip3 {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pipx`.
-    #[command(disable_help_flag = true)]
-    Pipx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `uv` (Astral's pip replacement).
-    #[command(disable_help_flag = true)]
-    Uv {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `uvx` (equivalent to `uv tool run`) through the proxy.
-    #[command(disable_help_flag = true)]
-    Uvx {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `poetry`.
-    #[command(disable_help_flag = true)]
-    Poetry {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pdm`; dependency-resolving commands are intercepted.
-    #[command(disable_help_flag = true)]
-    Pdm {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `go`. `get`/`install`/`mod` are intercepted; `run`/`test`/`build`/`vet` pass through.
-    #[command(disable_help_flag = true)]
-    Go {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `cargo`. `install`/`add`/`update`/`fetch` are intercepted; `build`/`test`/`run` pass through.
-    #[command(disable_help_flag = true)]
-    Cargo {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `zig`. `build` and `fetch` are intercepted; `run`/`test`/`cc` pass through.
-    #[command(disable_help_flag = true)]
-    Zig {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `brew`. `install`/`upgrade`/`reinstall`/`fetch`/`tap`/`bundle` are intercepted.
-    #[command(disable_help_flag = true)]
-    Brew {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pacman`. `-S`/`-U` (sync/upgrade) operations are intercepted; `-Q`/`-R` pass through.
-    #[command(disable_help_flag = true)]
-    Pacman {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `yay` (Arch AUR helper). Installs and upgrades are intercepted; queries pass through.
-    #[command(disable_help_flag = true)]
-    Yay {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `paru` (Arch AUR helper). Same intercept model as yay.
-    #[command(disable_help_flag = true)]
-    Paru {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `makepkg`. Any build fetches sources and is intercepted; info flags pass through.
-    #[command(disable_help_flag = true)]
-    Makepkg {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `dnf`. `install`/`upgrade`/`update`/`download` and friends are intercepted.
-    #[command(disable_help_flag = true)]
-    Dnf {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `yum` (dnf-compatible front end).
-    #[command(disable_help_flag = true)]
-    Yum {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `zypper`. `install`/`in`/`update`/`dup`/`patch`/`refresh` are intercepted.
-    #[command(disable_help_flag = true)]
-    Zypper {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `rpm`. Intercepted only when given an `http(s)`/`ftp` URL; local installs pass through.
-    #[command(disable_help_flag = true)]
-    Rpm {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `pkg` (FreeBSD). `install`/`add`/`upgrade`/`fetch`/`update` are intercepted.
-    #[command(disable_help_flag = true)]
-    Pkg {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
-    /// Run `apk` (Alpine). `add`/`upgrade`/`update`/`fetch` are intercepted.
-    #[command(disable_help_flag = true)]
-    Apk {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        args: Vec<OsString>,
-    },
+    /// Run a supported tool through hood, as in `hood npm install`.
+    /// Everything after the tool's name goes to it untouched.
+    #[command(external_subcommand)]
+    Tool(Vec<OsString>),
     /// Run an arbitrary command; hood injects every env var it knows.
     Exec {
         /// Binary to run, followed by its args.
@@ -245,6 +56,10 @@ enum Command {
     Version,
 }
 
+/// `sysexits.h`'s internal software error: hood itself failed, as opposed to
+/// the tool it ran, whose own exit code is passed through.
+const EX_SOFTWARE: u8 = 70;
+
 fn main() {
     let code = hood_main();
     // End without C exit handlers. Once Security.framework has loaded trust
@@ -253,8 +68,9 @@ fn main() {
     // dropped by now; only stdout may still hold buffered bytes.
     drop(std::io::stdout().flush());
     #[cfg(unix)]
-    // SAFETY: `_exit` only ends the process; nothing in it can observe a
-    // half-dropped value, because none remain.
+    // SAFETY: `_exit` has no preconditions. What it skips, C exit handlers
+    // and Rust destructors, is the point: hood's own state has dropped, and
+    // stdout was flushed above.
     #[allow(unsafe_code)]
     unsafe {
         libc::_exit(code.into());
@@ -267,7 +83,10 @@ fn main() {
 /// files all drop before this returns.
 fn hood_main() -> u8 {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let cli = Cli::parse_from(rewrite_argv_for_shim(argv));
+    let cli = Cli::command()
+        .after_help(format!("Tools: {}", tool_names()))
+        .get_matches_from(rewrite_argv_for_shim(argv));
+    let cli = Cli::from_arg_matches(&cli).unwrap_or_else(|e| e.exit());
     let verbose = verbose_from_env();
     init_logging(verbose);
 
@@ -287,7 +106,7 @@ fn hood_main() -> u8 {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("hood: failed to start tokio runtime: {e:#}");
-            return 70;
+            return EX_SOFTWARE;
         }
     };
 
@@ -295,7 +114,7 @@ fn hood_main() -> u8 {
         Ok(code) => u8::try_from(code).unwrap_or(1),
         Err(e) => {
             eprintln!("hood: {e:#}");
-            70
+            EX_SOFTWARE
         }
     }
 }
@@ -323,8 +142,8 @@ fn rewrite_argv_for_shim(argv: Vec<OsString>) -> Vec<OsString> {
 async fn run(command: Command, verbose: bool) -> Result<i32> {
     let (program, initial_args) = match Action::try_from(command)? {
         Action::Run { program, argv } => (program, argv),
-        Action::Install { force } => return hood::install::install(force),
-        Action::Uninstall => return hood::install::uninstall(),
+        Action::Install { force } => return hood::install::install(force).map(|()| 0),
+        Action::Uninstall => return hood::install::uninstall().map(|()| 0),
         Action::Enrich => {
             // Blocking HTTP and a terminal read: off the async runtime.
             tokio::task::spawn_blocking(cleave::rule_update::enrich).await??;
@@ -355,47 +174,63 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
     };
     let child_args = match dispatched {
         Dispatch::Passthrough(child_args) => {
-            return run_passthrough(&program, child_args, shim_dir.as_deref()).await;
+            return run_tool(&program, child_args, None, shim_dir.as_deref()).await;
         }
         Dispatch::Intercept(child_args) => child_args,
     };
 
     let policy = resolve_policy();
-
-    // Setup the full scan/proxy pipeline. Only the top bypass tier
-    // (`HOOD_BYPASS=3`) tolerates a startup failure by forwarding unscanned —
-    // that level already forwards every verdict. Levels 1 and 2 promise to keep
-    // *blocking* hostile/suspicious payloads; the scanner being down makes that
-    // impossible, so an infrastructure failure fails closed like Strict rather
-    // than silently downgrading to "download everything unscanned."
     // Go reads SSL_CERT_FILE only on Unix systems other than macOS; macOS and
     // Windows consult the system store alone, so they get the loopback bridge.
-    let go_bridge = if cfg!(any(target_os = "macos", windows)) && program.tool() == Some(Tool::Go) {
-        let go = resolve_real_binary("go", shim_dir.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("no real `go` found on PATH (only the hood shim)"))?;
-        Some(
-            GoBridge::query(&go)
-                .await
-                .context("read effective Go network settings")?,
-        )
-    } else {
-        None
-    };
-
+    let go_bridge = cfg!(any(target_os = "macos", windows)) && program.tool() == Some(Tool::Go);
     // Zig cannot trust hood's CA on any platform; see `Tool::Zig`.
     let zig_clients = program.tool() == Some(Tool::Zig);
-    let setup_result =
-        setup_proxy(policy, invocation.clone(), go_bridge, zig_clients, verbose).await;
+
+    let setup_result = async {
+        let go_bridge = if go_bridge {
+            let go = resolve_real_binary("go", shim_dir.as_deref())
+                .context("no real `go` found on PATH (only the hood shim)")?;
+            Some(
+                GoBridge::query(&go)
+                    .await
+                    .context("read effective Go network settings")?,
+            )
+        } else {
+            None
+        };
+        setup_proxy(
+            policy,
+            invocation.clone(),
+            go_bridge,
+            program.scan_limit(),
+            zig_clients,
+            verbose,
+        )
+        .await
+    }
+    .await;
+    // Only the top bypass tier (`HOOD_BYPASS=3`) tolerates a startup failure
+    // by forwarding unscanned — that level already forwards every verdict.
+    // Levels 1 and 2 promise to keep *blocking* hostile/suspicious payloads;
+    // the scanner being down makes that impossible, so an infrastructure
+    // failure fails closed like Strict rather than silently downgrading to
+    // "download everything unscanned."
     let proxy_setup = match setup_result {
         Ok(setup) => setup,
         Err(e) if matches!(policy, ScanPolicy::Bypass) => {
             hood::output::emit_failsafe(&invocation, policy, &format!("{e:#}"));
-            return run_passthrough(&program, child_args, shim_dir.as_deref()).await;
+            return run_tool(&program, child_args, None, shim_dir.as_deref()).await;
         }
         Err(e) => return Err(e),
     };
 
-    let exit_code = run_child(&program, child_args, &proxy_setup.env, shim_dir.as_deref()).await?;
+    let exit_code = run_tool(
+        &program,
+        child_args,
+        Some(&proxy_setup.env),
+        shim_dir.as_deref(),
+    )
+    .await?;
     proxy_setup.handle.stop().await;
     if let Some(stats) = &proxy_setup.stats {
         hood::output::emit_scan_summary(stats.snapshot());
@@ -416,18 +251,25 @@ async fn setup_proxy(
     policy: ScanPolicy,
     invocation: String,
     go_bridge: Option<GoBridge>,
+    scan_limit: Option<u64>,
     zig_clients: bool,
     show_passes: bool,
 ) -> Result<ProxySetup> {
     let stats = show_passes.then(|| Arc::new(ScanStats::default()));
     let scanner = {
         let stats = stats.clone();
-        tokio::task::spawn_blocking(move || build_scanner(policy, invocation, stats))
-            .await
-            .context("build scanner task")??
+        tokio::task::spawn_blocking(move || {
+            // Network and disk: fetch what local analysis lacks up front.
+            hood::scanner::prepare();
+            AtomScanner::new(policy, invocation, stats)
+        })
+        .await
+        .context("build scanner task")?
     };
-    let config = Config::default().with_zig_clients(zig_clients);
-    let proxy = Proxy::new(scanner, config).context("build proxy")?;
+    let config = Config::default()
+        .with_scan_limit(scan_limit)?
+        .with_zig_clients(zig_clients);
+    let proxy = Proxy::new(Arc::new(scanner), config).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let go_bridge_token = proxy.go_bridge_token().to_owned();
     let handle = proxy.spawn().await.context("start proxy")?;
@@ -452,56 +294,92 @@ fn format_invocation(program: &Program, args: &[OsString]) -> String {
         Program::Tool(tool) => tool.name().to_owned(),
         Program::Command(path) => sh_quote(&path.to_string()),
     };
+    let curl = program.is_curl();
     let mut redact_next = false;
     for a in args {
         out.push(' ');
-        let raw = a.to_string_lossy();
         if redact_next {
             out.push_str("'<redacted>'");
             redact_next = false;
             continue;
         }
-        let (safe, takes_secret_value) = redact_invocation_arg(&raw);
+        let (safe, takes_secret_value) = redact_invocation_arg(&a.to_string_lossy(), curl);
         redact_next = takes_secret_value;
         out.push_str(&sh_quote(&safe));
     }
     out
 }
 
-/// Redact common credential-bearing command arguments before an invocation is
-/// retained for diagnostics. The real child argv is untouched. This list is
-/// deliberately broad: a less-copyable bypass hint is preferable to placing a
-/// registry token or Authorization header in terminal and CI logs.
-fn redact_invocation_arg(arg: &str) -> (String, bool) {
-    const VALUE_FLAGS: &[&str] = &[
-        "-H",
-        "--header",
-        "-u",
-        "--user",
-        "--proxy-user",
-        "--oauth2-bearer",
-        "--password",
-        "--token",
-        "--secret",
-        "--auth",
-    ];
-    if VALUE_FLAGS.contains(&arg) {
+/// Flags, in any tool, whose next argument is a credential.
+const SECRET_VALUE_FLAGS: &[&str] = &[
+    "--header",
+    "--user",
+    "--proxy-user",
+    "--oauth2-bearer",
+    "--password",
+    "--token",
+    "--secret",
+    "--auth",
+];
+
+/// curl's short spellings of `--header` and `--user`. Only curl's: to go and
+/// apk, `-u` means update.
+const CURL_SECRET_SHORT_FLAGS: [&str; 2] = ["-H", "-u"];
+
+/// Redact a credential-bearing argument before an invocation is retained for
+/// diagnostics, and say whether the argument after it is a credential too.
+/// The real child argv is untouched. Deliberately broad: a less-copyable bypass
+/// hint beats a registry token or Authorization header in terminal and CI logs.
+fn redact_invocation_arg(arg: &str, curl: bool) -> (String, bool) {
+    if SECRET_VALUE_FLAGS.contains(&arg) || (curl && CURL_SECRET_SHORT_FLAGS.contains(&arg)) {
         return (arg.to_owned(), true);
     }
-    if (arg.starts_with("-H") || arg.starts_with("-u")) && arg.len() > 2 {
-        return (format!("{}<redacted>", &arg[..2]), false);
-    }
-    if !arg.contains("://")
-        && let Some((key, _)) = arg.split_once('=')
-        && (is_sensitive_name(key) || VALUE_FLAGS.contains(&key))
+    // curl also takes the value attached: `-uuser:pass`, `-HAuthorization: …`.
+    if curl
+        && let Some(flag) = CURL_SECRET_SHORT_FLAGS
+            .into_iter()
+            .find(|flag| arg.len() > flag.len() && arg.starts_with(flag))
     {
-        return (format!("{key}=<redacted>"), false);
+        return (format!("{flag}<redacted>"), false);
     }
-    if let Ok(mut url) = url::Url::parse(arg)
-        && matches!(url.scheme(), "http" | "https")
-    {
-        let had_userinfo = !url.username().is_empty() || url.password().is_some();
-        let query: Vec<(String, String)> = url
+    // Before `key=value`: a URL's query has `=` in it, but its userinfo
+    // would survive redacting only the query.
+    if let Some(url) = parse_http_url(arg) {
+        return (redact_url(url).unwrap_or_else(|| arg.to_owned()), false);
+    }
+    if let Some((key, value)) = arg.split_once('=') {
+        if is_sensitive_name(key) || SECRET_VALUE_FLAGS.contains(&key) {
+            return (format!("{key}=<redacted>"), false);
+        }
+        // `--index-url=https://__token__:…@host/simple`
+        if let Some(url) = parse_http_url(value).and_then(redact_url) {
+            return (format!("{key}={url}"), false);
+        }
+    }
+    (arg.to_owned(), false)
+}
+
+fn parse_http_url(raw: &str) -> Option<url::Url> {
+    url::Url::parse(raw)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// `url` without its userinfo and with sensitive query values replaced, or
+/// `None` when it carried neither.
+fn redact_url(mut url: url::Url) -> Option<String> {
+    let has_userinfo = !url.username().is_empty() || url.password().is_some();
+    let has_secret_query = url.query_pairs().any(|(key, _)| is_sensitive_name(&key));
+    if !has_userinfo && !has_secret_query {
+        return None;
+    }
+    // An http(s) URL always has a host, so these cannot fail; if they ever
+    // did, show nothing of it rather than its credentials.
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return Some("<redacted>".to_owned());
+    }
+    if has_secret_query {
+        let pairs: Vec<(String, String)> = url
             .query_pairs()
             .map(|(key, value)| {
                 let value = if is_sensitive_name(&key) {
@@ -512,41 +390,9 @@ fn redact_invocation_arg(arg: &str) -> (String, bool) {
                 (key.into_owned(), value)
             })
             .collect();
-        let had_sensitive_query = query.iter().any(|(key, _)| is_sensitive_name(key));
-        if had_sensitive_query {
-            url.set_query(None);
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        if had_userinfo || had_sensitive_query {
-            // Rebuild from the origin instead of mutating userinfo in place.
-            // This keeps credentials out if setter semantics ever change.
-            let mut safe = format!("{}://", url.scheme());
-            if let Some(host) = url.host_str() {
-                if host.contains(':') {
-                    safe.push('[');
-                    safe.push_str(host);
-                    safe.push(']');
-                } else {
-                    safe.push_str(host);
-                }
-            }
-            if let Some(port) = url.port() {
-                safe.push(':');
-                safe.push_str(&port.to_string());
-            }
-            safe.push_str(url.path());
-            if let Some(query) = url.query() {
-                safe.push('?');
-                safe.push_str(query);
-            }
-            if let Some(fragment) = url.fragment() {
-                safe.push('#');
-                safe.push_str(fragment);
-            }
-            return (safe, false);
-        }
+        url.query_pairs_mut().clear().extend_pairs(pairs);
     }
-    (arg.to_owned(), false)
+    Some(url.into())
 }
 
 fn is_sensitive_name(name: &str) -> bool {
@@ -611,57 +457,45 @@ impl TryFrom<Command> for Action {
     type Error = anyhow::Error;
 
     fn try_from(command: Command) -> Result<Self> {
-        let (tool, argv) = match command {
-            Command::Curl { args } => (Tool::Curl, args),
-            Command::Wget { args } => (Tool::Wget, args),
-            Command::Npm { args } => (Tool::Npm, args),
-            Command::Npx { args } => (Tool::Npx, args),
-            Command::Pnpm { args } => (Tool::Pnpm, args),
-            Command::Pnpx { args } => (Tool::Pnpx, args),
-            Command::Yarn { args } => (Tool::Yarn, args),
-            Command::Rush { args } => (Tool::Rush, args),
-            Command::Rushx { args } => (Tool::Rushx, args),
-            Command::Bun { args } => (Tool::Bun, args),
-            Command::Bunx { args } => (Tool::Bunx, args),
-            Command::Pip { args } => (Tool::Pip, args),
-            Command::Pip3 { args } => (Tool::Pip3, args),
-            Command::Pipx { args } => (Tool::Pipx, args),
-            Command::Uv { args } => (Tool::Uv, args),
-            Command::Uvx { args } => (Tool::Uvx, args),
-            Command::Poetry { args } => (Tool::Poetry, args),
-            Command::Pdm { args } => (Tool::Pdm, args),
-            Command::Go { args } => (Tool::Go, args),
-            Command::Cargo { args } => (Tool::Cargo, args),
-            Command::Zig { args } => (Tool::Zig, args),
-            Command::Brew { args } => (Tool::Brew, args),
-            Command::Pacman { args } => (Tool::Pacman, args),
-            Command::Yay { args } => (Tool::Yay, args),
-            Command::Paru { args } => (Tool::Paru, args),
-            Command::Makepkg { args } => (Tool::Makepkg, args),
-            Command::Dnf { args } => (Tool::Dnf, args),
-            Command::Yum { args } => (Tool::Yum, args),
-            Command::Zypper { args } => (Tool::Zypper, args),
-            Command::Rpm { args } => (Tool::Rpm, args),
-            Command::Pkg { args } => (Tool::Pkg, args),
-            Command::Apk { args } => (Tool::Apk, args),
+        match command {
+            Command::Tool(argv) => {
+                let mut argv = argv.into_iter();
+                let name = argv.next().unwrap_or_default();
+                let tool = name.to_str().and_then(Tool::from_name).with_context(|| {
+                    format!(
+                        "unknown command {}; hood runs: {}",
+                        name.to_string_lossy(),
+                        tool_names()
+                    )
+                })?;
+                Ok(Self::Run {
+                    program: tool.into(),
+                    argv: argv.collect(),
+                })
+            }
             Command::Exec { argv } => {
                 let mut argv = argv.into_iter();
                 let program = argv.next().context("hood exec requires a command to run")?;
-                return Ok(Self::Run {
+                Ok(Self::Run {
                     program: Program::command(program)?,
                     argv: argv.collect(),
-                });
+                })
             }
-            Command::Install { force } => return Ok(Self::Install { force }),
-            Command::Uninstall => return Ok(Self::Uninstall),
-            Command::Enrich => return Ok(Self::Enrich),
-            Command::Version => return Ok(Self::Version),
-        };
-        Ok(Self::Run {
-            program: tool.into(),
-            argv,
-        })
+            Command::Install { force } => Ok(Self::Install { force }),
+            Command::Uninstall => Ok(Self::Uninstall),
+            Command::Enrich => Ok(Self::Enrich),
+            Command::Version => Ok(Self::Version),
+        }
     }
+}
+
+/// Every tool hood runs, comma-separated, for help and errors.
+fn tool_names() -> String {
+    Tool::SHIMMABLE
+        .iter()
+        .map(|tool| tool.name())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Map the `HOOD_BYPASS` env var to a policy. The ladder is strict — each
@@ -689,19 +523,6 @@ fn resolve_policy() -> ScanPolicy {
             ScanPolicy::Strict
         }
     }
-}
-
-/// Build the live scanner, first fetching anything it lacks (blocking; see
-/// [`hood::scanner::prepare`]).
-fn build_scanner(
-    policy: ScanPolicy,
-    invocation: String,
-    status: Option<Arc<ScanStats>>,
-) -> Result<Arc<dyn Scanner>> {
-    hood::scanner::prepare();
-    Ok(Arc::new(
-        AtomScanner::load(policy, invocation, status).context("load scan scanner")?,
-    ))
 }
 
 /// `HOOD_VERBOSE=1` prints a verdict per download and a summary. Any value but
@@ -735,8 +556,8 @@ fn init_logging(verbose: bool) {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hood=info,warn"))
     };
-    // try_init returns SubscriberInitExt's SetGlobalDefaultError on second
-    // call (tests, repeated entry); harmless to ignore.
+    // Fails only if a global subscriber is already set, and nothing else in
+    // hood sets one.
     drop(
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -761,8 +582,8 @@ mod tests {
     fn curl_passes_hyphen_args() {
         let cli = Cli::try_parse_from(["hood", "curl", "-fsSL", "https://example.com"]).unwrap();
         match cli.command {
-            Command::Curl { args } => {
-                assert_eq!(args, vec!["-fsSL", "https://example.com"]);
+            Command::Tool(argv) => {
+                assert_eq!(argv, vec!["curl", "-fsSL", "https://example.com"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -774,7 +595,7 @@ mod tests {
         for flag in ["-v", "--verbose", "--help", "-h", "--version", "-V"] {
             let cli = Cli::try_parse_from(["hood", "npm", flag, "x"]).unwrap();
             match cli.command {
-                Command::Npm { args } => assert_eq!(args, vec![flag, "x"]),
+                Command::Tool(argv) => assert_eq!(argv, vec!["npm", flag, "x"]),
                 other => panic!("unexpected command: {other:?}"),
             }
         }
@@ -808,8 +629,8 @@ mod tests {
     fn npm_with_install_args() {
         let cli = Cli::try_parse_from(["hood", "npm", "install", "lodash", "--save"]).unwrap();
         match cli.command {
-            Command::Npm { args } => {
-                assert_eq!(args, vec!["install", "lodash", "--save"]);
+            Command::Tool(argv) => {
+                assert_eq!(argv, vec!["npm", "install", "lodash", "--save"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -835,6 +656,19 @@ mod tests {
             assert_eq!(program, Program::Tool(expected), "{name}");
             assert_eq!(argv, vec![OsString::from("fixture")], "{name}");
         }
+    }
+
+    #[test]
+    fn every_tool_parses_and_others_do_not() {
+        for &tool in Tool::SHIMMABLE {
+            let cli = Cli::try_parse_from(["hood", tool.name()]).unwrap();
+            let Action::Run { program, .. } = Action::try_from(cli.command).unwrap() else {
+                panic!("{tool} did not produce a run action");
+            };
+            assert_eq!(program, Program::Tool(tool));
+        }
+        let cli = Cli::try_parse_from(["hood", "rsync", "-a"]).unwrap();
+        assert!(Action::try_from(cli.command).is_err());
     }
 
     #[test]
@@ -865,7 +699,7 @@ mod tests {
 
     #[test]
     fn rewrite_argv_prepends_hood_and_tool_when_shimmed() {
-        let argv = os_vec(&["/Users/t/.hood/bin/npm", "install", "lodash"]);
+        let argv = os_vec(&["/home/user/.hood/bin/npm", "install", "lodash"]);
         let out = rewrite_argv_for_shim(argv);
         assert_eq!(out, os_vec(&["hood", "npm", "install", "lodash"]));
     }
@@ -935,11 +769,35 @@ mod tests {
     }
 
     #[test]
+    fn redaction_covers_every_spelling_of_a_credential() {
+        let pip = |args: &[&str]| format_invocation(&Program::Tool(Tool::Pip), &os_vec(args));
+        let curl = |args: &[&str]| format_invocation(&Program::Tool(Tool::Curl), &os_vec(args));
+        assert_eq!(
+            pip(&[
+                "install",
+                "--index-url=https://__token__:SECRET@pypi.corp/simple",
+                "x"
+            ]),
+            "pip install --index-url=https://pypi.corp/simple x"
+        );
+        assert_eq!(
+            curl(&["https://u:p@[::1]:8080/a?token=t&v=1"]),
+            // The URL's own serialization percent-encodes the marker.
+            "curl 'https://[::1]:8080/a?token=%3Credacted%3E&v=1'"
+        );
+        assert_eq!(curl(&["-uuser:pass", "x"]), "curl '-u<redacted>' x");
+        assert_eq!(curl(&["-u", "user:pass", "x"]), "curl -u '<redacted>' x");
+        // `-u` is update to go: its argument is a module, not a secret.
+        assert_eq!(
+            format_invocation(&Program::Tool(Tool::Go), &os_vec(&["get", "-u", "m"])),
+            "go get -u m"
+        );
+    }
+
+    #[test]
     fn format_invocation_redacts_credentials() {
-        let parsed = url::Url::parse("https://user:password@example.com/pkg?token=secret").unwrap();
-        assert_eq!(parsed.host_str(), Some("example.com"));
         let (safe_url, _) =
-            redact_invocation_arg("https://user:password@example.com/pkg?token=secret");
+            redact_invocation_arg("https://user:password@example.com/pkg?token=secret", false);
         assert!(!safe_url.contains("password"), "{safe_url}");
         let argv = os_vec(&[
             "-H",

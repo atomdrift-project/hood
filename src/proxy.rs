@@ -36,8 +36,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -47,8 +48,8 @@ use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, HeaderMap,
-    HeaderName, HeaderValue, LOCATION, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+    HOST, HeaderMap, HeaderName, HeaderValue, LOCATION, USER_AGENT,
 };
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
@@ -59,9 +60,9 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::ca::{Ca, CaResolver};
 use crate::go_bridge;
@@ -87,16 +88,21 @@ fn passthrough_body(body: Incoming) -> ProxyBody {
 }
 
 /// Upper bound on a response body buffered *in memory* for scanning. Larger
-/// responses spill to a temp file and are scanned from disk instead (up to
-/// [`MAX_SCAN_BYTES_DEFAULT`]). Generous enough for npm tarballs and binary
-/// installers, low enough that a single in-RAM response can't OOM the host.
-const MAX_BODY_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+/// responses spill to a temp file and are scanned from there; cleave
+/// memory-maps it, so scanning costs no more either way. Enough for nearly every
+/// package, and small enough that a burst of parallel downloads stays cheap.
+const MAX_BODY_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
 
-/// Upper bound on a response body scanned *from disk*. Between
-/// [`MAX_BODY_BYTES_DEFAULT`] and this, the body is streamed to a temp file and
-/// scanned there (cleave memory-maps it, so RAM stays bounded). Past this, the
-/// body is too large to scan and is decided by [`Scanner::scan_limit`].
-const MAX_SCAN_BYTES_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+/// How long reaching an origin may take: TCP connect, then TLS handshake, each.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an origin may take to send response headers. Registries that
+/// build an archive on request answer slowly, so this is generous.
+const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// How long an origin may leave a response body idle. Per frame, so a slow
+/// but moving multi-gigabyte download is never cut off.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
 const HOP_BY_HOP: &[&str] = &[
@@ -117,8 +123,8 @@ pub struct Config {
     /// Maximum response body buffered in RAM for scanning. Larger responses
     /// spill to disk and are scanned from there.
     max_body_bytes: u64,
-    /// Maximum response body inspected. Larger responses are decided by
-    /// [`Scanner::scan_limit`].
+    /// Maximum response body inspected; `u64::MAX`, the default, inspects
+    /// everything. Larger responses are decided by [`Scanner::scan_limit`].
     max_scan_bytes: u64,
     /// Bind address. Forced to a loopback address for safety.
     bind: SocketAddr,
@@ -133,7 +139,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_body_bytes: MAX_BODY_BYTES_DEFAULT,
-            max_scan_bytes: MAX_SCAN_BYTES_DEFAULT,
+            max_scan_bytes: u64::MAX,
             // 127.0.0.1:0 → kernel-assigned ephemeral port.
             bind: ([127, 0, 0, 1], 0).into(),
             extra_upstream_roots: Vec::new(),
@@ -151,16 +157,27 @@ impl Config {
     /// `max_scan_bytes`.
     pub fn with_scan_limits(mut self, max_body_bytes: u64, max_scan_bytes: u64) -> Result<Self> {
         if max_body_bytes == 0 {
-            return Err(anyhow!("max_body_bytes must be greater than zero"));
+            bail!("max_body_bytes must be greater than zero");
         }
         if max_scan_bytes < max_body_bytes {
-            return Err(anyhow!(
+            bail!(
                 "max_scan_bytes ({max_scan_bytes}) must be at least max_body_bytes ({max_body_bytes})",
-            ));
+            );
         }
         self.max_body_bytes = max_body_bytes;
         self.max_scan_bytes = max_scan_bytes;
         Ok(self)
+    }
+
+    /// Inspect at most `limit` bytes of a response, deciding anything larger
+    /// with [`Scanner::scan_limit`]; `None` inspects everything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `limit` is below the in-memory buffer size.
+    pub fn with_scan_limit(self, limit: Option<u64>) -> Result<Self> {
+        let max_body_bytes = self.max_body_bytes;
+        self.with_scan_limits(max_body_bytes, limit.unwrap_or(u64::MAX))
     }
 
     /// Set the listener address.
@@ -170,10 +187,7 @@ impl Config {
     /// Returns an error unless `bind` is loopback-only.
     pub fn with_bind(mut self, bind: SocketAddr) -> Result<Self> {
         if !bind.ip().is_loopback() {
-            return Err(anyhow!(
-                "refusing to bind on non-loopback address: {}",
-                bind.ip(),
-            ));
+            bail!("refusing to bind on non-loopback address: {}", bind.ip());
         }
         self.bind = bind;
         Ok(self)
@@ -281,10 +295,8 @@ impl Proxy {
             .await
             .with_context(|| format!("bind {}", self.inner.config.bind))?;
         let addr = listener.local_addr().context("local_addr")?;
-        let shutdown = Arc::new(Notify::new());
-        let signal = Arc::clone(&shutdown);
-        let proxy = self.clone();
-        let task = tokio::spawn(async move { accept_loop(listener, proxy, signal).await });
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(accept_loop(listener, self.clone(), shutdown.clone()));
         // Load upstream roots while the child starts rather than delaying it.
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
@@ -330,29 +342,33 @@ impl Inner {
 pub(crate) fn native_roots() -> &'static RootCertStore {
     static ROOTS: std::sync::OnceLock<RootCertStore> = std::sync::OnceLock::new();
     ROOTS.get_or_init(|| {
-        let mut roots = RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            // Individual cert failures are common (expired/unsupported algos);
-            // skip them and keep building the set.
-            drop(roots.add(cert));
+        let native = rustls_native_certs::load_native_certs();
+        for error in &native.errors {
+            tracing::debug!(%error, "native trust store partly unreadable");
         }
+        let mut roots = RootCertStore::empty();
+        // Platform stores routinely hold roots rustls cannot use (expired,
+        // unsupported algorithms); skipping them is expected, so only counted.
+        let (added, ignored) = roots.add_parsable_certificates(native.certs);
+        tracing::debug!(added, ignored, "native trust roots loaded");
         roots
     })
 }
 
 /// Build the verifier for upstream servers from the platform roots plus any
-/// configured extras.
+/// configured extras. Unlike the platform's, a configured root that rustls
+/// rejects is an error: someone chose it, and expects it to be trusted.
 fn upstream_tls_config(
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<Arc<ClientConfig>> {
     let mut roots = native_roots().clone();
     for cert in extra_roots {
-        drop(roots.add(cert.clone()));
+        roots
+            .add(cert.clone())
+            .context("add configured upstream TLS root")?;
     }
     if roots.is_empty() {
-        return Err(anyhow!(
-            "no native TLS roots found; cannot verify upstream servers",
-        ));
+        bail!("no native TLS roots found; cannot verify upstream servers");
     }
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
@@ -366,14 +382,14 @@ fn upstream_tls_config(
 pub struct Handle {
     /// Bound address (with the kernel-assigned port resolved).
     pub addr: SocketAddr,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Handle {
     /// Signal shutdown and wait for the accept loop to exit.
     pub async fn stop(mut self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.cancel();
         if let Some(task) = self.task.take() {
             // Best-effort: connection failures are logged at their source.
             drop(task.await);
@@ -383,18 +399,24 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.shutdown.notify_waiters();
+        self.shutdown.cancel();
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
 }
 
-async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: Arc<Notify>) {
+/// How long the accept loop pauses after a failed accept. Running out of file
+/// descriptors fails every accept at once; retrying immediately would spin.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: CancellationToken) {
     loop {
         tokio::select! {
             biased;
-            () = shutdown.notified() => {
+            // Cancellation is sticky, so a stop issued before this loop first
+            // polls is still seen.
+            () = shutdown.cancelled() => {
                 tracing::debug!("proxy shutdown");
                 return;
             }
@@ -405,6 +427,7 @@ async fn accept_loop(listener: TcpListener, proxy: Proxy, shutdown: Arc<Notify>)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 }
             }
         }
@@ -419,7 +442,6 @@ async fn serve_inbound_plain(stream: TcpStream, proxy: Proxy) {
         async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, None).await) }
     });
     if let Err(e) = server_http1::Builder::new()
-        .keep_alive(true)
         .serve_connection(TokioIo::new(stream), svc)
         .with_upgrades()
         .await
@@ -442,7 +464,6 @@ where
         async move { Ok::<_, Infallible>(proxy.dispatch_inbound(req, Some(origin)).await) }
     });
     if let Err(e) = server_http1::Builder::new()
-        .keep_alive(true)
         .serve_connection(TokioIo::new(stream), svc)
         .await
     {
@@ -697,11 +718,12 @@ impl Proxy {
 
         let scan_url = target_url.to_string();
 
-        // Open upstream connection (no pool for v1; one TCP per request).
+        // One upstream connection per request: nothing is pooled, so nothing
+        // one request did can be reused by another.
         let response = upstream_request(&self.inner, &host, port, is_https, req).await?;
         let (mut parts, body) = response.into_parts();
         if let Some(base) = &redirect_base {
-            rewrite_go_bridge_location(&mut parts.headers, base, &self.inner.go_bridge_token);
+            rewrite_go_bridge_location(&mut parts.headers, base, &self.inner.go_bridge_token)?;
         }
 
         // A response with no body — a HEAD reply, a 204/304, or an explicit zero
@@ -744,7 +766,8 @@ impl Proxy {
             });
         }
 
-        let buffered = collect_or_spill(body, &scan_url, ram_cap, disk_cap).await?;
+        let size_hint = content_length(&parts.headers);
+        let buffered = collect_or_spill(body, &scan_url, size_hint, ram_cap, disk_cap).await?;
         self.finish_scanned_response(
             buffered,
             &scan_url,
@@ -764,11 +787,11 @@ impl Proxy {
         headers: HeaderMap,
     ) -> Result<Response<ProxyBody>> {
         match buffered {
-            Buffered::Memory(bytes) if bytes.is_empty() => {
+            Buffered::Memory { bytes, .. } if bytes.is_empty() => {
                 tracing::debug!(url = %ShownUrl(scan_url), "forward (empty body)");
                 build_response(status, headers, full_body(bytes), Some(0))
             }
-            Buffered::Memory(bytes) => {
+            Buffered::Memory { bytes, sha256 } => {
                 let verdict = self
                     .inner
                     .scanner
@@ -776,9 +799,9 @@ impl Proxy {
                         url: scan_url.to_owned(),
                         allow_purl,
                         body: bytes.clone(),
+                        sha256,
                     })
-                    .await
-                    .context("scanner")?;
+                    .await;
                 match verdict {
                     Verdict::Allow => {
                         let len = bytes.len() as u64;
@@ -806,8 +829,7 @@ impl Proxy {
                         path: tmp.path().to_path_buf(),
                         sha256,
                     })
-                    .await
-                    .context("disk scanner")?;
+                    .await;
                 match verdict {
                     Verdict::Allow => {
                         tracing::debug!(
@@ -817,9 +839,7 @@ impl Proxy {
                             "forward (from disk)"
                         );
                         let body = BodyExt::boxed(StreamBody::new(spill_stream(&tmp)?));
-                        let response = build_response(status, headers, body, Some(len));
-                        drop(tmp);
-                        response
+                        build_response(status, headers, body, Some(len))
                     }
                     Verdict::Block(reason) => {
                         tracing::warn!(
@@ -930,9 +950,7 @@ fn resolve_target(
         .scheme_str()
         .ok_or_else(|| anyhow!("missing scheme in absolute URI"))?;
     if scheme != "http" && !(allow_absolute_https && scheme == "https") {
-        return Err(anyhow!(
-            "plaintext proxy only accepts http://; got {scheme}",
-        ));
+        bail!("plaintext proxy only accepts http://; got {scheme}");
     }
     let url = url::Url::parse(&uri.to_string()).context("parse absolute uri")?;
     let host_header = authority_header(&url)?;
@@ -957,8 +975,9 @@ async fn upstream_request(
     is_https: bool,
     req: Request<Incoming>,
 ) -> Result<Response<Incoming>> {
-    let tcp = TcpStream::connect((host, port))
+    let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .with_context(|| format!("connect {host} port {port}: timed out"))?
         .with_context(|| format!("connect {host} port {port}"))?;
     // TCP_NODELAY is advisory — some platforms reject; not fatal.
     drop(tcp.set_nodelay(true));
@@ -967,10 +986,13 @@ async fn upstream_request(
         let server_name = ServerName::try_from(host.to_owned())
             .map_err(|e| anyhow!("invalid SNI {host}: {e}"))?;
         let connector = TlsConnector::from(inner.upstream_tls().await?);
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .context("upstream tls handshake")?;
+        let tls = tokio::time::timeout(
+            UPSTREAM_CONNECT_TIMEOUT,
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .context("upstream TLS handshake timed out")?
+        .context("upstream TLS handshake")?;
         send_one(tls, req).await
     } else {
         send_one(tcp, req).await
@@ -990,7 +1012,10 @@ where
             tracing::trace!(error = %e, "upstream connection driver");
         }
     });
-    sender.send_request(req).await.context("send_request")
+    tokio::time::timeout(UPSTREAM_RESPONSE_TIMEOUT, sender.send_request(req))
+        .await
+        .context("upstream response timed out")?
+        .context("send_request")
 }
 
 /// Capture provenance before URL credentials are moved into headers.
@@ -1005,7 +1030,7 @@ fn permits_public_coordinate(method: &Method, headers: &HeaderMap, url: &url::Ur
 /// Outcome of reading an upstream body under the size policy.
 enum Buffered {
     /// Fit within the in-RAM cap — buffered whole and scanned in memory.
-    Memory(Bytes),
+    Memory { bytes: Bytes, sha256: [u8; 32] },
     /// Fit within the disk-scan cap — spilled whole to a temporary file
     /// (dropping `tmp` unlinks it) and scanned from there.
     Spilled {
@@ -1026,7 +1051,10 @@ enum Buffered {
 
 /// The next data frame of an upstream body, skipping trailers.
 async fn next_data(body: &mut Incoming) -> Result<Option<Bytes>> {
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, body.frame())
+        .await
+        .context("upstream body stalled")?
+    {
         if let Ok(data) = frame.context("read upstream frame")?.into_data() {
             return Ok(Some(data));
         }
@@ -1035,31 +1063,40 @@ async fn next_data(body: &mut Incoming) -> Result<Option<Bytes>> {
 }
 
 /// Read an upstream body, buffering it in RAM up to `ram_cap`, then spilling the
-/// remainder to a temp file up to `disk_cap`. The SHA-256 is computed while
-/// streaming so the disk path never re-reads the payload just to hash it.
+/// remainder to a temp file up to `disk_cap`. The SHA-256 is computed frame by
+/// frame as the body streams, so nothing is ever re-read just to hash it.
+/// `size_hint`, the declared length, only sizes the buffer.
 async fn collect_or_spill(
     mut body: Incoming,
     url: &str,
+    size_hint: Option<u64>,
     ram_cap: u64,
     disk_cap: u64,
 ) -> Result<Buffered> {
-    let mut buf: Vec<u8> = Vec::new();
+    let capacity = usize::try_from(size_hint.unwrap_or(0).min(ram_cap)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(capacity);
+    let mut hasher = Sha256::new();
     while let Some(data) = next_data(&mut body).await? {
         if buf.len() as u64 + data.len() as u64 > ram_cap {
-            // Cross into spill mode, carrying the RAM prefix and the frame that
-            // tipped us over the cap.
-            return spill_to_disk(body, url, buf, data, disk_cap).await;
+            // Cross into spill mode, carrying the RAM prefix (already hashed)
+            // and the frame that tipped us over the cap.
+            return spill_to_disk(body, url, hasher, buf, data, disk_cap).await;
         }
+        hasher.update(&data);
         buf.extend_from_slice(&data);
     }
-    Ok(Buffered::Memory(Bytes::from(buf)))
+    Ok(Buffered::Memory {
+        bytes: Bytes::from(buf),
+        sha256: hasher.finalize().into(),
+    })
 }
 
 /// Drain the rest of a body too large for RAM to a temp file, hashing as we
-/// go, and stop at `disk_cap`.
+/// go, and stop at `disk_cap`. `hasher` has already seen `prefix`.
 async fn spill_to_disk(
     mut body: Incoming,
     url: &str,
+    mut hasher: Sha256,
     prefix: Vec<u8>,
     overflow: Bytes,
     disk_cap: u64,
@@ -1071,8 +1108,6 @@ async fn spill_to_disk(
         .context("create spill file")?;
     let mut file = tokio::fs::File::from_std(tmp.reopen().context("reopen spill file")?);
 
-    let mut hasher = Sha256::new();
-    hasher.update(&prefix);
     file.write_all(&prefix).await.context("write spill file")?;
     let mut len = prefix.len() as u64;
     let mut chunk = overflow;
@@ -1104,8 +1139,10 @@ async fn spill_to_disk(
 /// extension — cleave's type detection keys on it. Empty when there's no clean,
 /// short, alphanumeric extension to copy.
 fn temp_suffix(url: &str) -> String {
-    let basename = url.rsplit('/').next().unwrap_or("");
-    let basename = basename.split(['?', '#']).next().unwrap_or(basename);
+    // The query and fragment go first: a `/` inside one (`?r=/a.txt`) must not
+    // let the server choose the extension cleave sees.
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let basename = path.rsplit('/').next().unwrap_or_default();
     match basename.rsplit_once('.') {
         Some((_, ext))
             if !ext.is_empty()
@@ -1119,7 +1156,7 @@ fn temp_suffix(url: &str) -> String {
 }
 
 /// Parse a `Content-Length` header into a byte count, if present and well-formed.
-fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(CONTENT_LENGTH)?
         .to_str()
@@ -1175,24 +1212,34 @@ fn take_url_authorization(target: &mut url::Url) -> Result<Option<HeaderValue>> 
     Ok(Some(value))
 }
 
-/// Keep redirects from escaping the macOS Go loopback bridge. Module proxies
+/// Keep redirects from escaping the Go loopback bridge. Module proxies
 /// commonly redirect zip payloads to object storage; an absolute HTTPS
 /// Location would otherwise send Go back through the CA path it cannot trust.
-fn rewrite_go_bridge_location(headers: &mut hyper::HeaderMap, request_url: &url::Url, token: &str) {
+///
+/// # Errors
+///
+/// An HTTPS origin redirecting to plain HTTP. Go refuses that downgrade
+/// itself, but behind the bridge it only ever sees loopback HTTP, so hood
+/// refuses it on Go's behalf.
+fn rewrite_go_bridge_location(
+    headers: &mut HeaderMap,
+    request_url: &url::Url,
+    token: &str,
+) -> Result<()> {
     let Some(raw) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) else {
-        return;
+        return Ok(());
     };
     let Ok(mut target) = request_url.join(raw) else {
         tracing::warn!(location = raw, "invalid upstream Go bridge redirect");
-        return;
+        return Ok(());
     };
-    if !matches!(target.scheme(), "http" | "https") {
-        tracing::warn!(
-            location = raw,
-            scheme = target.scheme(),
-            "unsupported Go bridge redirect"
-        );
-        return;
+    match (request_url.scheme(), target.scheme()) {
+        ("https", "http") => bail!("refusing Go bridge redirect from HTTPS to HTTP"),
+        (_, "http" | "https") => {}
+        (_, scheme) => {
+            tracing::warn!(location = raw, scheme, "unsupported Go bridge redirect");
+            return Ok(());
+        }
     }
     target.set_fragment(None);
     let local = go_bridge::redirect_location(token, &target);
@@ -1204,9 +1251,10 @@ fn rewrite_go_bridge_location(headers: &mut hyper::HeaderMap, request_url: &url:
             tracing::warn!(error = %e, "could not encode Go bridge redirect");
         }
     }
+    Ok(())
 }
 
-fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) -> Result<()> {
+fn strip_hop_by_hop(headers: &mut HeaderMap) -> Result<()> {
     // RFC 7230 also makes every field named by `Connection` hop-by-hop. Merely
     // removing the standard list can forward attacker-selected connection
     // metadata and enables request-smuggling differentials between hops.
@@ -1234,43 +1282,41 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP.contains(&name.as_str())
 }
 
+/// A plain-text response hood writes itself.
+fn text_response(status: StatusCode, text: String) -> Response<ProxyBody> {
+    let mut response = Response::new(full_body(Bytes::from(text)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
-    // Header values are static ASCII; the only way this could fail is an
-    // invalid status (impossible — typed input). On the off chance the builder
-    // returns Err we fall back to a bodyless response with the requested code.
-    let body = full_body(Bytes::from(format!("{msg}\n")));
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(body)
-        .unwrap_or_else(|_| {
-            let mut fallback = Response::new(full_body(Bytes::new()));
-            *fallback.status_mut() = status;
-            fallback
-        })
+    text_response(status, format!("{msg}\n"))
 }
 
 fn blocked_response(url: &str, reason: &BlockReason) -> Response<ProxyBody> {
     // RFC 7725: 451 Unavailable for Legal Reasons. We bend the semantics — it's
     // closer to "withheld by middleware policy" — but no closer code exists,
     // and it's distinctive enough that tools and humans can spot it.
-    let body = format!(
-        "hood blocked this response.\nurl: {url}\nverdict: {}\n",
-        reason.label(),
+    let label = reason.label();
+    let mut response = text_response(
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        format!("hood blocked this response.\nurl: {url}\nverdict: {label}\n"),
     );
-    Response::builder()
-        .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header("x-hood-block-reason", reason.label())
-        .body(full_body(Bytes::from(body)))
-        .unwrap_or_else(|_| error_response(StatusCode::FORBIDDEN, "blocked"))
+    response.headers_mut().insert(
+        HeaderName::from_static("x-hood-block-reason"),
+        HeaderValue::from_static(label),
+    );
+    response
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use hyper::header::HeaderMap;
 
     #[test]
     fn authenticated_requests_never_disclose_coordinates() {
@@ -1360,5 +1406,52 @@ mod tests {
         let authorization = take_url_authorization(&mut target).unwrap().unwrap();
         assert_eq!(authorization, "Basic dXNlcjpwQHNz");
         assert_eq!(target.as_str(), "https://proxy.example/base");
+    }
+
+    /// On a current-thread runtime the accept loop has not run when `spawn`
+    /// returns; a stop issued then must still end it.
+    #[tokio::test]
+    async fn stop_before_the_accept_loop_runs_still_stops() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let proxy = Proxy::new(Arc::new(crate::scanner::AllowAll), Config::default()).unwrap();
+        let handle = proxy.spawn().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle.stop())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn go_bridge_redirects_stay_on_the_bridge_and_never_downgrade() {
+        let origin = url::Url::parse("https://proxy.golang.org/m/@v/v1.zip").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://storage.example/m.zip"),
+        );
+        rewrite_go_bridge_location(&mut headers, &origin, "token").unwrap();
+        let location = headers.get(LOCATION).unwrap().to_str().unwrap();
+        assert!(location.starts_with(go_bridge::ROUTE_PREFIX), "{location}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("http://storage.example/m.zip"),
+        );
+        assert!(rewrite_go_bridge_location(&mut headers, &origin, "token").is_err());
+    }
+
+    #[test]
+    fn spill_suffix_comes_from_the_path_alone() {
+        for (url, suffix) in [
+            ("https://x/pkg-1.0.tgz", ".tgz"),
+            ("https://x/pkg.tgz?r=/a.txt", ".tgz"),
+            ("https://x/pkg.tgz#/a.txt", ".tgz"),
+            ("https://x/download?file=a.exe", ""),
+            ("https://x/archive.tar.gz", ".gz"),
+            ("https://x/odd.t-z", ""),
+            ("https://x/", ""),
+        ] {
+            assert_eq!(temp_suffix(url), suffix, "{url}");
+        }
     }
 }

@@ -1,17 +1,15 @@
 //! Human-facing stderr panels for non-benign scan verdicts.
 //!
-//! Design language mirrors atomscan and cleave: truecolor classification accents,
-//! confidence indicator blocks, indented evidence. The presentation goes one
-//! step further than atomscan's per-file streaming output: hood has the *whole*
-//! verdict in hand for a single payload, so the panel can be a focused unit
-//! instead of a one-liner. Operators get the verdict, evidence, and an
-//! actionable next step in one glance.
+//! Design language mirrors atomscan and cleave: truecolor classification
+//! accents and indented evidence. hood has the *whole* verdict in hand for a
+//! single payload, so a panel is a focused unit rather than a one-liner:
+//! verdict, evidence, and an actionable next step in one glance.
 //!
 //! Output only colorizes when stderr is a real terminal — when redirected to a
 //! file, we collapse to a single structured line that's grep-friendly.
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, Write};
+use std::io::{self, IsTerminal, StderrLock, Write};
 
 use scan::engine::{Reason, TopFinding};
 use scan::model::Classification;
@@ -93,6 +91,45 @@ impl Disposition {
             Self::Forwarded => "FORWARDED",
         }
     }
+}
+
+/// Write to stderr: `pretty` on a terminal, `plain` (one line, no escapes)
+/// otherwise, so log aggregators are not smeared with ANSI. Write errors are
+/// dropped: stderr is the diagnostics channel, with nowhere else to complain.
+fn to_stderr(
+    pretty: impl FnOnce(&mut StderrLock<'static>, Palette) -> io::Result<()>,
+    plain: impl FnOnce(&mut StderrLock<'static>) -> io::Result<()>,
+) {
+    let mut stderr = io::stderr().lock();
+    let written = if stderr.is_terminal() {
+        pretty(&mut stderr, Palette::from(scan::output::detect_theme()))
+    } else {
+        plain(&mut stderr)
+    };
+    drop(written);
+}
+
+/// Panel width in columns; every rule, top and bottom, ends here.
+const PANEL_WIDTH: usize = 72;
+
+/// The blank line and `── WORD ───` rule that open a panel.
+fn write_header<W: Write>(w: &mut W, c: Palette, color: Rgb, word: &str) -> io::Result<()> {
+    // "── " before the word and " " after it, then rule to the panel's edge.
+    let fill = PANEL_WIDTH.saturating_sub(word.chars().count() + 4);
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {} {} {}",
+        fg(c.dim, "──"),
+        fg_bold(color, word),
+        fg(c.chrome, &"─".repeat(fill)),
+    )
+}
+
+/// The rule and blank line that close a panel.
+fn write_footer<W: Write>(w: &mut W, c: Palette) -> io::Result<()> {
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(PANEL_WIDTH)))?;
+    writeln!(w)
 }
 
 /// Emit the compact successful-scan record requested by verbose mode.
@@ -181,8 +218,6 @@ fn format_scan_summary(summary: crate::scanner::ScanSummary) -> Option<String> {
 pub struct Panel<'a> {
     /// The classification driving this panel. Benign is never rendered.
     pub classification: Classification,
-    /// Original classification before the upgrade heuristic, if applicable.
-    pub original: Option<Classification>,
     /// Whether the body was withheld or forwarded under bypass.
     pub disposition: Disposition,
     /// Effective policy in force, used to choose the bypass hint.
@@ -201,49 +236,21 @@ pub struct Panel<'a> {
     pub invocation: &'a str,
 }
 
-/// Render the panel to stderr. Falls back to a single structured WARN line
-/// when stderr isn't a TTY so log aggregators don't get smeared with ANSI.
-///
-/// This function never fails — write errors to stderr are silent (stderr is
-/// the diagnostics channel; we have nowhere else to complain to).
+/// Render a verdict panel to stderr.
 pub fn emit(panel: &Panel<'_>) {
-    let mut stderr = std::io::stderr().lock();
-    if stderr.is_terminal() {
-        let theme = scan::output::detect_theme();
-        drop(write_pretty(&mut stderr, panel, Palette::from(theme)));
-    } else {
-        drop(write_plain(&mut stderr, panel));
-    }
+    to_stderr(|w, c| write_pretty(w, panel, c), |w| write_plain(w, panel));
 }
 
-fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Result<()> {
+fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> io::Result<()> {
     let verdict_color = match p.classification {
         Classification::Hostile => c.hostile,
         Classification::Suspicious => c.suspicious,
         _ => c.text,
     };
 
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(verdict_color, p.disposition.header()),
-        fg(c.chrome, &"─".repeat(64)),
-    )?;
+    write_header(w, c, verdict_color, p.disposition.header())?;
     writeln!(w, "  {}", fg_bold(verdict_color, &friendly_status(p)))?;
     writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
-
-    if let Some(orig) = p.original
-        && orig != p.classification
-    {
-        writeln!(
-            w,
-            "  {} {}",
-            fg(c.dim, "upgraded from"),
-            fg(c.dim, classification_label(orig)),
-        )?;
-    }
 
     if !p.traits.is_empty() {
         writeln!(w)?;
@@ -269,11 +276,10 @@ fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Resu
 
     writeln!(w)?;
     write_bypass_hint(w, p, c)?;
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
-    writeln!(w)
+    write_footer(w, c)
 }
 
-fn write_bypass_hint<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> std::io::Result<()> {
+fn write_bypass_hint<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> io::Result<()> {
     let inv = p.invocation;
     match (p.disposition, p.classification, p.policy) {
         // Already forwarded — show what's active.
@@ -303,7 +309,7 @@ fn write_command_hint<W: Write>(
     label: &str,
     env: &str,
     invocation: &str,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     if invocation.is_empty() {
         writeln!(w, "  {}  {}", fg(c.dim, label), fg(c.accent, env))
     } else {
@@ -319,7 +325,7 @@ fn write_command_hint<W: Write>(
 
 /// Plain-text fallback for non-TTY stderr (CI logs, file redirection).
 /// Single line, structured-ish, no escape codes.
-fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
+fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> io::Result<()> {
     let traits = p
         .traits
         .iter()
@@ -329,7 +335,7 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
     let reasons: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
     writeln!(
         w,
-        "{}; hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]{}",
+        "{}; hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]",
         friendly_status(p),
         p.disposition.verb(),
         ShownUrl(p.url),
@@ -337,11 +343,6 @@ fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> std::io::Result<()> {
         p.probability,
         traits,
         reasons.join(", "),
-        match p.original {
-            Some(o) if o != p.classification =>
-                format!(" upgraded_from={}", classification_label(o)),
-            _ => String::new(),
-        },
     )
 }
 
@@ -405,42 +406,29 @@ pub struct ScanErrorPanel<'a> {
     pub invocation: &'a str,
 }
 
-/// Render a scan-error panel to stderr — one payload, one verdict (or lack
-/// of one), single visual unit. Same TTY-vs-pipe split as [`emit`].
+/// Render a scan-error panel to stderr.
 pub fn emit_scan_error(p: &ScanErrorPanel<'_>) {
-    let mut stderr = std::io::stderr().lock();
-    if stderr.is_terminal() {
-        let theme = scan::output::detect_theme();
-        drop(write_scan_error_pretty(
-            &mut stderr,
-            p,
-            Palette::from(theme),
-        ));
-    } else {
-        drop(writeln!(
-            stderr,
-            "hood scan-error url={} policy={} disposition={} error={}",
-            ShownUrl(p.url),
-            policy_tag(p.policy),
-            p.disposition.verb(),
-            sanitize(p.error),
-        ));
-    }
+    to_stderr(
+        |w, c| write_scan_error_pretty(w, p, c),
+        |w| {
+            writeln!(
+                w,
+                "hood scan-error url={} policy={} disposition={} error={}",
+                ShownUrl(p.url),
+                policy_tag(p.policy),
+                p.disposition.verb(),
+                sanitize(p.error),
+            )
+        },
+    );
 }
 
 fn write_scan_error_pretty<W: Write>(
     w: &mut W,
     p: &ScanErrorPanel<'_>,
     c: Palette,
-) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(c.suspicious, p.disposition.header()),
-        fg(c.chrome, &"─".repeat(62)),
-    )?;
+) -> io::Result<()> {
+    write_header(w, c, c.suspicious, p.disposition.header())?;
     writeln!(
         w,
         "  {}  {}",
@@ -467,8 +455,7 @@ fn write_scan_error_pretty<W: Write>(
             write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=1", p.invocation)?;
         }
     }
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
-    writeln!(w)
+    write_footer(w, c)
 }
 
 /// Base of the atomdrift lab file view. The payload's SHA-256 is appended to
@@ -486,14 +473,8 @@ const LAB_FILE_URL: &str = "https://lab.atomdrift.org/file/";
 pub struct KnownBadPanel<'a> {
     /// URL the tool was about to fetch.
     pub url: &'a str,
-    /// Lower-hex SHA-256 of the payload; forms the lab permalink. Empty for a
-    /// pre-fetch PURL match, where no bytes were downloaded to hash — the panel
-    /// then keys the match on [`Self::purl`] instead.
+    /// Lower-hex SHA-256 of the payload; forms the lab permalink.
     pub sha256: &'a str,
-    /// PURL the known-bad match fired on, when it was a pre-fetch PURL hit rather
-    /// than a content-hash hit. Shown in place of the lab link when `sha256` is
-    /// empty.
-    pub purl: Option<&'a str>,
     /// Effective policy, for the bypass hint / active tag.
     pub policy: ScanPolicy,
     /// Whether the body was withheld or forwarded (under `HOOD_BYPASS=3`).
@@ -506,45 +487,35 @@ pub struct KnownBadPanel<'a> {
     pub beamline: &'a [String],
 }
 
-/// Render a known-bad panel to stderr — same TTY-vs-pipe split as [`emit`].
+/// Render a known-bad panel to stderr.
 pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
-    let mut stderr = std::io::stderr().lock();
-    if stderr.is_terminal() {
-        let theme = scan::output::detect_theme();
-        drop(write_known_bad_pretty(&mut stderr, p, Palette::from(theme)));
-    } else {
-        // A pre-fetch PURL match downloaded no bytes, so it keys on the PURL.
-        let identity = if p.sha256.is_empty() {
-            format!("purl={}", sanitize(p.purl.unwrap_or("?")))
-        } else {
-            format!("sha256={0} lab={LAB_FILE_URL}{0}", p.sha256)
-        };
-        drop(writeln!(
-            stderr,
-            "hood known-bad url={} {identity} policy={} disposition={}",
-            ShownUrl(p.url),
-            policy_tag(p.policy),
-            p.disposition.verb(),
-        ));
-        for line in p.beamline {
-            drop(writeln!(stderr, "  {}", sanitize(line)));
-        }
+    to_stderr(
+        |w, c| write_known_bad_pretty(w, p, c),
+        |w| write_known_bad_plain(w, p),
+    );
+}
+
+fn write_known_bad_plain<W: Write>(w: &mut W, p: &KnownBadPanel<'_>) -> io::Result<()> {
+    writeln!(
+        w,
+        "hood known-bad url={url} sha256={sha} lab={LAB_FILE_URL}{sha} policy={policy} disposition={verb}",
+        url = ShownUrl(p.url),
+        sha = p.sha256,
+        policy = policy_tag(p.policy),
+        verb = p.disposition.verb(),
+    )?;
+    for line in p.beamline {
+        writeln!(w, "  {}", sanitize(line))?;
     }
+    Ok(())
 }
 
 fn write_known_bad_pretty<W: Write>(
     w: &mut W,
     p: &KnownBadPanel<'_>,
     c: Palette,
-) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(c.hostile, p.disposition.header()),
-        fg(c.chrome, &"─".repeat(63)),
-    )?;
+) -> io::Result<()> {
+    write_header(w, c, c.hostile, p.disposition.header())?;
     writeln!(
         w,
         "  {}  {}",
@@ -552,22 +523,12 @@ fn write_known_bad_pretty<W: Write>(
         fg_bold(c.text, &ShownUrl(p.url).to_string()),
     )?;
     writeln!(w)?;
-    if p.sha256.is_empty() {
-        // Pre-fetch PURL match: no hash to permalink, so show the matched PURL.
-        writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "purl:"),
-            fg(c.accent, sanitize(p.purl.unwrap_or("?")).as_ref()),
-        )?;
-    } else {
-        writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "lab:"),
-            fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
-        )?;
-    }
+    writeln!(
+        w,
+        "  {}  {}",
+        fg(c.dim, "lab:"),
+        fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
+    )?;
     for (i, line) in p.beamline.iter().enumerate() {
         let label = if i == 0 { "beamline:" } else { "         " };
         writeln!(
@@ -590,8 +551,7 @@ fn write_known_bad_pretty<W: Write>(
             write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=3", p.invocation)?;
         }
     }
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
-    writeln!(w)
+    write_footer(w, c)
 }
 
 /// Context for an unscanned-download panel.
@@ -610,38 +570,26 @@ pub struct UnscannedPanel<'a> {
     pub limit: u64,
 }
 
-/// Render an unscanned-download warning to stderr — same TTY-vs-pipe split
-/// as [`emit`].
+/// Render an unscanned-download warning to stderr.
 pub fn emit_unscanned(p: &UnscannedPanel<'_>) {
-    let mut stderr = std::io::stderr().lock();
-    if stderr.is_terminal() {
-        let theme = scan::output::detect_theme();
-        drop(write_unscanned_pretty(&mut stderr, p, Palette::from(theme)));
-    } else {
-        drop(write_unscanned_plain(&mut stderr, p));
-    }
+    to_stderr(
+        |w, c| write_unscanned_pretty(w, p, c),
+        |w| write_unscanned_plain(w, p),
+    );
 }
 
 fn write_unscanned_pretty<W: Write>(
     w: &mut W,
     p: &UnscannedPanel<'_>,
     c: Palette,
-) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(c.suspicious, "UNSCANNED"),
-        fg(c.chrome, &"─".repeat(62)),
-    )?;
+) -> io::Result<()> {
+    write_header(w, c, c.suspicious, "UNSCANNED")?;
     writeln!(w, "  {}", fg_bold(c.suspicious, &unscanned_status(p)))?;
     writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
-    writeln!(w)
+    write_footer(w, c)
 }
 
-fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> std::io::Result<()> {
+fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> io::Result<()> {
     writeln!(
         w,
         "{}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={}",
@@ -679,25 +627,18 @@ fn human_size(bytes: u64) -> String {
 /// Only emitted when `HOOD_BYPASS` is set; under strict policy a startup
 /// failure aborts the run before this is ever called.
 pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
-    let mut stderr = std::io::stderr().lock();
-    if stderr.is_terminal() {
-        let theme = scan::output::detect_theme();
-        drop(write_failsafe_pretty(
-            &mut stderr,
-            invocation,
-            policy,
-            reason,
-            Palette::from(theme),
-        ));
-    } else {
-        drop(writeln!(
-            stderr,
-            "hood unscanned policy={} reason={} invocation={}",
-            policy_tag(policy),
-            sanitize(reason),
-            sanitize(invocation),
-        ));
-    }
+    to_stderr(
+        |w, c| write_failsafe_pretty(w, invocation, policy, reason, c),
+        |w| {
+            writeln!(
+                w,
+                "hood unscanned policy={} reason={} invocation={}",
+                policy_tag(policy),
+                sanitize(reason),
+                sanitize(invocation),
+            )
+        },
+    );
 }
 
 fn write_failsafe_pretty<W: Write>(
@@ -706,15 +647,8 @@ fn write_failsafe_pretty<W: Write>(
     policy: ScanPolicy,
     reason: &str,
     c: Palette,
-) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(c.suspicious, "UNSCANNED"),
-        fg(c.chrome, &"─".repeat(62)),
-    )?;
+) -> io::Result<()> {
+    write_header(w, c, c.suspicious, "UNSCANNED")?;
     writeln!(
         w,
         "  {} {}",
@@ -735,8 +669,7 @@ fn write_failsafe_pretty<W: Write>(
         fg(c.accent, policy_tag(policy)),
         fg(c.dim, "active — passing through without inspection"),
     )?;
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(72)))?;
-    writeln!(w)
+    write_footer(w, c)
 }
 
 const fn policy_tag(p: ScanPolicy) -> &'static str {
@@ -755,30 +688,6 @@ const fn classification_label(c: Classification) -> &'static str {
         Classification::Benign => "benign",
         _ => "unknown",
     }
-}
-
-/// Five-cell confidence indicator: ▰ filled / ▱ empty.
-///
-/// The fill count tracks probability, the color tracks the classification —
-/// same idiom atomscan uses, expanded from two cells to five for a finer read.
-#[cfg(test)]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn confidence_blocks(probability: f32, accent: Rgb, dim: Rgb) -> String {
-    const CELLS: usize = 5;
-    const CELLS_F32: f32 = 5.0;
-    // probability is clamped to [0, 1] and CELLS is 5, so the rounded product
-    // fits in usize on every platform — no truncation or sign loss possible.
-    let filled = (probability.clamp(0.0, 1.0) * CELLS_F32).round() as usize;
-    let filled = filled.min(CELLS);
-    let empty = CELLS - filled;
-    let mut s = String::with_capacity(64);
-    for _ in 0..filled {
-        s.push_str(&fg(accent, "▰"));
-    }
-    for _ in 0..empty {
-        s.push_str(&fg(dim, "▱"));
-    }
-    s
 }
 
 /// Unicode bidirectional formatting characters. They are not control
@@ -914,7 +823,6 @@ mod tests {
     ) -> Panel<'a> {
         Panel {
             classification,
-            original: None,
             disposition,
             policy,
             probability: 0.7,
@@ -1004,29 +912,9 @@ mod tests {
     }
 
     #[test]
-    fn plain_output_reports_upgrade_provenance() {
-        let p = Panel {
-            classification: Classification::Hostile,
-            original: Some(Classification::Benign),
-            disposition: Disposition::Blocked,
-            policy: ScanPolicy::Strict,
-            probability: 0.9,
-            url: "https://x",
-            traits: &[],
-            reasons: &[],
-            invocation: "",
-        };
-        let mut buf = Vec::new();
-        write_plain(&mut buf, &p).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("upgraded_from=benign"));
-    }
-
-    #[test]
     fn pretty_hint_uses_command_when_provided_for_hostile() {
         let p = Panel {
             classification: Classification::Hostile,
-            original: None,
             disposition: Disposition::Blocked,
             policy: ScanPolicy::Strict,
             probability: 0.9,
@@ -1045,7 +933,6 @@ mod tests {
     fn pretty_hint_for_suspicious_uses_command_with_level_2() {
         let p = Panel {
             classification: Classification::Suspicious,
-            original: None,
             disposition: Disposition::Blocked,
             policy: ScanPolicy::Strict,
             probability: 0.6,
@@ -1100,7 +987,6 @@ mod tests {
         let p = KnownBadPanel {
             url: "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
             sha256: "7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b",
-            purl: None,
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "npm install evil",
@@ -1127,7 +1013,6 @@ mod tests {
         let p = KnownBadPanel {
             url: "https://x/evil.tgz",
             sha256: "abc123",
-            purl: None,
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "",
@@ -1146,25 +1031,35 @@ mod tests {
         let p = KnownBadPanel {
             url: "https://x/evil.tgz",
             sha256: "abc123",
-            purl: None,
             policy: ScanPolicy::Strict,
             disposition: Disposition::Blocked,
             invocation: "",
             beamline: &[],
         };
-        // Exercise the non-TTY plain branch directly.
-        let line = format!(
-            "hood known-bad url={} sha256={} lab={}{} policy={} disposition={}",
-            p.url,
-            p.sha256,
-            LAB_FILE_URL,
-            p.sha256,
-            policy_tag(p.policy),
-            "block",
+        let mut buf = Vec::new();
+        write_known_bad_plain(&mut buf, &p).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            line,
+            "hood known-bad url=https://x/evil.tgz sha256=abc123 \
+             lab=https://lab.atomdrift.org/file/abc123 policy=HOOD_BYPASS=0 disposition=block\n"
         );
-        assert!(line.contains("hood known-bad"));
-        assert!(line.contains("sha256=abc123"));
-        assert!(line.contains("lab=https://lab.atomdrift.org/file/abc123"));
+    }
+
+    #[test]
+    fn every_panel_rule_ends_at_the_panel_edge() {
+        for word in ["BLOCKED", "FORWARDED", "UNSCANNED"] {
+            let mut buf = Vec::new();
+            write_header(&mut buf, Palette::dark(), Rgb(0, 0, 0), word).unwrap();
+            write_footer(&mut buf, Palette::dark()).unwrap();
+            let s = strip_ansi(&String::from_utf8(buf).unwrap());
+            let widths: Vec<usize> = s
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.trim_start().chars().count())
+                .collect();
+            assert_eq!(widths, [PANEL_WIDTH, PANEL_WIDTH], "{word}");
+        }
     }
 
     #[test]
@@ -1274,20 +1169,6 @@ mod tests {
         assert!(s.contains("active:"));
         assert!(s.contains("HOOD_BYPASS=3"));
         assert!(s.contains("FORWARDED"));
-    }
-
-    #[test]
-    fn confidence_blocks_count_filled_cells() {
-        let s = strip_ansi(&confidence_blocks(0.0, Rgb(0, 0, 0), Rgb(0, 0, 0)));
-        assert_eq!(s.matches('▰').count(), 0);
-        assert_eq!(s.matches('▱').count(), 5);
-
-        let s = strip_ansi(&confidence_blocks(1.0, Rgb(0, 0, 0), Rgb(0, 0, 0)));
-        assert_eq!(s.matches('▰').count(), 5);
-        assert_eq!(s.matches('▱').count(), 0);
-
-        let s = strip_ansi(&confidence_blocks(0.5, Rgb(0, 0, 0), Rgb(0, 0, 0)));
-        assert_eq!(s.matches('▰').count() + s.matches('▱').count(), 5);
     }
 
     fn strip_ansi(s: &str) -> String {

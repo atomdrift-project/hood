@@ -311,7 +311,7 @@ async fn zig_global_cache(zig: &Path, harness: &ToolHarness) -> Result<PathBuf> 
     fs::write(warmup.join("warmup.zig"), "")?;
     let _shared = TIMING.read().await;
     let output = tokio::time::timeout(
-        Duration::from_secs(600),
+        Duration::from_mins(10),
         Command::new(zig)
             .arg("fetch")
             .arg(&warmup)

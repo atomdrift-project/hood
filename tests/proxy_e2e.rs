@@ -23,26 +23,39 @@ use hyper_util::rt::TokioIo;
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair, SanType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::rustls::{self, pki_types::CertificateDer, pki_types::PrivateKeyDer};
+use tokio_rustls::rustls::{
+    self, pki_types::CertificateDer, pki_types::PrivateKeyDer, pki_types::pem::PemObject,
+};
 
 use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
 use hood::scanner::{AllowAll, BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
 
-/// A scanner that blocks everything it is asked to inspect, in-memory or on
-/// disk. Used to prove a path was *not* scanned: if a response still comes back
-/// forwarded, the scanner was never consulted.
+/// A scanner that blocks everything it is asked to decide. Used to prove a
+/// path was *not* scanned: if a response still comes back forwarded, the
+/// scanner was never consulted.
 #[derive(Debug)]
 struct BlockAll;
 
 #[async_trait::async_trait]
 impl Scanner for BlockAll {
-    async fn scan(&self, _req: ScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Block(BlockReason::Hostile))
+    async fn scan(&self, _req: ScanRequest) -> Verdict {
+        Verdict::Block(BlockReason::Hostile)
     }
-    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Block(BlockReason::Hostile))
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Verdict {
+        Verdict::Block(BlockReason::Hostile)
     }
+    fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
+        withheld("download exceeds inspection limit")
+    }
+    fn uninspectable(&self, _url: &str, why: &str) -> Verdict {
+        withheld(why)
+    }
+}
+
+/// What both test scanners answer for a payload they cannot inspect.
+fn withheld(why: &str) -> Verdict {
+    Verdict::Block(BlockReason::ScanError(why.to_owned()))
 }
 
 /// Body the test origin returns. Some plain ASCII so we don't accidentally
@@ -174,15 +187,13 @@ async fn start_https_origin_at(bind: &str) -> Result<(SocketAddr, String)> {
 }
 
 fn roots_from_pem(pem: &str) -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut pem.as_bytes())
+    CertificateDer::pem_slice_iter(pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
 
-/// Build a reqwest client that:
-///   - routes through the hood proxy at `proxy_addr`
-///   - trusts hood's ephemeral CA (so MITM cert verifies)
-///   - trusts an additional CA (the origin's, for direct upstream TLS in proxy)
+/// A reqwest client that routes through the hood proxy at `proxy_addr` and
+/// trusts hood's ephemeral CA, so the intercepted leaf verifies.
 fn client_with_proxy(proxy_addr: SocketAddr, hood_ca_pem: &str) -> reqwest::Client {
     let proxy_url = format!("http://{proxy_addr}");
     let proxy_all = reqwest::Proxy::all(&proxy_url).unwrap();
@@ -190,9 +201,8 @@ fn client_with_proxy(proxy_addr: SocketAddr, hood_ca_pem: &str) -> reqwest::Clie
         .proxy(proxy_all)
         .danger_accept_invalid_certs(false)
         .tls_built_in_root_certs(true);
-    for cert in rustls_pemfile::certs(&mut hood_ca_pem.as_bytes()).filter_map(Result::ok) {
-        let der = cert.to_vec();
-        builder = builder.add_root_certificate(reqwest::Certificate::from_der(&der).unwrap());
+    for cert in roots_from_pem(hood_ca_pem) {
+        builder = builder.add_root_certificate(reqwest::Certificate::from_der(&cert).unwrap());
     }
     builder.build().unwrap()
 }
@@ -442,12 +452,13 @@ async fn large_body_spills_to_disk_and_forwards_intact() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn oversized_body_is_blocked_by_default() -> Result<()> {
+async fn oversized_body_follows_the_scanners_limit_decision() -> Result<()> {
     drop(rustls::crypto::ring::default_provider().install_default());
 
     let origin_addr = start_http_origin().await?;
     let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
-    // Oversized artifacts must not bypass the release gate.
+    // Past the limit, the scanner's `scan_limit` answer is final; this one
+    // withholds, so nothing oversized slips through unasked.
     let cfg = Config::default().with_scan_limits(4096, 16 * 1024)?;
     let proxy = Proxy::new(scanner, cfg)?;
     let hood_ca = proxy.ca_pem().to_owned();
@@ -514,19 +525,25 @@ async fn block_returns_451() -> Result<()> {
     Ok(())
 }
 
-/// A scanner that clears everything it inspects but keeps the default answer —
-/// withhold — for anything it cannot inspect. A 451 from it proves the payload
-/// was refused as uninspectable, not judged.
+/// A scanner that clears everything it inspects but withholds anything it
+/// cannot inspect. A 451 from it proves the payload was refused as
+/// uninspectable, not judged.
 #[derive(Debug)]
 struct ClearsInspected;
 
 #[async_trait::async_trait]
 impl Scanner for ClearsInspected {
-    async fn scan(&self, _req: ScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Allow)
+    async fn scan(&self, _req: ScanRequest) -> Verdict {
+        Verdict::Allow
     }
-    async fn scan_disk(&self, _req: DiskScanRequest) -> Result<Verdict> {
-        Ok(Verdict::Allow)
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Verdict {
+        Verdict::Allow
+    }
+    fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
+        withheld("download exceeds inspection limit")
+    }
+    fn uninspectable(&self, _url: &str, why: &str) -> Verdict {
+        withheld(why)
     }
 }
 

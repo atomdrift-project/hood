@@ -13,7 +13,8 @@ keywords = ["malware", "supply-chain", "package-manager", "security", "proxy"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
 
 [lints.rust]
-# `deny`, not `forbid`: `main` allows the crate's one unsafe call, `_exit`.
+# `deny`, not `forbid`: two libc calls are allowed where they stand, `_exit`
+# in `main` and `kill` in `tools`, each with its SAFETY argument.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
@@ -56,6 +57,9 @@ cast_possible_truncation = "warn"
 # Its suggested `assert_eq!(v, [] as [T; 0])` is noisier than the
 # `is_empty()` it replaces, and does not type-check for every element type.
 assert_is_empty = "allow"
+# Contradicts rustc's `unreachable_pub`, which wants `pub(crate)` written out
+# on items inside private modules; the rustc lint wins.
+redundant_pub_crate = "allow"
 
 [dependencies]
 anyhow = "1"
@@ -77,7 +81,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rustls-pemfile = "2"
 # Hard-linked Windows shims share an identity with hood.exe that paths cannot show.
 same-file = "1"
 rustls-native-certs = "0.8"
@@ -93,7 +96,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
-# `_exit` only; see `main`. Already in the graph via tokio.
+# `_exit` in `main` and `kill` in `tools`. Already in the graph via tokio.
 libc = "0.2"
 
 [dev-dependencies]

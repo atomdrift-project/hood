@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Shared by the distribution scripts, which CI runs as root inside each
 # distribution's container with this checkout mounted read-only at /src:
 #

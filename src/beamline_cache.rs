@@ -1,8 +1,5 @@
 //! Persistent, byte-specific Beamline assessments. Cache failures are always misses.
 
-// Match beamline's explicit internal visibility without conflicting with unreachable_pub.
-#![allow(clippy::redundant_pub_crate)]
-
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Once;
@@ -15,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::beamline::Assessment;
 
 const TTL: Duration = Duration::from_hours(30 * 24);
-const UNMEASURED_TTL: Duration = Duration::from_secs(60);
+const UNMEASURED_TTL: Duration = Duration::from_mins(1);
 const MAX_ENTRY_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug)]

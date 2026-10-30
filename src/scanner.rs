@@ -372,7 +372,7 @@ impl AtomScanner {
     async fn gate(&self, url: &str, allow_purl: bool, sha: &[u8; 32]) -> Option<Verdict> {
         // Local identity checks may use private coordinates; disclosure is decided
         // separately, only if the local bundle cannot resolve the artifact.
-        let purl = fletch::url_to_purl(url);
+        let purl = fletch::purl::url_to_purl(url);
         let bloom = self
             .bloom
             .get_or_init(|| async {
@@ -943,7 +943,7 @@ mod tests {
         for (tier, record) in rows {
             sets.insert(*tier, record.clone());
         }
-        burton::build::write_bundle(
+        burton::write_bundle(
             dir,
             &sets.into_filters(1e-9),
             "2026-09-09",

@@ -459,7 +459,7 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
     ) {
         return None;
     }
-    fletch::url_to_purl(raw)
+    fletch::purl::url_to_purl(raw)
 }
 
 #[cfg(test)]

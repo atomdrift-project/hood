@@ -47,11 +47,12 @@ enum Command {
     },
     /// Remove hood shims and shell-rc entries.
     Uninstall,
-    /// Switch on isotope13 Enriched: approve the code shown at
-    /// `dash.isotope13.io/device`. Afterwards hood checks downloads with the
-    /// latest rules, the moment they clear QA, and sends the token to
+    /// Switch on Atomdrift Uplink: approve the code shown at
+    /// `dash.isotope13.io/device`. Afterwards hood checks downloads with
+    /// zero-hour rules, the moment they clear QA, and sends the token to
     /// Beamline. To switch it off, delete the saved token file.
-    Enrich,
+    #[command(alias = "enrich")]
+    Uplink,
     /// Show hood's version and which rules it checks downloads with.
     Version,
 }
@@ -144,7 +145,7 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
         Action::Run { program, argv } => (program, argv),
         Action::Install { force } => return hood::install::install(force).map(|()| 0),
         Action::Uninstall => return hood::install::uninstall().map(|()| 0),
-        Action::Enrich => {
+        Action::Uplink => {
             // Blocking HTTP and a terminal read: off the async runtime.
             tokio::task::spawn_blocking(cleave::rule_update::enrich).await??;
             return Ok(0);
@@ -449,7 +450,7 @@ enum Action {
         force: bool,
     },
     Uninstall,
-    Enrich,
+    Uplink,
     Version,
 }
 
@@ -483,7 +484,7 @@ impl TryFrom<Command> for Action {
             }
             Command::Install { force } => Ok(Self::Install { force }),
             Command::Uninstall => Ok(Self::Uninstall),
-            Command::Enrich => Ok(Self::Enrich),
+            Command::Uplink => Ok(Self::Uplink),
             Command::Version => Ok(Self::Version),
         }
     }
@@ -576,6 +577,14 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn uplink_and_legacy_enrich_alias_parse() {
+        for sub in ["uplink", "enrich"] {
+            let cli = Cli::try_parse_from(["hood", sub]).unwrap();
+            assert!(matches!(cli.command, Command::Uplink));
+        }
     }
 
     #[test]

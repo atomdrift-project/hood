@@ -97,7 +97,7 @@ enum Query<'a> {
 const API_URL: &str = "https://api.isotope13.ai";
 
 /// The isotope13 token for requests to `base`: `ISOTOPE13_TOKEN`, else the one
-/// `hood enrich` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
+/// `hood uplink` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
 /// pointing anywhere else gets no token, so redirecting the endpoint can never
 /// carry a subscriber's credential with it.
 fn isotope13_token(base: &str) -> Option<String> {

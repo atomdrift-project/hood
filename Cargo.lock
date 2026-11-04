@@ -321,7 +321,7 @@ dependencies = [
  "colored",
  "ctrlc",
  "dashmap",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "fletch",
  "form_urlencoded",
@@ -533,7 +533,7 @@ dependencies = [
 [[package]]
 name = "binform"
 version = "0.9.0"
-source = "git+https://github.com/atomdrift-project/binform.git#d10cb13681054b33c99cab4ea60c4841fcdec76a"
+source = "git+https://github.com/atomdrift-project/binform.git#4211c34c06adbed883caf73542cfa76f12130d8b"
 dependencies = [
  "gimli 0.32.3",
  "iced-x86",
@@ -932,7 +932,7 @@ dependencies = [
  "cu-bincode",
  "data-encoding",
  "des",
- "dirs",
+ "dirs 6.0.0",
  "dmgwiz",
  "encoding_rs",
  "filefacts",
@@ -989,7 +989,7 @@ dependencies = [
  "xz2",
  "yara-classify",
  "yara-x",
- "zip 9.3.0",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -1645,6 +1645,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1931,7 +1940,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#5a757cf5104030c4571a3250383a70ff35f63cf7"
+source = "git+https://github.com/atomdrift-project/filefacts.git#977d9cc8fd261f935003988cfbe8654872d11d36"
 dependencies = [
  "aes 0.9.4",
  "aho-corasick",
@@ -1942,14 +1951,14 @@ dependencies = [
  "cms",
  "crc32fast",
  "der 0.7.10",
- "dirs",
+ "dirs 6.0.0",
  "flate2",
  "gimli 0.32.3",
  "goblin",
  "iced-x86",
  "jpeg-decoder",
  "libc",
- "lzma-rust2",
+ "lzma-rust2 0.24.0",
  "md-5 0.10.6",
  "memchr",
  "p256 0.13.2",
@@ -2000,7 +2009,7 @@ dependencies = [
  "tree-sitter-zig",
  "ts-parser-perl",
  "x509-cert",
- "zip 9.3.0",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -2051,11 +2060,11 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/fletch.git#f79828b27c51f599ff6ad3fa3b5fe0b6e7e923ae"
+source = "git+https://github.com/atomdrift-project/fletch.git#fa428e089478624712c7a54893644abb9ffff6ef"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "flate2",
  "hex",
@@ -2075,7 +2084,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "xz2",
- "zip 9.3.0",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -2469,7 +2478,7 @@ dependencies = [
  "bytes",
  "clap",
  "cleave",
- "dirs",
+ "dirs 7.0.0",
  "flate2",
  "fletch",
  "futures-util",
@@ -2495,7 +2504,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -3238,6 +3247,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baab2bbbd7d75a144d671e9ff79270e903957d92fb7386fd39034c709bd2661"
 dependencies = [
  "byteorder",
+]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
+dependencies = [
+ "sha2 0.11.1",
 ]
 
 [[package]]
@@ -5535,7 +5553,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#9d505cecb9469a75cb9c11f2b5a5a8f3bfa16dc8"
+source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -5561,7 +5579,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#9d505cecb9469a75cb9c11f2b5a5a8f3bfa16dc8"
+source = "git+https://github.com/atomdrift-project/stng.git#72e68eaa3b583fd2e1d75baff6e08ef87c68b0b6"
 dependencies = [
  "libc",
 ]
@@ -6360,7 +6378,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#5a757cf5104030c4571a3250383a70ff35f63cf7"
+source = "git+https://github.com/atomdrift-project/filefacts.git#977d9cc8fd261f935003988cfbe8654872d11d36"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -6583,12 +6601,6 @@ name = "twox-hash"
 version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
-
-[[package]]
-name = "typed-path"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
 
 [[package]]
 name = "typed-path"
@@ -7649,7 +7661,7 @@ dependencies = [
  "yara-x-macros",
  "yara-x-parser",
  "yara-x-proto",
- "zip 9.3.0",
+ "zip",
 ]
 
 [[package]]
@@ -7825,21 +7837,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "indexmap",
- "memchr",
- "typed-path 0.12.4",
-]
-
-[[package]]
-name = "zip"
-version = "9.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaeb7f16d2605b49aef586996ded29e65642fab7259a3077e537351df6d80426"
+checksum = "848dad21639597378c3be94c59fd4de683f0f6d8a5387575896e1245737d4f37"
 dependencies = [
  "aes 0.9.4",
  "bzip2 0.6.1",
@@ -7850,15 +7850,14 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "indexmap",
- "libc",
- "lzma-rust2",
+ "lzma-rust2 0.23.0",
  "memchr",
  "nix",
  "pbkdf2 0.13.0",
  "ppmd-rust",
  "sha1 0.11.0",
  "time",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
  "zopfli",

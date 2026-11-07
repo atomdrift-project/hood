@@ -321,7 +321,7 @@ dependencies = [
  "colored",
  "ctrlc",
  "dashmap",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "fletch",
  "form_urlencoded",
@@ -932,7 +932,7 @@ dependencies = [
  "cu-bincode",
  "data-encoding",
  "des 0.8.1",
- "dirs",
+ "dirs 6.0.0",
  "dmgwiz",
  "encoding_rs",
  "filefacts",
@@ -990,7 +990,7 @@ dependencies = [
  "xz2",
  "yara-classify",
  "yara-x",
- "zip 9.4.1",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -1655,6 +1655,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1958,7 +1967,7 @@ dependencies = [
  "iced-x86",
  "jpeg-decoder",
  "libc",
- "lzma-rust2 0.24.0",
+ "lzma-rust2",
  "md-5 0.10.6",
  "memchr",
  "p256 0.13.2",
@@ -2008,7 +2017,7 @@ dependencies = [
  "tree-sitter-zig",
  "ts-parser-perl",
  "x509-cert",
- "zip 9.4.1",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -2062,7 +2071,7 @@ version = "3.0.0-beta.1"
 source = "git+https://github.com/atomdrift-project/fletch.git#868671ab614fc6df1be392cd1dfef9b703d9b688"
 dependencies = [
  "base64 0.22.1",
- "dirs",
+ "dirs 6.0.0",
  "filefacts",
  "flate2",
  "node-semver",
@@ -2080,7 +2089,7 @@ dependencies = [
  "tracing",
  "url",
  "xz2",
- "zip 9.4.1",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -2474,7 +2483,7 @@ dependencies = [
  "bytes",
  "clap",
  "cleave",
- "dirs",
+ "dirs 7.0.0",
  "flate2",
  "fletch",
  "futures-util",
@@ -2500,7 +2509,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -3250,15 +3259,6 @@ name = "lzma-rust2"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490750560fa7851fbbf5d3ab1a8750f09350ed361ed8aed85b1e1e40587812ee"
-dependencies = [
- "sha2 0.11.1",
-]
-
-[[package]]
-name = "lzma-rust2"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
 dependencies = [
  "sha2 0.11.1",
 ]
@@ -6498,12 +6498,6 @@ checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
-
-[[package]]
-name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
@@ -7526,7 +7520,7 @@ dependencies = [
  "yara-x-macros",
  "yara-x-parser",
  "yara-x-proto",
- "zip 9.4.1",
+ "zip",
 ]
 
 [[package]]
@@ -7702,21 +7696,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "indexmap",
- "memchr",
- "typed-path 0.12.4",
-]
-
-[[package]]
-name = "zip"
-version = "9.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f17fbc870bfac28c6228aed7d6e6df352e26bf7015c4313727e16a7a01ce5e"
+checksum = "eaeb7f16d2605b49aef586996ded29e65642fab7259a3077e537351df6d80426"
 dependencies = [
  "aes 0.9.4",
  "bzip2 0.6.1",
@@ -7728,14 +7710,14 @@ dependencies = [
  "hmac 0.13.0",
  "indexmap",
  "libc",
- "lzma-rust2 0.25.0",
+ "lzma-rust2",
  "memchr",
  "nix",
  "pbkdf2 0.13.0",
  "ppmd-rust",
  "sha1 0.11.0",
  "time",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
  "zopfli",

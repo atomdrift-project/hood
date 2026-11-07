@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(sanitize("a\tb"), "a\tb");
     }
 
-    fn trait_(id: &str, crit: u32, conf: f32) -> TopFinding {
+    fn trait_(id: &str, crit: cleave::Criticality, conf: f32) -> TopFinding {
         TopFinding {
             id: id.into(),
             crit,
@@ -835,7 +835,11 @@ mod tests {
 
     #[test]
     fn plain_output_includes_url_and_verdict() {
-        let traits = vec![trait_("exec/shell::bash", 5, 0.95)];
+        let traits = vec![trait_(
+            "exec/shell::bash",
+            cleave::Criticality::Hostile,
+            0.95,
+        )];
         let reasons = vec![reason_("crit_count:suspicious")];
         let p = panel(
             &traits,

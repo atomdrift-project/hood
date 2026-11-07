@@ -991,7 +991,7 @@ mod tests {
                 (Tier::SightedSuspicious, rec(None, Some(sighted_sha))),
             ],
         );
-        let lookup = Lookup::load_from(tmp.path());
+        let lookup = scan::bloom_repo::test_support::load_from(tmp.path());
         assert!(lookup.is_active());
 
         // Known-bad hash → hard block carrying the payload's SHA-256.
@@ -1113,7 +1113,7 @@ mod tests {
         let mock = beamline::test_support::server(vec![]).await;
         let scanner = test_scanner(
             Some(beamline::Client::new(&mock.url, None).unwrap()),
-            Some(Lookup::load_from(tmp.path())),
+            Some(scan::bloom_repo::test_support::load_from(tmp.path())),
             tmp.path().join("missing-model"),
             ScanPolicy::Strict,
         );
@@ -1171,7 +1171,7 @@ mod tests {
             publish_filters(bundle.path(), &[(Tier::Bad, bad_record)]);
             let scanner = test_scanner(
                 Some(cached_client(&endpoint, cache_dir.path())),
-                Some(Lookup::load_from(bundle.path())),
+                Some(scan::bloom_repo::test_support::load_from(bundle.path())),
                 bundle.path().join("missing-model"),
                 ScanPolicy::default(),
             );

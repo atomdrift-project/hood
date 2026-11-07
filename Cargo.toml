@@ -102,6 +102,8 @@ libc = "0.2"
 [dev-dependencies]
 # Builds the bloom bundles the gate tests load; the same crate scan reads them with.
 burton = { git = "https://github.com/atomdrift-project/burton.git" }
+# Lets the gate tests load those bundles from a tempdir.
+scan = { package = "atomdrift-scan", git = "https://github.com/atomdrift-project/scan.git", features = ["test-support"] }
 flate2 = "1"
 tar = "0.4"
 tokio = { version = "1", features = ["test-util", "macros"] }

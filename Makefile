@@ -8,7 +8,7 @@ TOOL ?= go
 # inherit a malformed MAKEFLAGS and fail with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release install lint test test-tools clean check-cargo
+.PHONY: all build release install lint fix test test-tools clean check-cargo
 
 all: build
 
@@ -49,6 +49,12 @@ install: release
 lint:
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
+
+# Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
+# tidies any code clippy rewrote. Mirrors what `lint` checks.
+fix:
+	$(CARGO) clippy --workspace --all-targets --fix --allow-dirty --allow-staged
+	$(CARGO) fmt --all
 
 test:
 	$(CARGO) test --release

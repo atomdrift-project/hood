@@ -327,9 +327,9 @@ impl AtomScanner {
             .get_or_init(|| async {
                 let model_dir = self.model_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    // Before the analyzer resolves a rules tree: logged in
-                    // means the Enriched one, and never the working directory's.
-                    activate_enriched();
+                    // Before the analyzer resolves a rules tree: this host's
+                    // feed, and never the working directory's.
+                    activate_feed();
                     scan::traits_repo::prepare_runtime_env();
                     let model_dir = match model_dir {
                         Some(dir) => dir,
@@ -638,15 +638,15 @@ fn refresh_bloom() {
 /// Do the network work local analysis may need before the command starts.
 ///
 /// That is a first-run install of the models and rules, and the daily Bloom and
-/// Enriched refreshes. Left to the first scan, the download happens inside a
+/// paid-feed refreshes. Left to the first scan, the download happens inside a
 /// request, and package managers abandon a transfer that sends nothing for a
 /// few seconds (pacman after 10). Failures are logged and left to the lazy
 /// analyzer load, which applies the scan policy per download.
 ///
 /// Blocking: network and disk I/O.
 pub fn prepare() {
-    // Before anything resolves a rules tree: logged in means the Enriched one.
-    activate_enriched();
+    // Before anything resolves a rules tree: this host's feed.
+    activate_feed();
     refresh_bloom();
     // `SCAN_MODELS_DIR` names models scan uses as they are, never fetching.
     if let Err(error) = scan::models_repo::ensure_model_dir() {
@@ -660,7 +660,7 @@ pub fn prepare() {
 /// let the checkout being installed supply its own rules.
 fn install_traits() {
     let explicit = std::env::var_os("CLEAVE_TRAITS_DIR").is_some_and(|dir| !dir.is_empty());
-    let installed = cleave::traits_repo::installed_dir(cleave::enriched::enabled());
+    let installed = cleave::traits_repo::installed_dir(cleave::feed::current());
     if !explicit
         && !installed.is_dir()
         && let Err(error) = scan::traits_repo::update(false, false)
@@ -670,65 +670,56 @@ fn install_traits() {
     scan::traits_repo::prepare_runtime_env();
 }
 
-/// Check downloads with the Atomdrift Uplink rules once `hood uplink` has
-/// saved a token (or `ISOTOPE13_TOKEN` names one), refreshing them at most
-/// once a day.
+/// Check downloads with this host's rule feed — the one saved by `hood feed`
+/// (shared with cleave and atomscan), `ATOMDRIFT_FEED`, or the zero-day feed
+/// once `hood uplink` has saved a token — refreshing a paid feed at most once
+/// a day.
 ///
 /// A refused token is a warning, never a failed install: a billing problem
 /// must not block a developer's `npm install`, and the check itself still runs
-/// — on the Uplink rules already installed, or on the open-source ones when
+/// — on the feed's rules already installed, or on the open-source ones when
 /// there are none yet.
-fn activate_enriched() {
+fn activate_feed() {
     static ACTIVATE: std::sync::Once = std::sync::Once::new();
     ACTIVATE.call_once(|| {
-        // The refresh is what first installs the Uplink tree after `hood
+        // The refresh is what first installs a paid feed's tree after `hood
         // uplink`, so it runs before the installed tree is checked. A refused
-        // token falls the run back to the open-source rules inside the refresh,
-        // with its own warning; what is left to say is a network failure.
-        if token_selects_enriched()
-            && due_today("traits-enriched-checked")
+        // token falls the run back inside the refresh, with its own warning;
+        // what is left to say is a network failure.
+        let feed = resolve_feed();
+        if feed.needs_token()
+            && due_today(&format!("traits-{}-checked", feed.slug()))
             && let Err(error) = scan::traits_repo::update(false, true)
         {
-            tracing::warn!(error = %format!("{error:#}"), "Uplink rules refresh failed; using installed rules");
+            tracing::warn!(error = %format!("{error:#}"), "{feed} refresh failed; using installed rules");
         }
         installed_or_open_source();
     });
 }
 
-/// Choose the rules a check uses, with no network.
-///
-/// That is the Uplink tree when this host holds a token (`hood uplink`, or
-/// `ISOTOPE13_TOKEN`) and that tree is installed, the open-source one
-/// otherwise.
+/// Choose the rules a check uses, with no network: this host's feed when its
+/// tree is installed, the open-source one otherwise.
 pub fn select_rules() {
-    if token_selects_enriched() {
-        installed_or_open_source();
-    }
+    resolve_feed();
+    installed_or_open_source();
 }
 
-/// Whether this host's token, or its absence, selects the Uplink rules.
-fn token_selects_enriched() -> bool {
-    if let Err(error) = cleave::enriched::resolve(false) {
+/// This host's feed, from what it has saved and holds.
+fn resolve_feed() -> cleave::feed::Feed {
+    if let Err(error) = cleave::feed::resolve(None) {
         tracing::warn!(error = %format!("{error:#}"), "isotope13 token unusable; checking with open-source rules");
-        return false;
+        cleave::feed::select(cleave::feed::Feed::OssDelayed, false);
     }
-    if std::env::var("ATOMDRIFT_UPLINK").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        )
-    }) {
-        cleave::enriched::set_enabled(false);
-    }
-    cleave::enriched::enabled()
+    cleave::feed::current()
 }
 
-/// Keep Uplink only if its tree is on disk; a check never runs on no rules.
+/// Keep a paid feed only if its tree is on disk; a check never runs on no rules.
 fn installed_or_open_source() {
-    let installed = cleave::traits_repo::installed_dir(true);
-    if cleave::enriched::enabled() && cleave::rule_update::installed(&installed).is_none() {
-        tracing::warn!(dir = %installed.display(), "no Uplink rules installed; checking with open-source rules");
-        cleave::enriched::set_enabled(false);
+    let feed = cleave::feed::current();
+    let installed = cleave::traits_repo::installed_dir(feed);
+    if feed.needs_token() && cleave::rule_update::installed(&installed).is_none() {
+        tracing::warn!(dir = %installed.display(), "no {feed} rules installed; checking with open-source rules");
+        cleave::feed::select(cleave::feed::Feed::OssDelayed, false);
     }
 }
 

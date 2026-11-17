@@ -45,7 +45,7 @@ Commands that fetch are intercepted; local operations such as `go test`, `cargo 
 2. **Beamline assessment.** Public packages are assessed by package URL, everything else by SHA-256. Verified results are cached for 30 days.
 3. **Local analysis** for anything still unresolved, including API outages and rate limits. Package-manager downloads are always inspected in full. Downloads larger than 1 GB through `curl`, `wget`, or `hood exec` — ISOs, disk images, model weights — are forwarded unscanned, with a warning. A response compressed despite hood asking for `identity` follows the `HOOD_BYPASS` policy, because hood cannot inspect what the tool will decode.
 
-`hood uplink` enables Atomdrift Uplink (zero-hour rules the moment they clear QA, plus authenticated Beamline lookups); `ISOTOPE13_TOKEN` overrides the saved token, and a lapsed token is a warning, never a failed install. `hood version` says which rules a check uses, Atomdrift Uplink or open source, and their revision.
+`hood uplink` connects this computer to your isotope¹³ plan (its rule feed, plus authenticated Beamline lookups); `ISOTOPE13_TOKEN` overrides the saved token, and a lapsed token is a warning, never a failed install. `hood feed` lists the rule feeds — `zero-day`, `supporter` (72 hours behind), and `oss-delayed` (up to 8 days) — and `hood feed <name>` switches, for cleave and atomscan too. `hood version` says which feed a check uses and its revision.
 
 ## Environment
 

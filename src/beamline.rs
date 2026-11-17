@@ -104,7 +104,7 @@ fn isotope13_token(base: &str) -> Option<String> {
     if base.trim_end_matches('/') != API_URL {
         return None;
     }
-    match cleave::enriched::token() {
+    match cleave::feed::token() {
         Ok(found) => found.map(|(token, _)| token.secret().to_owned()),
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "isotope13 token unusable; asking Beamline without one");

@@ -47,12 +47,19 @@ enum Command {
     },
     /// Remove hood shims and shell-rc entries.
     Uninstall,
-    /// Switch on Atomdrift Uplink: approve the code shown at
-    /// `dash.isotope13.io/device`. Afterwards hood checks downloads with
-    /// zero-hour rules, the moment they clear QA, and sends the token to
-    /// Beamline. To switch it off, delete the saved token file.
+    /// Connect this computer to your isotope¹³ plan: approve the code shown
+    /// at `dash.isotope13.io/device`. Afterwards hood checks downloads with
+    /// the plan's rule feed and sends the token to Beamline. To disconnect,
+    /// delete the saved token file.
     #[command(alias = "enrich")]
     Uplink,
+    /// Show the rule feeds, or switch to one (zero-day, supporter,
+    /// oss-delayed). The choice is shared with cleave and atomscan.
+    Feed {
+        /// Feed to switch to; omit to list them
+        #[arg(value_enum)]
+        name: Option<cleave::feed::Feed>,
+    },
     /// Show hood's version and which rules it checks downloads with.
     Version,
 }
@@ -147,7 +154,22 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
         Action::Uninstall => return hood::install::uninstall().map(|()| 0),
         Action::Uplink => {
             // Blocking HTTP and a terminal read: off the async runtime.
-            tokio::task::spawn_blocking(cleave::rule_update::enrich).await??;
+            tokio::task::spawn_blocking(cleave::rule_update::connect).await??;
+            return Ok(0);
+        }
+        Action::Feed(name) => {
+            // Blocking HTTP and a terminal read: off the async runtime.
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                match name {
+                    None => {
+                        cleave::feed::resolve(None)?;
+                        print!("{}", cleave::feed::list());
+                    }
+                    Some(feed) => cleave::rule_update::switch(feed)?,
+                }
+                Ok(())
+            })
+            .await??;
             return Ok(0);
         }
         Action::Version => {
@@ -451,6 +473,7 @@ enum Action {
     },
     Uninstall,
     Uplink,
+    Feed(Option<cleave::feed::Feed>),
     Version,
 }
 
@@ -485,6 +508,7 @@ impl TryFrom<Command> for Action {
             Command::Install { force } => Ok(Self::Install { force }),
             Command::Uninstall => Ok(Self::Uninstall),
             Command::Uplink => Ok(Self::Uplink),
+            Command::Feed { name } => Ok(Self::Feed(name)),
             Command::Version => Ok(Self::Version),
         }
     }
@@ -585,6 +609,20 @@ mod tests {
             let cli = Cli::try_parse_from(["hood", sub]).unwrap();
             assert!(matches!(cli.command, Command::Uplink));
         }
+    }
+
+    #[test]
+    fn feed_lists_or_names_a_feed() {
+        let cli = Cli::try_parse_from(["hood", "feed"]).unwrap();
+        assert!(matches!(cli.command, Command::Feed { name: None }));
+        let cli = Cli::try_parse_from(["hood", "feed", "supporter"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Feed {
+                name: Some(cleave::feed::Feed::Supporter)
+            }
+        ));
+        assert!(Cli::try_parse_from(["hood", "feed", "nightly"]).is_err());
     }
 
     #[test]

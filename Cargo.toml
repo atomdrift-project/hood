@@ -149,6 +149,8 @@ codegen-units = 1
 # carries these changes.
 [patch.crates-io]
 # Inherited from a sibling by update-deps: [patch] applies only in the root.
+regex-syntax = { git = "https://github.com/tstromberg/regex" }
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }

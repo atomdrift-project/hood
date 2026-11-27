@@ -20,6 +20,11 @@
 //!   absolute form; hood performs the verified upstream TLS handshake itself.
 //!   The plaintext leg never leaves loopback.
 //!
+//! - Homebrew, when [`Config::with_brew_clients`] is enabled. brew gives up
+//!   on a download that is silent for five seconds, so a body held longer
+//!   than a second is kept alive with a trickle of its own first bytes; and
+//!   brew's git, which cannot be handed hood's CA, is tunnelled uninspected.
+//!
 //! Hop-by-hop headers are stripped on both legs and `Accept-Encoding` is forced
 //! to `identity` on outbound so we never have to decompress for scanning.
 //!
@@ -34,26 +39,27 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
-    HOST, HeaderMap, HeaderName, HeaderValue, LOCATION, USER_AGENT,
+    ACCEPT_ENCODING, ACCEPT_RANGES, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue, IF_RANGE, LOCATION, RANGE, USER_AGENT,
 };
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -104,6 +110,19 @@ const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 /// but moving multi-gigabyte download is never cut off.
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// How long a Homebrew download is held in silence, and then how often a
+/// little of it is released. brew's curl runs with `--speed-limit 100
+/// --speed-time 5`: five seconds under 100 bytes a second and it gives up.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bytes of a held body released each [`KEEPALIVE_INTERVAL`]: a few times
+/// the rate brew's curl insists on.
+const KEEPALIVE_BYTES: usize = 256;
+
+/// The most of a held body's start kept for release as keepalive, enough for
+/// a hold of over four minutes.
+const KEEPALIVE_HEAD: usize = 64 * 1024;
+
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -133,6 +152,8 @@ pub struct Config {
     extra_upstream_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     /// Refuse CONNECT from Zig's HTTP client; accept absolute-form `https://`.
     zig_clients: bool,
+    /// Keep Homebrew's held downloads alive; tunnel its git uninspected.
+    brew_clients: bool,
 }
 
 impl Default for Config {
@@ -144,6 +165,7 @@ impl Default for Config {
             bind: ([127, 0, 0, 1], 0).into(),
             extra_upstream_roots: Vec::new(),
             zig_clients: false,
+            brew_clients: false,
         }
     }
 }
@@ -215,6 +237,31 @@ impl Config {
         self.zig_clients = enabled;
         self
     }
+
+    /// Serve Homebrew, whose two clients each need an accommodation.
+    ///
+    /// brew's curl abandons a download that stays silent for five seconds,
+    /// sooner than a large one can be fetched and assessed. A body held
+    /// longer than a second is therefore answered with the upstream headers
+    /// and a trickle of its own first bytes, the rest following only once
+    /// it is cleared; a blocked one is cut off instead. brew keeps a file
+    /// only when its transfer completes, and it is never offered a resume
+    /// (`Range` is dropped, `Accept-Ranges: none` sent), so what a blocked
+    /// transfer leaves behind cannot be finished later from a fragment hood
+    /// has no way to judge.
+    ///
+    /// brew's git cannot be made to trust hood's CA: brew scrubs every git
+    /// setting from its environment. Its CONNECT tunnels are relayed without
+    /// interception, so what git fetches is not inspected.
+    ///
+    /// Both are chosen by user agent (`Homebrew/…`, `git/…`). Any client may
+    /// claim either, which is why this is enabled only when brew is what
+    /// hood runs.
+    #[must_use]
+    pub const fn with_brew_clients(mut self, enabled: bool) -> Self {
+        self.brew_clients = enabled;
+        self
+    }
 }
 
 /// A ready-to-bind proxy. Cheap to clone (everything is `Arc` inside).
@@ -230,6 +277,8 @@ struct Inner {
     /// longer than many child commands run. See [`Inner::upstream_tls`].
     upstream_tls: tokio::sync::OnceCell<Arc<ClientConfig>>,
     go_bridge_token: String,
+    /// Whether this run has yet said that git passes uninspected.
+    git_tunnel_reported: AtomicBool,
     config: Config,
 }
 
@@ -267,6 +316,7 @@ impl Proxy {
                 ca,
                 upstream_tls: tokio::sync::OnceCell::new(),
                 go_bridge_token,
+                git_tunnel_reported: AtomicBool::new(false),
                 config,
             }),
         })
@@ -483,12 +533,11 @@ impl Proxy {
         if req.method() == Method::CONNECT && tunnel_origin.is_none() {
             // Zig's CONNECT never carries caller headers, so it always sends
             // the default `zig/<version> (std.http)` user agent.
-            let zig = req
-                .headers()
-                .get(USER_AGENT)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|agent| agent.starts_with("zig/"));
-            if self.inner.config.zig_clients && zig {
+            let agent = user_agent(req.headers());
+            if self.inner.config.brew_clients && agent.starts_with("git/") {
+                return self.tunnel_git(req).await;
+            }
+            if self.inner.config.zig_clients && agent.starts_with("zig/") {
                 // A 4xx, not 5xx: Zig treats a server error as possibly
                 // transient and keeps trying to tunnel.
                 tracing::debug!(authority = ?req.uri().authority(), "refuse Zig CONNECT; expecting absolute-form https");
@@ -540,6 +589,54 @@ impl Proxy {
                 error_response(StatusCode::BAD_GATEWAY, "upstream error")
             }
         }
+    }
+
+    /// Relay git's CONNECT tunnel to its origin without interception; see
+    /// [`Config::with_brew_clients`]. The origin is dialed before the tunnel
+    /// is confirmed, so git hears of an unreachable one as a proxy error.
+    async fn tunnel_git(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
+        let Some(authority) = req.uri().authority().cloned() else {
+            return error_response(StatusCode::BAD_REQUEST, "CONNECT requires authority");
+        };
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = authority.port_u16().unwrap_or(443);
+        let dial = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect((host, port)));
+        let mut upstream = match dial.await {
+            Ok(Ok(upstream)) => upstream,
+            Ok(Err(error)) => {
+                tracing::warn!(%authority, %error, "git tunnel connect failed");
+                return error_response(StatusCode::BAD_GATEWAY, "upstream error");
+            }
+            Err(_) => {
+                tracing::warn!(%authority, "git tunnel connect timed out");
+                return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream timed out");
+            }
+        };
+        if !self.inner.git_tunnel_reported.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "Homebrew's git cannot be given hood's CA; what it fetches passes uninspected"
+            );
+        }
+        tracing::debug!(%authority, "tunnel git (uninspected)");
+        let on_upgrade = hyper::upgrade::on(&mut req);
+        tokio::spawn(async move {
+            let relayed = match on_upgrade.await {
+                Ok(upgraded) => {
+                    tokio::io::copy_bidirectional(&mut TokioIo::new(upgraded), &mut upstream)
+                        .await
+                        .map(drop)
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = relayed {
+                tracing::debug!(%authority, error, "git tunnel ended");
+            }
+        });
+        Response::new(full_body(Bytes::new()))
     }
 
     fn handle_connect(&self, mut req: Request<Incoming>) -> Response<ProxyBody> {
@@ -687,6 +784,10 @@ impl Proxy {
         // Captured before `req` is consumed by the upstream call: a HEAD request
         // never carries a response body to scan.
         let method = req.method().clone();
+        let brew_curl =
+            self.inner.config.brew_clients && user_agent(req.headers()).starts_with("Homebrew/");
+        // A cut-off transfer is only detectable under HTTP/1.1 framing.
+        let keepalive = brew_curl && req.version() == Version::HTTP_11;
         // The bare address to dial and verify: `host_str()` brackets an IPv6
         // literal, a form neither the socket nor the TLS server name accepts.
         let host = match target_url.host().ok_or_else(|| anyhow!("no host"))? {
@@ -715,6 +816,11 @@ impl Proxy {
         }
         // Force identity so we always see plaintext bytes for scanning.
         headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        if brew_curl {
+            // No resuming: see `Config::with_brew_clients`.
+            headers.remove(RANGE);
+            headers.remove(IF_RANGE);
+        }
 
         let scan_url = target_url.to_string();
 
@@ -724,6 +830,11 @@ impl Proxy {
         let (mut parts, body) = response.into_parts();
         if let Some(base) = &redirect_base {
             rewrite_go_bridge_location(&mut parts.headers, base, &self.inner.go_bridge_token)?;
+        }
+        if brew_curl {
+            parts
+                .headers
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("none"));
         }
 
         // A response with no body — a HEAD reply, a 204/304, or an explicit zero
@@ -741,7 +852,6 @@ impl Proxy {
             return build_response(parts.status, parts.headers, full_body(Bytes::new()), None);
         }
 
-        let ram_cap = self.inner.config.max_body_bytes;
         let disk_cap = self.inner.config.max_scan_bytes;
 
         // The request asked for `identity`. A server that encodes anyway would
@@ -750,9 +860,10 @@ impl Proxy {
         if let Some(encoding) = content_encoding(&parts.headers) {
             let why = format!("response is {encoding}-encoded despite an identity request");
             let verdict = self.inner.scanner.uninspectable(&scan_url, &why);
-            return uninspected(verdict, &scan_url, parts.status, parts.headers, || {
+            return uninspected(verdict, &scan_url, parts.status, || {
                 Ok(passthrough_body(body))
-            });
+            })?
+            .into_response(&scan_url, parts.status, parts.headers);
         }
 
         // A declared oversized download is never buffered.
@@ -761,35 +872,83 @@ impl Proxy {
                 .inner
                 .scanner
                 .scan_limit(&scan_url, disk_cap, Some(len));
-            return uninspected(verdict, &scan_url, parts.status, parts.headers, || {
+            return uninspected(verdict, &scan_url, parts.status, || {
                 Ok(passthrough_body(body))
-            });
+            })?
+            .into_response(&scan_url, parts.status, parts.headers);
         }
 
-        let size_hint = content_length(&parts.headers);
-        let buffered = collect_or_spill(body, &scan_url, size_hint, ram_cap, disk_cap).await?;
-        self.finish_scanned_response(
-            buffered,
-            &scan_url,
-            allow_purl && parts.status.is_success(),
-            parts.status,
-            parts.headers,
-        )
-        .await
+        let allow_purl = allow_purl && parts.status.is_success();
+        self.hold_until_assessed(body, scan_url, allow_purl, keepalive, parts)
+            .await
     }
 
-    async fn finish_scanned_response(
+    /// Buffer and assess a response body, then answer with it or a block.
+    ///
+    /// With `keepalive`, an assessment that takes longer than
+    /// [`KEEPALIVE_INTERVAL`] is answered before it finishes; see
+    /// [`Config::with_brew_clients`].
+    async fn hold_until_assessed(
+        &self,
+        body: Incoming,
+        scan_url: String,
+        allow_purl: bool,
+        keepalive: bool,
+        parts: hyper::http::response::Parts,
+    ) -> Result<Response<ProxyBody>> {
+        let ram_cap = self.inner.config.max_body_bytes;
+        let disk_cap = self.inner.config.max_scan_bytes;
+        let size_hint = content_length(&parts.headers);
+        let status = parts.status;
+        let head = keepalive.then(|| Arc::new(Mutex::new(Vec::new())));
+        let assess = {
+            let proxy = self.clone();
+            let url = scan_url.clone();
+            let head = head.clone();
+            async move {
+                let buffered =
+                    collect_or_spill(body, &url, size_hint, ram_cap, disk_cap, head.as_deref())
+                        .await?;
+                proxy.assess(buffered, &url, allow_purl, status).await
+            }
+        };
+        let Some(head) = head else {
+            return assess
+                .await?
+                .into_response(&scan_url, status, parts.headers);
+        };
+        // A prompt assessment is answered like any other. Past that, the
+        // client is one that gives up on silence: commit to the upstream
+        // headers and keep the transfer alive while the body is held.
+        let mut assess = Box::pin(assess);
+        if let Ok(assessed) = tokio::time::timeout(KEEPALIVE_INTERVAL, &mut assess).await {
+            return assessed?.into_response(&scan_url, status, parts.headers);
+        }
+        tracing::debug!(url = %ShownUrl(&scan_url), "holding download; keeping client alive");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Err(error) = release_held(assess, &head, &tx).await {
+                tracing::warn!(url = %ShownUrl(&scan_url), error = %format!("{error:#}"), "forward failed");
+                drop(tx.send(Err(std::io::Error::other("upstream error"))).await);
+            }
+        });
+        let body = StreamBody::new(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+        build_response(status, parts.headers, BodyExt::boxed(body), None)
+    }
+
+    /// Assess a buffered body: scan it, log the decision, and hand back the
+    /// body to forward or the reason it is withheld.
+    async fn assess(
         &self,
         buffered: Buffered,
         scan_url: &str,
         allow_purl: bool,
         status: StatusCode,
-        headers: HeaderMap,
-    ) -> Result<Response<ProxyBody>> {
-        match buffered {
+    ) -> Result<Assessed> {
+        Ok(match buffered {
             Buffered::Memory { bytes, .. } if bytes.is_empty() => {
                 tracing::debug!(url = %ShownUrl(scan_url), "forward (empty body)");
-                build_response(status, headers, full_body(bytes), Some(0))
+                Assessed::Forward(full_body(bytes), Some(0))
             }
             Buffered::Memory { bytes, sha256 } => {
                 let verdict = self
@@ -811,11 +970,11 @@ impl Proxy {
                             bytes = len,
                             "forward"
                         );
-                        build_response(status, headers, full_body(bytes), Some(len))
+                        Assessed::Forward(full_body(bytes), Some(len))
                     }
                     Verdict::Block(reason) => {
                         tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
-                        Ok(blocked_response(scan_url, &reason))
+                        Assessed::Withhold(reason)
                     }
                 }
             }
@@ -839,7 +998,7 @@ impl Proxy {
                             "forward (from disk)"
                         );
                         let body = BodyExt::boxed(StreamBody::new(spill_stream(&tmp)?));
-                        build_response(status, headers, body, Some(len))
+                        Assessed::Forward(body, Some(len))
                     }
                     Verdict::Block(reason) => {
                         tracing::warn!(
@@ -848,7 +1007,7 @@ impl Proxy {
                             verdict = reason.label(),
                             "block"
                         );
-                        Ok(blocked_response(scan_url, &reason))
+                        Assessed::Withhold(reason)
                     }
                 }
             }
@@ -859,7 +1018,7 @@ impl Proxy {
             } => {
                 let limit = self.inner.config.max_scan_bytes;
                 let verdict = self.inner.scanner.scan_limit(scan_url, limit, None);
-                uninspected(verdict, scan_url, status, headers, || {
+                uninspected(verdict, scan_url, status, || {
                     // What was spilled, then the frame that crossed the limit,
                     // then the rest of the upstream body, unread by hood.
                     let body = spill_stream(&tmp)?
@@ -869,31 +1028,119 @@ impl Proxy {
                             std::io::Error::other,
                         ));
                     Ok(BodyExt::boxed(StreamBody::new(body)))
-                })
+                })?
             }
+        })
+    }
+}
+
+/// What assessment made of a held body.
+enum Assessed {
+    /// Cleared: the body to forward and, when known exactly, its length.
+    Forward(ProxyBody, Option<u64>),
+    /// Withheld, and why.
+    Withhold(BlockReason),
+}
+
+impl Assessed {
+    /// The answer for a client that has been sent nothing yet: the upstream
+    /// response with the cleared body, or hood's own 451.
+    fn into_response(
+        self,
+        scan_url: &str,
+        status: StatusCode,
+        headers: HeaderMap,
+    ) -> Result<Response<ProxyBody>> {
+        match self {
+            Self::Forward(body, len) => build_response(status, headers, body, len),
+            Self::Withhold(reason) => Ok(blocked_response(scan_url, &reason)),
         }
     }
 }
 
-/// Answer for a body hood does not scan, as the scanner decided: withheld, or
-/// streamed through as `body` builds it.
+/// The decision for a body hood does not scan, as the scanner made it:
+/// withheld, or streamed through as `body` builds it.
 fn uninspected(
     verdict: Verdict,
     scan_url: &str,
     status: StatusCode,
-    headers: HeaderMap,
     body: impl FnOnce() -> Result<ProxyBody>,
-) -> Result<Response<ProxyBody>> {
+) -> Result<Assessed> {
     match verdict {
         Verdict::Block(reason) => {
             tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
-            Ok(blocked_response(scan_url, &reason))
+            Ok(Assessed::Withhold(reason))
         }
         Verdict::Allow => {
             tracing::debug!(url = %ShownUrl(scan_url), status = status.as_u16(), "forward (unscanned)");
-            build_response(status, headers, body()?, None)
+            Ok(Assessed::Forward(body()?, None))
         }
     }
+}
+
+/// Feed a client that was already sent the upstream headers: a trickle of
+/// the body's `head` while `assess` runs, then the rest of a cleared body.
+/// A withheld body ends in an error instead, which cuts the transfer short.
+///
+/// The final byte of `head` is never trickled, so however short the body, a
+/// transfer hood does not clear never completes.
+///
+/// # Errors
+///
+/// Returns the assessment's own failure, or one reading back a cleared body.
+async fn release_held(
+    mut assess: impl Future<Output = Result<Assessed>> + Unpin,
+    head: &Mutex<Vec<u8>>,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<Frame<Bytes>>>,
+) -> Result<()> {
+    let mut sent = 0;
+    let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
+    let assessed = loop {
+        tokio::select! {
+            assessed = &mut assess => break assessed?,
+            _ = tick.tick() => {
+                let chunk = {
+                    let head = head.lock().unwrap_or_else(PoisonError::into_inner);
+                    let end = head.len().saturating_sub(1).min(sent + KEEPALIVE_BYTES);
+                    Bytes::copy_from_slice(head.get(sent..end).unwrap_or_default())
+                };
+                sent += chunk.len();
+                // A failed send is the client hanging up: nothing left to do.
+                if !chunk.is_empty() && tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let mut body = match assessed {
+        Assessed::Forward(body, _) => body,
+        Assessed::Withhold(_) => {
+            drop(tx.send(Err(std::io::Error::other("blocked"))).await);
+            return Ok(());
+        }
+    };
+    // The client already has the first `sent` bytes.
+    let mut skip = sent;
+    while let Some(frame) = body.frame().await {
+        let Ok(mut data) = frame.context("read held body")?.into_data() else {
+            continue;
+        };
+        let skipped = skip.min(data.len());
+        data.advance(skipped);
+        skip -= skipped;
+        if !data.is_empty() && tx.send(Ok(Frame::data(data))).await.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// A request's `User-Agent`, or the empty string when it has none readable.
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
 }
 
 /// Stream a spill file back out. It is reopened through the temp file's own
@@ -1065,18 +1312,26 @@ async fn next_data(body: &mut Incoming) -> Result<Option<Bytes>> {
 /// Read an upstream body, buffering it in RAM up to `ram_cap`, then spilling the
 /// remainder to a temp file up to `disk_cap`. The SHA-256 is computed frame by
 /// frame as the body streams, so nothing is ever re-read just to hash it.
-/// `size_hint`, the declared length, only sizes the buffer.
+/// `size_hint`, the declared length, only sizes the buffer. `head`, when
+/// given, receives a copy of the body's first [`KEEPALIVE_HEAD`] bytes as
+/// they arrive; it fills while the body is still within any sane `ram_cap`.
 async fn collect_or_spill(
     mut body: Incoming,
     url: &str,
     size_hint: Option<u64>,
     ram_cap: u64,
     disk_cap: u64,
+    head: Option<&Mutex<Vec<u8>>>,
 ) -> Result<Buffered> {
     let capacity = usize::try_from(size_hint.unwrap_or(0).min(ram_cap)).unwrap_or(0);
     let mut buf = Vec::with_capacity(capacity);
     let mut hasher = Sha256::new();
     while let Some(data) = next_data(&mut body).await? {
+        if let Some(head) = head {
+            let mut head = head.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = KEEPALIVE_HEAD.saturating_sub(head.len()).min(data.len());
+            head.extend_from_slice(&data[..room]);
+        }
         if buf.len() as u64 + data.len() as u64 > ram_cap {
             // Cross into spill mode, carrying the RAM prefix (already hashed)
             // and the frame that tipped us over the cap.

@@ -61,6 +61,7 @@ use sha2::Digest;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::process::Command;
+use tokio_rustls::TlsAcceptor;
 
 /// Printed or stored by fixture packages so tests can prove they ran.
 const TOOL_MARKER: &str = "hood-tool-integration-ok";
@@ -291,12 +292,14 @@ struct Payload<'a> {
 type Route = (String, Vec<u8>);
 type Routes = Arc<Mutex<HashMap<String, Route>>>;
 
-/// A loopback HTTP origin serving fixture files by path. Query strings are
-/// ignored, so `/rpc?type=info` matches a `/rpc` route.
+/// A loopback origin serving fixture files by path, over HTTP or HTTPS.
+/// Query strings are ignored, so `/rpc?type=info` matches a `/rpc` route.
 #[derive(Debug)]
 struct TestOrigin {
     addr: SocketAddr,
     routes: Routes,
+    /// The root an HTTPS origin's certificate chains to, in PEM.
+    ca_pem: Option<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -308,50 +311,108 @@ impl Drop for TestOrigin {
 
 impl TestOrigin {
     async fn spawn() -> Result<Self> {
+        Self::serve(None).await
+    }
+
+    /// An HTTPS origin for `127.0.0.1`, under a root of its own that no
+    /// client trusts until it is handed [`Self::ca_pem`].
+    #[cfg(unix)]
+    async fn spawn_tls() -> Result<Self> {
+        use rcgen::{CertificateParams, Issuer, KeyPair};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let root_key = KeyPair::generate()?;
+        let mut root = CertificateParams::default();
+        root.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        root.distinguished_name
+            .push(rcgen::DnType::CommonName, "hood tool-test origin root");
+        let root_cert = root.self_signed(&root_key)?;
+        let leaf_key = KeyPair::generate()?;
+        let mut leaf = CertificateParams::default();
+        leaf.subject_alt_names = vec![rcgen::SanType::IpAddress([127, 0, 0, 1].into())];
+        let leaf_cert = leaf.signed_by(&leaf_key, &Issuer::new(root, root_key))?;
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+            )?;
+        Self::serve(Some((TlsAcceptor::from(Arc::new(config)), root_cert.pem()))).await
+    }
+
+    async fn serve(tls: Option<(TlsAcceptor, String)>) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .context("bind tool-test origin")?;
         let addr = listener.local_addr().context("tool-test origin address")?;
         let routes: Routes = Arc::default();
         let served_routes = Arc::clone(&routes);
+        let (acceptor, ca_pem) = tls.unzip();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let routes = Arc::clone(&served_routes);
+                let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let route = routes.lock().unwrap().get(req.uri().path()).cloned();
-                        async move {
-                            let response = match route {
-                                Some((content_type, body)) => Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header("content-type", content_type)
-                                    .body(Full::new(Bytes::from(body)))
-                                    .unwrap(),
-                                None => Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .header("content-type", "text/plain")
-                                    .body(Full::new(Bytes::from_static(b"not found\n")))
-                                    .unwrap(),
-                            };
-                            Ok::<_, hyper::Error>(response)
+                    match acceptor {
+                        // A client that rejects the certificate just goes away.
+                        Some(acceptor) => {
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                Self::serve_connection(stream, routes).await;
+                            }
                         }
-                    });
-                    drop(
-                        hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await,
-                    );
+                        None => Self::serve_connection(stream, routes).await,
+                    }
                 });
             }
         });
-        Ok(Self { addr, routes, task })
+        Ok(Self {
+            addr,
+            routes,
+            ca_pem,
+            task,
+        })
+    }
+
+    async fn serve_connection<IO>(io: IO, routes: Routes)
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let route = routes.lock().unwrap().get(req.uri().path()).cloned();
+            async move {
+                let response = match route {
+                    Some((content_type, body)) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", content_type)
+                        .body(Full::new(Bytes::from(body)))
+                        .unwrap(),
+                    None => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header("content-type", "text/plain")
+                        .body(Full::new(Bytes::from_static(b"not found\n")))
+                        .unwrap(),
+                };
+                Ok::<_, hyper::Error>(response)
+            }
+        });
+        drop(
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(io), service)
+                .await,
+        );
     }
 
     fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        let scheme = if self.ca_pem.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{}", self.addr)
     }
 
     /// The origin's URL spelled so a Go client routes it through `HTTP_PROXY`.

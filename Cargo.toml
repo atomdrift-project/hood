@@ -7,7 +7,6 @@ authors = ["The Atomdrift Project"]
 description = "Scan payloads before they reach package managers, installers, and curl|sh scripts"
 license = "Apache-2.0"
 repository = "https://github.com/atomdrift-project/hood"
-homepage = "https://github.com/atomdrift-project/hood"
 readme = "README.md"
 keywords = ["malware", "supply-chain", "package-manager", "security", "proxy"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]

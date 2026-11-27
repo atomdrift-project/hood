@@ -208,6 +208,9 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
     let go_bridge = cfg!(any(target_os = "macos", windows)) && program.tool() == Some(Tool::Go);
     // Zig cannot trust hood's CA on any platform; see `Tool::Zig`.
     let zig_clients = program.tool() == Some(Tool::Zig);
+    // brew's curl gives up on a held download, and its git cannot trust
+    // hood's CA at all; see `Config::with_brew_clients`.
+    let brew_clients = program.tool() == Some(Tool::Brew);
 
     let setup_result = async {
         let go_bridge = if go_bridge {
@@ -227,6 +230,7 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
             go_bridge,
             program.scan_limit(),
             zig_clients,
+            brew_clients,
             verbose,
         )
         .await
@@ -276,6 +280,7 @@ async fn setup_proxy(
     go_bridge: Option<GoBridge>,
     scan_limit: Option<u64>,
     zig_clients: bool,
+    brew_clients: bool,
     show_passes: bool,
 ) -> Result<ProxySetup> {
     let stats = show_passes.then(|| Arc::new(ScanStats::default()));
@@ -291,7 +296,8 @@ async fn setup_proxy(
     };
     let config = Config::default()
         .with_scan_limit(scan_limit)?
-        .with_zig_clients(zig_clients);
+        .with_zig_clients(zig_clients)
+        .with_brew_clients(brew_clients);
     let proxy = Proxy::new(Arc::new(scanner), config).context("build proxy")?;
     let ca_pem = proxy.ca_pem().to_owned();
     let go_bridge_token = proxy.go_bridge_token().to_owned();

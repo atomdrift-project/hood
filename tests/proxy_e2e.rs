@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -754,5 +755,281 @@ async fn ipv6_literal_origin_round_trips_over_https_without_sni() -> Result<()> 
     );
 
     handle.stop().await;
+    Ok(())
+}
+
+/// A scanner that decides nothing until the test opens its gate, standing
+/// in for an assessment that takes a while.
+#[derive(Debug)]
+struct Gated {
+    gate: tokio::sync::Semaphore,
+    verdict: Verdict,
+}
+
+impl Gated {
+    fn new(verdict: Verdict) -> Arc<Self> {
+        Arc::new(Self {
+            gate: tokio::sync::Semaphore::new(0),
+            verdict,
+        })
+    }
+
+    async fn decide(&self) -> Verdict {
+        drop(self.gate.acquire().await);
+        self.verdict.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Scanner for Gated {
+    async fn scan(&self, _req: ScanRequest) -> Verdict {
+        self.decide().await
+    }
+    async fn scan_disk(&self, _req: DiskScanRequest) -> Verdict {
+        self.decide().await
+    }
+    fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
+        withheld("download exceeds inspection limit")
+    }
+    fn uninspectable(&self, _url: &str, why: &str) -> Verdict {
+        withheld(why)
+    }
+}
+
+/// The user agent brew gives its curl.
+const BREW_AGENT: &str = "Homebrew/5.0.0 (Macintosh; arm64 Mac OS X 26.0) curl/8.7.1";
+
+/// Longer than a held download stays silent, shorter than brew's patience.
+const HELD: Duration = Duration::from_secs(4);
+
+/// Start a brew-serving proxy over `scanner` and request `/big` from a fresh
+/// origin as `agent`. The response future is returned unawaited.
+async fn brew_request(
+    scanner: Arc<dyn Scanner>,
+    agent: &str,
+) -> Result<(hood::proxy::Handle, reqwest::RequestBuilder)> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+    let origin_addr = start_http_origin().await?;
+    let proxy = Proxy::new(scanner, Config::default().with_brew_clients(true))?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+    let request = client_with_proxy(handle.addr, &hood_ca)
+        .get(format!("http://{origin_addr}/big"))
+        .header("user-agent", agent);
+    Ok((handle, request))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_brew_download_is_kept_alive_then_completed() -> Result<()> {
+    let scanner = Gated::new(Verdict::Allow);
+    let (handle, request) = brew_request(scanner.clone(), BREW_AGENT).await?;
+
+    // Headers and a first trickle arrive while the scanner is still deciding.
+    let mut response = tokio::time::timeout(HELD, request.send()).await??;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "none");
+    let payload = big_payload();
+    let mut body = tokio::time::timeout(HELD, response.chunk())
+        .await??
+        .unwrap()
+        .to_vec();
+    assert!(!body.is_empty() && body.len() < payload.len());
+
+    scanner.gate.add_permits(1);
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    assert_eq!(body, payload);
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_brew_download_is_cut_short_when_blocked() -> Result<()> {
+    let scanner = Gated::new(Verdict::Block(BlockReason::Hostile));
+    let (handle, request) = brew_request(scanner.clone(), BREW_AGENT).await?;
+
+    let mut response = tokio::time::timeout(HELD, request.send()).await??;
+    let mut body = tokio::time::timeout(HELD, response.chunk())
+        .await??
+        .unwrap()
+        .to_vec();
+
+    scanner.gate.add_permits(1);
+    let cut_short = loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    assert!(cut_short, "a blocked transfer must not end cleanly");
+    let payload = big_payload();
+    assert!(body.len() < payload.len() && payload.starts_with(&body));
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_homebrew_curl_is_sent_an_unassessed_byte() -> Result<()> {
+    // Another client in the same run sees nothing until the verdict.
+    let scanner = Gated::new(Verdict::Allow);
+    let (handle, request) = brew_request(scanner.clone(), "curl/8.7.1").await?;
+    assert!(
+        tokio::time::timeout(HELD, request.send()).await.is_err(),
+        "a held response was answered early"
+    );
+    handle.stop().await;
+
+    // And a prompt verdict is answered as for any client, block page and all.
+    let (handle, request) = brew_request(Arc::new(BlockAll), BREW_AGENT).await?;
+    assert_eq!(request.send().await?.status().as_u16(), 451);
+    handle.stop().await;
+    Ok(())
+}
+
+/// An origin answering with the `Range` header it was sent.
+async fn start_range_echo_origin() -> Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let range = format!("{:?}", req.headers().get("range"));
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(range))))
+                });
+                drop(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await,
+                );
+            });
+        }
+    });
+    Ok(addr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn homebrew_curl_is_never_offered_a_resume() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let origin_addr = start_range_echo_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(AllowAll);
+    let proxy = Proxy::new(scanner, Config::default().with_brew_clients(true))?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let get = |agent| {
+        client
+            .get(format!("http://{origin_addr}/"))
+            .header("user-agent", agent)
+            .header("range", "bytes=5-")
+            .send()
+    };
+
+    // A tail fetched by range could complete a file hood cut short.
+    let brew = get(BREW_AGENT).await?;
+    assert_eq!(brew.headers().get("accept-ranges").unwrap(), "none");
+    assert_eq!(brew.text().await?, "None");
+
+    let other = get("curl/8.7.1").await?;
+    assert!(other.headers().get("accept-ranges").is_none());
+    assert_eq!(other.text().await?, r#"Some("bytes=5-")"#);
+
+    handle.stop().await;
+    Ok(())
+}
+
+/// Open a CONNECT tunnel to `authority` as `agent` and fetch `/hello` over
+/// TLS inside it, trusting only `origin_ca_pem`: the origin's own
+/// certificate, never one hood minted.
+async fn fetch_through_tunnel(
+    proxy: SocketAddr,
+    authority: &str,
+    agent: &str,
+    origin_ca_pem: &str,
+) -> Result<String> {
+    let mut tunnel = TcpStream::connect(proxy).await?;
+    tunnel
+        .write_all(
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {agent}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut head = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        anyhow::ensure!(
+            tunnel.read(&mut byte).await? == 1,
+            "proxy closed the tunnel"
+        );
+        head.push(byte[0]);
+    }
+    anyhow::ensure!(head.starts_with(b"HTTP/1.1 200"), "tunnel refused");
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in roots_from_pem(origin_ca_pem) {
+        roots.add(cert)?;
+    }
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
+        .connect("localhost".try_into()?, tunnel)
+        .await?;
+    tls.write_all(
+        format!("GET /hello HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await?;
+    let mut response = Vec::new();
+    drop(tls.read_to_end(&mut response).await);
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn brew_mode_relays_git_tunnels_without_interception() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let (origin_addr, origin_ca_pem) = start_https_origin().await?;
+    let authority = format!("localhost:{}", origin_addr.port());
+    let git = "git/2.50.1";
+
+    // The scanner blocks all it is asked about, and is never asked: git
+    // speaks TLS to the origin itself, end to end.
+    let brew = Proxy::new(
+        Arc::new(BlockAll),
+        Config::default().with_brew_clients(true),
+    )?
+    .spawn()
+    .await?;
+    let response = fetch_through_tunnel(brew.addr, &authority, git, &origin_ca_pem).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.ends_with(std::str::from_utf8(PAYLOAD)?),
+        "{response}"
+    );
+    // Every other client of the same run is still intercepted.
+    assert!(
+        fetch_through_tunnel(brew.addr, &authority, BREW_AGENT, &origin_ca_pem)
+            .await
+            .is_err()
+    );
+    brew.stop().await;
+
+    // Outside a brew run, so is git.
+    let plain = Proxy::new(Arc::new(BlockAll), Config::default())?
+        .spawn()
+        .await?;
+    assert!(
+        fetch_through_tunnel(plain.addr, &authority, git, &origin_ca_pem)
+            .await
+            .is_err()
+    );
+    plain.stop().await;
     Ok(())
 }

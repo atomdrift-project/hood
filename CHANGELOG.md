@@ -28,6 +28,9 @@ All notable changes to hood. Versions follow [semantic versioning](https://semve
 - Fetch models, rules and Bloom filters before the command starts, so pacman and others don't abandon silent transfers.
 - Reach origins addressed by IPv6 literals, including HTTPS tunnels whose clients send no SNI.
 - Give `hood exec -- curl` the CA flag on Windows, as the curl shim already gets.
+- Make Homebrew's curl trust hood through `HOMEBREW_CURLRC`, since brew discards the CA environment variables.
+- Keep Homebrew downloads alive while they are assessed, so brew no longer abandons one held over five seconds.
+- Let Homebrew's git through uninspected, with a notice: brew leaves no way to make it trust hood, so `brew update` and `brew tap` failed.
 
 ## 0.2.0 (2026-10-23)
 

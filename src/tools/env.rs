@@ -2,10 +2,10 @@
 //! trust hood's CA.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
@@ -56,6 +56,8 @@ pub struct ChildEnv {
     proxy_url: String,
     /// Path the child process can pass to its TLS verifier.
     ca_pem_path: PathBuf,
+    /// curl config carrying the proxy and CA to Homebrew's curl.
+    brew_curlrc_path: PathBuf,
     /// macOS Go module/sumdb bridge settings, when enabled for this run.
     go: Option<GoChildEnv>,
 }
@@ -191,11 +193,14 @@ impl ChildEnv {
                 }
             }
             TrustProfile::Brew => {
-                // brew uses curl internally and respects CURL_CA_BUNDLE.
+                // brew re-executes itself under `env -i`, keeping only the
+                // proxy and `HOMEBREW_*` variables, so its curl never sees
+                // the CA variables below; the curl config is what reaches it.
+                out.insert("HOMEBREW_CURLRC", self.brew_curlrc_path.clone().into());
+                // For `HOMEBREW_NO_ENV_FILTERING` and builds from source.
                 out.insert("CURL_CA_BUNDLE", ca.clone());
                 out.insert("SSL_CERT_FILE", ca);
-                // Most brew formulae build with curl; the env carries. Auto
-                // update is declared, not suppressed.
+                // Auto update is declared, not suppressed.
                 out.insert("HOMEBREW_NO_AUTO_UPDATE", OsString::from("0"));
             }
             // System package managers reach the network through one of a few
@@ -241,6 +246,8 @@ impl ChildEnv {
                 out.insert("npm_config_proxy", proxy.clone());
                 out.insert("npm_config_https_proxy", proxy);
                 out.insert("npm_config_noproxy", OsString::from(NPM_NOPROXY));
+                // A script under `hood exec` may well call brew.
+                out.insert("HOMEBREW_CURLRC", self.brew_curlrc_path.clone().into());
                 // Unix-only: Go reads neither SSL_CERT_FILE nor this GODEBUG on
                 // macOS or Windows, where it trusts only the system store. The
                 // `go` shim handles those through the loopback bridge, but an
@@ -253,11 +260,44 @@ impl ChildEnv {
     }
 }
 
+/// The curl config handed to Homebrew as `HOMEBREW_CURLRC`.
+///
+/// brew scrubs its environment down to the proxy and `HOMEBREW_*` variables,
+/// so a config file is the only way to make its curl trust hood's CA. brew
+/// then loads this file alone, so a config the user already chose is loaded
+/// from it first; the proxy settings after it keep that config from routing
+/// downloads around hood.
+fn brew_curlrc(proxy_url: &str, ca_pem_path: &Path, user_curlrc: Option<&OsStr>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut option = |name: &str, value: &[u8]| {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b" = \"");
+        for &byte in value {
+            // The only characters special to curl inside a quoted value.
+            if matches!(byte, b'"' | b'\\') {
+                out.push(b'\\');
+            }
+            out.push(byte);
+        }
+        out.extend_from_slice(b"\"\n");
+    };
+    // brew reads only an absolute path as a file. Any other value asks for
+    // curl's default config, which is not carried over.
+    if let Some(user) = user_curlrc.filter(|path| Path::new(path).is_absolute()) {
+        option("config", user.as_encoded_bytes());
+    }
+    option("proxy", proxy_url.as_bytes());
+    option("noproxy", b"");
+    option("cacert", ca_pem_path.as_os_str().as_encoded_bytes());
+    out
+}
+
 /// Build a child environment whose owner keeps its temporary CA file alive.
 ///
 /// # Errors
 ///
-/// Returns an error if the CA file cannot be created, secured, or written.
+/// Returns an error if the CA file or Homebrew's curl config cannot be
+/// created, secured, or written.
 pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<PreparedChildEnv> {
     let dir = tempfile::Builder::new()
         .prefix("hood-ca-")
@@ -277,10 +317,18 @@ pub fn prepare_child_env(proxy_addr: SocketAddr, ca_pem: &str) -> Result<Prepare
     drop(f);
 
     let proxy_url = format!("http://{proxy_addr}");
+    let brew_curlrc_path = dir.path().join("brew-curlrc");
+    let user_curlrc = std::env::var_os("HOMEBREW_CURLRC");
+    std::fs::write(
+        &brew_curlrc_path,
+        brew_curlrc(&proxy_url, &pem_path, user_curlrc.as_deref()),
+    )
+    .context("write Homebrew curl config")?;
     Ok(PreparedChildEnv {
         env: ChildEnv {
             proxy_url,
             ca_pem_path: pem_path,
+            brew_curlrc_path,
             go: None,
         },
         _ca_dir: dir,
@@ -296,6 +344,7 @@ mod tests {
         ChildEnv {
             proxy_url: "http://127.0.0.1:12345".into(),
             ca_pem_path: PathBuf::from("/tmp/hood.pem"),
+            brew_curlrc_path: PathBuf::from("/tmp/brew-curlrc"),
             go: None,
         }
     }
@@ -358,6 +407,40 @@ mod tests {
     fn brew_env_uses_curl_ca_bundle() {
         let v = fake_env().vars_for(Tool::Brew);
         assert!(v.contains_key("CURL_CA_BUNDLE"));
+    }
+
+    /// brew drops every CA variable but honors `HOMEBREW_CURLRC`.
+    #[test]
+    fn brew_env_points_homebrew_curl_at_hood_config() {
+        let v = fake_env().vars_for(Tool::Brew);
+        assert_eq!(
+            v.get("HOMEBREW_CURLRC"),
+            Some(&OsString::from("/tmp/brew-curlrc"))
+        );
+    }
+
+    #[test]
+    fn brew_curlrc_trusts_hood_and_pins_the_proxy() {
+        let rc = brew_curlrc("http://127.0.0.1:1", Path::new("/t/hood.pem"), None);
+        assert_eq!(
+            String::from_utf8(rc).unwrap(),
+            "proxy = \"http://127.0.0.1:1\"\nnoproxy = \"\"\ncacert = \"/t/hood.pem\"\n"
+        );
+    }
+
+    /// The user's own config loads first, so hood's settings outrank it. A
+    /// relative value names no file.
+    #[test]
+    fn brew_curlrc_loads_the_users_absolute_config_first() {
+        let ca = Path::new("/t/hood.pem");
+        let user = OsString::from("/home/u/my \"curl\\rc");
+        let rc = String::from_utf8(brew_curlrc("http://p", ca, Some(&user))).unwrap();
+        assert!(
+            rc.starts_with("config = \"/home/u/my \\\"curl\\\\rc\"\nproxy = "),
+            "{rc}"
+        );
+        let relative = brew_curlrc("http://p", ca, Some(OsStr::new("1")));
+        assert_eq!(relative, brew_curlrc("http://p", ca, None));
     }
 
     #[test]

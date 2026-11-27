@@ -73,7 +73,9 @@ use tokio_util::sync::CancellationToken;
 use crate::ca::{Ca, CaResolver};
 use crate::go_bridge;
 use crate::output::ShownUrl;
-use crate::scanner::{BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
+use crate::scanner::{
+    Anticipated, BlockReason, Disclosure, DiskScanRequest, ScanRequest, Scanner, Verdict,
+};
 
 /// The proxy's response body. A [`BoxBody`] so one return type covers three
 /// shapes: a fully-buffered small response ([`full_body`]), an upstream body
@@ -779,7 +781,7 @@ impl Proxy {
         // A Go bridge redirect resolves against the request as configured,
         // credentials included; see `take_url_authorization`.
         let redirect_base = go_bridge_request.then(|| target_url.clone());
-        let allow_purl = permits_public_coordinate(req.method(), req.headers(), &target_url);
+        let disclosure = disclosure(req.method(), req.headers(), &target_url);
         let url_authorization = take_url_authorization(&mut target_url)?;
         // Captured before `req` is consumed by the upstream call: a HEAD request
         // never carries a response body to scan.
@@ -823,6 +825,13 @@ impl Proxy {
         }
 
         let scan_url = target_url.to_string();
+        // Whatever the scanner can do without the response starts with the
+        // request, so that it and the download overlap.
+        let early = if method == Method::HEAD {
+            Anticipated::default()
+        } else {
+            Arc::clone(&self.inner.scanner).anticipate(&scan_url, disclosure)
+        };
 
         // One upstream connection per request: nothing is pooled, so nothing
         // one request did can be reused by another.
@@ -878,8 +887,14 @@ impl Proxy {
             .into_response(&scan_url, parts.status, parts.headers);
         }
 
-        let allow_purl = allow_purl && parts.status.is_success();
-        self.hold_until_assessed(body, scan_url, allow_purl, keepalive, parts)
+        // An error page is not the package its URL names.
+        let disclosure = if parts.status.is_success() {
+            disclosure
+        } else {
+            disclosure.min(Disclosure::Digest)
+        };
+        let provenance = (disclosure, early);
+        self.hold_until_assessed(body, scan_url, provenance, keepalive, parts)
             .await
     }
 
@@ -892,7 +907,7 @@ impl Proxy {
         &self,
         body: Incoming,
         scan_url: String,
-        allow_purl: bool,
+        provenance: (Disclosure, Anticipated),
         keepalive: bool,
         parts: hyper::http::response::Parts,
     ) -> Result<Response<ProxyBody>> {
@@ -909,7 +924,7 @@ impl Proxy {
                 let buffered =
                     collect_or_spill(body, &url, size_hint, ram_cap, disk_cap, head.as_deref())
                         .await?;
-                proxy.assess(buffered, &url, allow_purl, status).await
+                proxy.assess(buffered, &url, provenance, status).await
             }
         };
         let Some(head) = head else {
@@ -942,7 +957,7 @@ impl Proxy {
         &self,
         buffered: Buffered,
         scan_url: &str,
-        allow_purl: bool,
+        (disclosure, early): (Disclosure, Anticipated),
         status: StatusCode,
     ) -> Result<Assessed> {
         Ok(match buffered {
@@ -956,7 +971,8 @@ impl Proxy {
                     .scanner
                     .scan(ScanRequest {
                         url: scan_url.to_owned(),
-                        allow_purl,
+                        disclosure,
+                        early,
                         body: bytes.clone(),
                         sha256,
                     })
@@ -984,7 +1000,8 @@ impl Proxy {
                     .scanner
                     .scan_disk(DiskScanRequest {
                         url: scan_url.to_owned(),
-                        allow_purl,
+                        disclosure,
+                        early,
                         path: tmp.path().to_path_buf(),
                         sha256,
                     })
@@ -1265,13 +1282,20 @@ where
         .context("send_request")
 }
 
-/// Capture provenance before URL credentials are moved into headers.
-fn permits_public_coordinate(method: &Method, headers: &HeaderMap, url: &url::Url) -> bool {
-    method == Method::GET
-        && !headers.contains_key(AUTHORIZATION)
-        && !headers.contains_key("cookie")
-        && url.username().is_empty()
-        && url.password().is_none()
+/// What Beamline may be told about the response to this request. Captured
+/// before URL credentials are moved into headers.
+fn disclosure(method: &Method, headers: &HeaderMap, url: &url::Url) -> Disclosure {
+    if headers.contains_key(AUTHORIZATION)
+        || headers.contains_key("cookie")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        Disclosure::Nothing
+    } else if method == Method::GET {
+        Disclosure::Coordinate
+    } else {
+        Disclosure::Digest
+    }
 }
 
 /// Outcome of reading an upstream body under the size policy.
@@ -1574,23 +1598,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authenticated_requests_never_disclose_coordinates() {
+    fn credentialed_requests_disclose_nothing() {
         let url = url::Url::parse("https://registry.npmjs.org/demo/-/demo-1.tgz").unwrap();
         let empty = HeaderMap::new();
-        assert!(permits_public_coordinate(&Method::GET, &empty, &url));
-        assert!(!permits_public_coordinate(&Method::POST, &empty, &url));
+        assert_eq!(
+            disclosure(&Method::GET, &empty, &url),
+            Disclosure::Coordinate
+        );
+        assert_eq!(disclosure(&Method::POST, &empty, &url), Disclosure::Digest);
         for header in ["authorization", "cookie"] {
             let mut headers = HeaderMap::new();
             headers.insert(header, HeaderValue::from_static("private"));
-            assert!(!permits_public_coordinate(&Method::GET, &headers, &url));
+            for method in [Method::GET, Method::POST] {
+                assert_eq!(disclosure(&method, &headers, &url), Disclosure::Nothing);
+            }
         }
-        let credentialed =
-            url::Url::parse("https://user:secret@registry.npmjs.org/demo/-/demo-1.tgz").unwrap();
-        assert!(!permits_public_coordinate(
-            &Method::GET,
-            &empty,
-            &credentialed
-        ));
+        for credentialed in [
+            "https://user:secret@registry.npmjs.org/demo/-/demo-1.tgz",
+            "https://user@registry.npmjs.org/demo/-/demo-1.tgz",
+        ] {
+            let url = url::Url::parse(credentialed).unwrap();
+            assert_eq!(disclosure(&Method::GET, &empty, &url), Disclosure::Nothing);
+        }
     }
 
     #[test]

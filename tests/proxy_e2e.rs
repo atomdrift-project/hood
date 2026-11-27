@@ -30,7 +30,9 @@ use tokio_rustls::rustls::{
 
 use hood::go_bridge::GoBridge;
 use hood::proxy::{Config, Proxy};
-use hood::scanner::{AllowAll, BlockReason, DiskScanRequest, ScanRequest, Scanner, Verdict};
+use hood::scanner::{
+    AllowAll, Anticipated, BlockReason, Disclosure, DiskScanRequest, ScanRequest, Scanner, Verdict,
+};
 
 /// A scanner that blocks everything it is asked to decide. Used to prove a
 /// path was *not* scanned: if a response still comes back forwarded, the
@@ -76,6 +78,12 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
             .status(302)
             .header("location", "/hello")
             .body(Full::new(Bytes::new()))
+            .unwrap());
+    }
+    if req.uri().path() == "/missing" {
+        return Ok(Response::builder()
+            .status(404)
+            .body(Full::new(Bytes::from_static(b"no such package\n")))
             .unwrap());
     }
     let body = if req.uri().path() == "/big" {
@@ -521,6 +529,75 @@ async fn block_returns_451() -> Result<()> {
         resp.headers().get("x-hood-block-reason").unwrap(),
         "hostile"
     );
+
+    handle.stop().await;
+    Ok(())
+}
+
+/// Records what the proxy tells a scanner of each download's provenance: once
+/// as the request goes out, and again with the response.
+#[derive(Debug, Default)]
+struct Provenance(std::sync::Mutex<Vec<(&'static str, Disclosure)>>);
+
+#[async_trait::async_trait]
+impl Scanner for Provenance {
+    fn anticipate(self: Arc<Self>, _url: &str, disclosure: Disclosure) -> Anticipated {
+        self.0.lock().unwrap().push(("request", disclosure));
+        Anticipated::default()
+    }
+    async fn scan(&self, req: ScanRequest) -> Verdict {
+        self.0.lock().unwrap().push(("response", req.disclosure));
+        Verdict::Allow
+    }
+    async fn scan_disk(&self, req: DiskScanRequest) -> Verdict {
+        self.0.lock().unwrap().push(("response", req.disclosure));
+        Verdict::Allow
+    }
+    fn scan_limit(&self, _url: &str, _limit: u64, _size: Option<u64>) -> Verdict {
+        Verdict::Allow
+    }
+    fn uninspectable(&self, _url: &str, _why: &str) -> Verdict {
+        Verdict::Allow
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_scanner_hears_of_a_download_when_it_is_requested_and_what_it_may_disclose()
+-> Result<()> {
+    use Disclosure::{Coordinate, Digest, Nothing};
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    let origin_addr = start_http_origin().await?;
+    let scanner = Arc::new(Provenance::default());
+    let proxy = Proxy::new(scanner.clone(), Config::default())?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+    let client = client_with_proxy(handle.addr, &hood_ca);
+    let get = |path: &str| client.get(format!("http://{origin_addr}{path}"));
+    let heard = || std::mem::take(&mut *scanner.0.lock().unwrap());
+
+    get("/hello").send().await?.bytes().await?;
+    assert_eq!(heard(), [("request", Coordinate), ("response", Coordinate)]);
+
+    // Credentials make the download private, whatever its URL.
+    for (header, value) in [("authorization", "Bearer secret"), ("cookie", "session=1")] {
+        get("/hello").header(header, value).send().await?;
+        assert_eq!(heard(), [("request", Nothing), ("response", Nothing)]);
+    }
+    let post = client.post(format!("http://{origin_addr}/hello"));
+    post.send().await?;
+    assert_eq!(heard(), [("request", Digest), ("response", Digest)]);
+
+    // An error page is not the package its URL names.
+    assert_eq!(get("/missing").send().await?.status(), 404);
+    assert_eq!(heard(), [("request", Coordinate), ("response", Digest)]);
+
+    // A HEAD brings nothing to scan, so nothing is begun for it.
+    client
+        .head(format!("http://{origin_addr}/hello"))
+        .send()
+        .await?;
+    assert_eq!(heard(), []);
 
     handle.stop().await;
     Ok(())

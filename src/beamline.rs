@@ -1,7 +1,8 @@
 //! Minimal-disclosure Beamline transport. Never accepts artifact bytes or URLs.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scan::model::Classification;
@@ -16,16 +17,20 @@ pub(crate) const BUDGET: &str = "25";
 
 const MAX_LINE: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Beamline lookups in flight at once; a package manager's parallel
-/// downloads queue here rather than flood the API.
-const MAX_CONCURRENT_LOOKUPS: usize = 4;
+/// Beamline requests in flight at once; a package manager's parallel
+/// downloads queue here rather than flood the API. Waiting in the queue
+/// counts against a request's budget.
+const MAX_CONCURRENT_LOOKUPS: usize = 8;
+/// The longest a spent quota keeps hood from asking, whatever `Retry-After`
+/// says: a wrong or forged header must not silence Beamline for good.
+const MAX_QUOTA_PAUSE: Duration = Duration::from_hours(24);
 /// How long a TCP and TLS connection to Beamline may take before local
 /// analysis takes over.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// The whole budget for a package analysis, then for a hash lookup. hood holds
-/// the response while it asks, and the tool waiting on it sees silence:
-/// pacman gives up after 10 s, pip after 15 s. Past these, local analysis
-/// decides instead.
+/// The whole budget for a package analysis, and for a hash lookup. An
+/// analysis begins with its download, so most of it is spent while bytes
+/// still arrive; a lookup begins once they have, while the tool waiting on
+/// hood sees silence: pacman gives up after 10 s, pip after 15 s.
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(8);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -82,6 +87,14 @@ impl Assessment {
             Severity::Unknown => None,
         }
     }
+
+    /// Whether this is a finished analysis with a verdict, on whichever
+    /// bytes it names.
+    pub(crate) fn is_verdict(&self) -> bool {
+        self.sha256
+            .as_deref()
+            .is_some_and(|sha256| self.classification(sha256).is_some())
+    }
 }
 
 /// What a request asks Beamline about.
@@ -131,7 +144,25 @@ pub(crate) struct Client {
     token: Option<String>,
     slots: Semaphore,
     cache: Option<Arc<Cache>>,
+    /// When a spent quota resets, in seconds since the epoch; 0 if it is not
+    /// known to be spent. Nothing is asked before then.
+    quota_reset: AtomicU64,
+    /// Whether this run has said that the quota is spent.
+    quota_reported: AtomicBool,
 }
+
+/// Why a request was not sent: the quota is spent, and the server said when
+/// it resets. The run says so once; after that, only this.
+#[derive(Debug)]
+pub(crate) struct QuotaSpent;
+
+impl std::fmt::Display for QuotaSpent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Beamline quota is spent")
+    }
+}
+
+impl std::error::Error for QuotaSpent {}
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,16 +180,23 @@ impl Client {
         let mut client = Self::new(&base, isotope13_token(&base))?;
         // A loopback endpoint is a development or test server; its answers
         // are not worth keeping across runs.
-        if !is_loopback(&client.base) {
-            client.cache = dirs::cache_dir().map(|root| {
-                Arc::new(Cache::new(
-                    root.join("atomdrift/hood/beamline/v1"),
-                    client.base.as_str(),
-                    client.token.as_deref(),
-                ))
-            });
+        if !is_loopback(&client.base)
+            && let Some(root) = dirs::cache_dir()
+        {
+            client = client.caching_under(root.join("atomdrift/hood/beamline/v1"));
         }
         Ok(Some(client))
+    }
+
+    /// Keep verdicts, and word of a spent quota, under `root` between runs.
+    fn caching_under(mut self, root: std::path::PathBuf) -> Self {
+        let cache = Cache::new(root, self.base.as_str(), self.token.as_deref());
+        // A quota an earlier run spent is still spent.
+        if let Some(reset) = cache.quota_reset() {
+            self.quota_reset = AtomicU64::new(reset);
+        }
+        self.cache = Some(Arc::new(cache));
+        self
     }
 
     pub(crate) fn new(base: &str, token: Option<String>) -> Result<Self> {
@@ -178,6 +216,8 @@ impl Client {
             token,
             slots: Semaphore::new(MAX_CONCURRENT_LOOKUPS),
             cache: None,
+            quota_reset: AtomicU64::new(0),
+            quota_reported: AtomicBool::new(false),
         })
     }
 
@@ -214,62 +254,128 @@ impl Client {
             .await
     }
 
+    /// The assessment of exactly `sha256`: by analyzing `purl`, when there is
+    /// a public coordinate to ask about, then by digest.
+    ///
     /// No retries: outages, quotas, and incomplete streams go to local analysis.
     pub(crate) async fn assess(&self, purl: Option<&str>, sha256: &str) -> Result<Assessment> {
-        if let Some(cache) = &self.cache {
-            let cache = Arc::clone(cache);
-            let sha = sha256.to_owned();
-            // Every cache failure is a miss; the join error is only logged.
-            match tokio::task::spawn_blocking(move || cache.get(&sha)).await {
-                Ok(Some(assessment)) => {
-                    tracing::debug!("using cached Beamline assessment");
-                    return Ok(assessment);
-                }
-                Ok(None) => {}
-                Err(error) => tracing::debug!(%error, "Beamline cache read failed"),
-            }
+        if let Some(assessment) = self.cached(sha256).await {
+            return Ok(assessment);
         }
-        let result = self.assess_remote(purl, sha256).await?;
-        if result.classification(sha256).is_some()
-            && let Some(cache) = &self.cache
+        let early = match purl {
+            Some(purl) => Some(self.analyze(purl).await),
+            None => None,
+        };
+        self.settle(early, sha256).await
+    }
+
+    /// Analyze a public package coordinate. This needs none of the package's
+    /// bytes, so it can run while they download; [`Self::settle`] then checks
+    /// the answer against them. A verdict is kept, so a later run of the same
+    /// install asks nothing.
+    pub(crate) async fn analyze(&self, purl: &str) -> Result<Assessment> {
+        let coordinate = purl.to_owned();
+        if let Some(assessment) = self
+            .with_cache(move |cache| cache.coordinate(&coordinate))
+            .await
+            .flatten()
         {
-            let cache = Arc::clone(cache);
-            let sha = sha256.to_owned();
-            let stored = result.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || cache.put(&sha, stored))
-                .await
-                .context("Beamline cache write task")
-                .flatten()
-            {
-                tracing::debug!(error = %format!("{error:#}"), "could not cache Beamline assessment");
-            }
+            tracing::debug!("using cached Beamline analysis");
+            return Ok(assessment);
         }
+        let result = self.ask(Query::Purl(purl), ANALYSIS_TIMEOUT).await?;
+        let (coordinate, stored) = (purl.to_owned(), result.clone());
+        self.store(move |cache| cache.put_coordinate(&coordinate, stored))
+            .await;
         Ok(result)
     }
 
-    async fn assess_remote(&self, purl: Option<&str>, sha256: &str) -> Result<Assessment> {
-        // Don't queue installs behind a saturated remote service; use the local engine.
-        let _slot = self
-            .slots
-            .try_acquire()
-            .context("Beamline concurrency limit")?;
-        let budget = if purl.is_some() {
-            ANALYSIS_TIMEOUT
-        } else {
-            LOOKUP_TIMEOUT
-        };
-        tokio::time::timeout(budget, async {
-            if let Some(purl) = purl {
-                let result = self.request(Query::Purl(purl)).await?;
-                if result.status != Status::Analyzed || result.classification(sha256).is_some() {
-                    return Ok(result);
-                }
-                // A release may resolve to another wheel or archive. Ask about our bytes.
+    /// The assessment of exactly `sha256`, given what [`Self::analyze`] said
+    /// of its coordinate, if that was asked.
+    pub(crate) async fn settle(
+        &self,
+        early: Option<Result<Assessment>>,
+        sha256: &str,
+    ) -> Result<Assessment> {
+        if let Some(assessment) = self.cached(sha256).await {
+            return Ok(assessment);
+        }
+        let result = match early {
+            // A release may resolve to another wheel or archive. Ask about our bytes.
+            Some(Ok(early))
+                if early.status == Status::Analyzed && early.classification(sha256).is_none() =>
+            {
+                self.ask(Query::Sha256(sha256), LOOKUP_TIMEOUT).await?
             }
-            self.request(Query::Sha256(sha256)).await
+            Some(early) => early?,
+            None => self.ask(Query::Sha256(sha256), LOOKUP_TIMEOUT).await?,
+        };
+        let (sha, stored) = (sha256.to_owned(), result.clone());
+        self.store(move |cache| cache.put(&sha, stored)).await;
+        Ok(result)
+    }
+
+    /// The stored verdict on exactly `sha256`.
+    async fn cached(&self, sha256: &str) -> Option<Assessment> {
+        let sha = sha256.to_owned();
+        let assessment = self.with_cache(move |cache| cache.get(&sha)).await??;
+        tracing::debug!("using cached Beamline assessment");
+        Some(assessment)
+    }
+
+    /// Run `job` against the cache, off the async runtime; `None` without one.
+    async fn with_cache<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Cache) -> T + Send + 'static,
+    ) -> Option<T> {
+        let cache = Arc::clone(self.cache.as_ref()?);
+        tokio::task::spawn_blocking(move || job(&cache))
+            .await
+            .inspect_err(|error| tracing::debug!(%error, "Beamline cache task failed"))
+            .ok()
+    }
+
+    /// Write to the cache. A failure costs a later lookup, not this verdict.
+    async fn store(&self, write: impl FnOnce(&Cache) -> Result<()> + Send + 'static) {
+        if let Some(Err(error)) = self.with_cache(write).await {
+            tracing::debug!(error = %format!("{error:#}"), "could not write Beamline cache");
+        }
+    }
+
+    /// Send one request within `budget`, unless the quota is known spent.
+    async fn ask(&self, query: Query<'_>, budget: Duration) -> Result<Assessment> {
+        let reset = self.quota_reset.load(Ordering::Relaxed);
+        if let Some(wait) = quota_wait(reset, SystemTime::now()) {
+            if !self.quota_reported.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "Beamline quota is spent for another {}; scanning locally",
+                    rounded(wait)
+                );
+            }
+            return Err(QuotaSpent.into());
+        }
+        tokio::time::timeout(budget, async {
+            let _slot = self
+                .slots
+                .acquire()
+                .await
+                .context("Beamline client closed")?;
+            self.request(query).await
         })
         .await
         .context("Beamline deadline exceeded")?
+    }
+
+    /// Stop asking until a spent quota resets, in this run and later ones.
+    async fn pause_for_quota(&self, retry_after: Duration) {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        let reset = (now + retry_after.min(MAX_QUOTA_PAUSE)).as_secs();
+        self.quota_reset.store(reset, Ordering::Relaxed);
+        // The rejection that brought the news is itself reported.
+        self.quota_reported.store(true, Ordering::Relaxed);
+        self.store(move |cache| cache.set_quota_reset(reset)).await;
     }
 
     async fn request(&self, query: Query<'_>) -> Result<Assessment> {
@@ -301,6 +407,15 @@ impl Client {
             .map_err(reqwest::Error::without_url)?;
         // Reject redirects too: neither identifiers nor authentication may be forwarded.
         if !response.status().is_success() {
+            // Beamline says in whole seconds when a spent quota resets.
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                && let Some(seconds) = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()?.parse().ok())
+            {
+                self.pause_for_quota(Duration::from_secs(seconds)).await;
+            }
             bail!("{}", rejection(&mut response).await);
         }
         let mut pending = Vec::new();
@@ -338,6 +453,24 @@ impl Client {
                 }
             }
         }
+    }
+}
+
+/// How long until a quota that resets at `reset` (seconds since the epoch)
+/// can be used again; `None` once it has reset. A reset further off than any
+/// pause hood would have recorded is a damaged or planted one, and ignored.
+fn quota_wait(reset: u64, now: SystemTime) -> Option<Duration> {
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let wait = Duration::from_secs(reset.checked_sub(now).filter(|&wait| wait > 0)?);
+    (wait <= MAX_QUOTA_PAUSE).then_some(wait)
+}
+
+/// A wait in the largest unit that fits, for a message.
+fn rounded(wait: Duration) -> String {
+    match wait.as_secs() {
+        seconds @ ..60 => format!("{seconds}s"),
+        seconds @ ..3600 => format!("{}m", seconds / 60),
+        seconds => format!("{}h", seconds / 3600),
     }
 }
 
@@ -442,8 +575,8 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
         return None;
     }
     // GitHub archives may be private. A private npm scope is never fetched without
-    // credentials, and the caller already sends authenticated requests by hash, so
-    // an unauthenticated scoped package on the public registry is public.
+    // credentials, and the caller discloses nothing of an authenticated request,
+    // so an unauthenticated scoped package on the public registry is public.
     if !matches!(
         url.host_str()?,
         "registry.npmjs.org"
@@ -464,7 +597,7 @@ pub(crate) fn public_purl(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{Cache, Client};
+    use super::Client;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -481,8 +614,17 @@ pub(crate) mod test_support {
         }
     }
 
-    #[allow(clippy::unwrap_used)]
     pub(crate) async fn server(replies: Vec<(u16, Vec<String>)>) -> Server {
+        server_with("", replies).await
+    }
+
+    /// A server that answers one connection per reply, in order, each with
+    /// `headers` (complete lines) added.
+    #[allow(clippy::unwrap_used)]
+    pub(crate) async fn server_with(
+        headers: &'static str,
+        replies: Vec<(u16, Vec<String>)>,
+    ) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -508,7 +650,7 @@ pub(crate) mod test_support {
                     .push(String::from_utf8(request).unwrap());
                 let length: usize = chunks.iter().map(String::len).sum();
                 let header = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/x-ndjson\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/x-ndjson\r\nContent-Length: {length}\r\nConnection: close\r\n{headers}\r\n"
                 );
                 if stream.write_all(header.as_bytes()).await.is_err() {
                     continue;
@@ -535,13 +677,9 @@ pub(crate) mod test_support {
 
     #[allow(clippy::unwrap_used)]
     pub(crate) fn cached_client(endpoint: &str, root: &std::path::Path) -> Client {
-        let mut client = Client::new(endpoint, None).unwrap();
-        client.cache = Some(Arc::new(Cache::new(
-            root.into(),
-            client.base.as_str(),
-            None,
-        )));
-        client
+        Client::new(endpoint, None)
+            .unwrap()
+            .caching_under(root.into())
     }
 }
 
@@ -549,7 +687,7 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use test_support::{assessment, cached_client, server};
+    use test_support::{assessment, cached_client, server, server_with};
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /// The subscription token goes to isotope13's API and nowhere else, so an
@@ -724,22 +862,188 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_refusal_and_local_saturation_return_for_fallback() {
+    async fn connection_refusal_returns_for_fallback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let client = Client::new(&endpoint, None).unwrap();
         assert!(client.assess(None, SHA).await.is_err());
-        let permits = client.slots.acquire_many(4).await.unwrap();
-        assert!(
-            client
-                .assess(None, SHA)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("concurrency limit")
-        );
+    }
+
+    /// Every slot taken, as by a package manager's parallel downloads.
+    async fn saturated(client: &Client) -> tokio::sync::SemaphorePermit<'_> {
+        let slots = u32::try_from(MAX_CONCURRENT_LOOKUPS).unwrap();
+        client.slots.acquire_many(slots).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_beyond_the_concurrency_limit_waits_its_turn() {
+        let mock = server(vec![(200, vec![assessment(SHA, "benign")])]).await;
+        let client = Arc::new(Client::new(&mock.url, None).unwrap());
+        let permits = saturated(&client).await;
+        let queued = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.assess(None, SHA).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(mock.requests.lock().unwrap().is_empty());
         drop(permits);
+        let result = queued.await.unwrap().unwrap();
+        assert_eq!(result.classification(SHA), Some(Classification::Benign));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_slot_is_bounded_by_the_request_budget() {
+        let client = Client::new("http://127.0.0.1:9", None).unwrap();
+        let _permits = saturated(&client).await;
+        let error = client.assess(None, SHA).await.unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn analysis_begun_with_the_request_is_settled_by_the_digest() {
+        // The package's bytes are the ones analyzed: one request decides.
+        let mock = server(vec![(200, vec![assessment(SHA, "hostile")])]).await;
+        let client = Client::new(&mock.url, None).unwrap();
+        let early = client.analyze("pkg:npm/demo@1").await;
+        let result = client.settle(Some(early), SHA).await.unwrap();
+        assert_eq!(result.classification(SHA), Some(Classification::Hostile));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+
+        // Other bytes were analyzed: ask about ours.
+        let mock = server(vec![
+            (200, vec![assessment(&"b".repeat(64), "benign")]),
+            (200, vec![assessment(SHA, "hostile")]),
+        ])
+        .await;
+        let client = Client::new(&mock.url, None).unwrap();
+        let early = client.analyze("pkg:npm/demo@1").await;
+        let result = client.settle(Some(early), SHA).await.unwrap();
+        assert_eq!(result.classification(SHA), Some(Classification::Hostile));
+        let requests = mock.requests.lock().unwrap().clone();
+        assert!(requests[1].starts_with(&format!("GET /v1/lookup?sha256={SHA}")));
+
+        // The analysis failed: local analysis decides, with no second request.
+        let mock = server(vec![(503, vec!["outage".into()])]).await;
+        let client = Client::new(&mock.url, None).unwrap();
+        let early = client.analyze("pkg:npm/demo@1").await;
+        assert!(client.settle(Some(early), SHA).await.is_err());
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cached_analysis_is_reused_but_never_vouches_for_other_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = "b".repeat(64);
+        let mock = server(vec![
+            (200, vec![assessment(SHA, "benign")]),
+            (200, vec![assessment(&other, "hostile")]),
+        ])
+        .await;
+        let client = cached_client(&mock.url, tmp.path());
+        drop(client.analyze("pkg:npm/demo@1").await.unwrap());
+        // A later run asks nothing about the same package...
+        let client = cached_client(&mock.url, tmp.path());
+        let early = client.analyze("pkg:npm/demo@1").await;
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        // ...and its verdict covers only the bytes it names.
+        let result = client.settle(Some(early), &other).await.unwrap();
+        assert_eq!(result.classification(&other), Some(Classification::Hostile));
+        let requests = mock.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with(&format!("GET /v1/lookup?sha256={other}")));
+        // No package name reaches the disk.
+        for entry in walk(tmp.path()) {
+            let stored = std::fs::read_to_string(&entry).unwrap();
+            assert!(!entry.to_string_lossy().contains("demo"), "{entry:?}");
+            assert!(!stored.contains("demo"), "{stored}");
+        }
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flat_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_spent_quota_is_not_asked_again_until_it_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = server_with(
+            "Retry-After: 1800\r\n",
+            vec![(429, vec!["quota exhausted".into()])],
+        )
+        .await;
+        let client = cached_client(&mock.url, tmp.path());
+        let error = client.assess(None, SHA).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Beamline returned HTTP 429 Too Many Requests: quota exhausted (retry after 1800s)"
+        );
+        // Neither this run nor the next asks again.
+        for client in [client, cached_client(&mock.url, tmp.path())] {
+            for purl in [None, Some("pkg:npm/demo@1")] {
+                let error = client.assess(purl, SHA).await.unwrap_err();
+                assert!(error.is::<QuotaSpent>(), "{error:#}");
+            }
+        }
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_that_names_no_reset_does_not_pause() {
+        let mock = server(vec![
+            (429, vec!["slow down".into()]),
+            (200, vec![assessment(SHA, "benign")]),
+        ])
+        .await;
+        let client = Client::new(&mock.url, None).unwrap();
+        assert!(client.assess(None, SHA).await.is_err());
+        let result = client.assess(None, SHA).await.unwrap();
+        assert_eq!(result.classification(SHA), Some(Classification::Benign));
+    }
+
+    #[test]
+    fn a_quota_pause_ends_and_is_never_longer_than_a_day() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let day = MAX_QUOTA_PAUSE.as_secs();
+        for (reset, expected) in [
+            (0, None),
+            (999_999, None),
+            (1_000_000, None),
+            (1_000_060, Some(Duration::from_mins(1))),
+            (1_000_000 + day, Some(MAX_QUOTA_PAUSE)),
+            // No pause hood records is this long: a damaged or planted stamp.
+            (1_000_001 + day, None),
+            (u64::MAX, None),
+        ] {
+            assert_eq!(quota_wait(reset, now), expected, "{reset}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absurd_retry_after_is_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = server_with(
+            "Retry-After: 99999999999\r\n",
+            vec![(429, vec!["quota exhausted".into()])],
+        )
+        .await;
+        let client = cached_client(&mock.url, tmp.path());
+        assert!(client.assess(None, SHA).await.is_err());
+        let reset = client.quota_reset.load(Ordering::Relaxed);
+        assert_eq!(
+            quota_wait(reset, SystemTime::now()).map(|wait| wait > Duration::from_hours(23)),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -755,7 +1059,7 @@ mod tests {
         drop(mock);
         // The server is gone and all network slots are occupied: this must be a disk hit.
         let client = cached_client(&endpoint, tmp.path());
-        let permits = client.slots.acquire_many(4).await.unwrap();
+        let permits = saturated(&client).await;
         let cached = client.assess(None, SHA).await.unwrap();
         drop(permits);
         assert_eq!(cached.classification(SHA), Some(Classification::Hostile));

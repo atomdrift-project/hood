@@ -1,7 +1,7 @@
 //! Persistent, byte-specific Beamline assessments. Cache failures are always misses.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,9 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::beamline::Assessment;
 
-const TTL: Duration = Duration::from_hours(30 * 24);
+pub(crate) const TTL: Duration = Duration::from_hours(30 * 24);
 const UNMEASURED_TTL: Duration = Duration::from_mins(1);
 const MAX_ENTRY_BYTES: u64 = 128 * 1024;
+/// Not a `.json` name, so pruning leaves it alone.
+const QUOTA_STAMP: &str = "quota-reset";
 
 #[derive(Debug)]
 pub(crate) struct Cache {
@@ -47,35 +49,59 @@ impl Cache {
         }
     }
 
-    fn path(&self, sha: &str) -> Option<PathBuf> {
-        (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| {
-            self.directory
-                .join(format!("{}.json", sha.to_ascii_lowercase()))
-        })
+    /// The key an analysis of `purl` is stored under: a digest, so that the
+    /// cache names no package.
+    fn coordinate_key(purl: &str) -> String {
+        let digest: [u8; 32] = Sha256::digest(format!("coordinate\0{purl}")).into();
+        crate::scanner::hex(&digest)
     }
 
+    /// When a spent quota resets, in seconds since the epoch, if recorded.
+    pub(crate) fn quota_reset(&self) -> Option<u64> {
+        let stamp = std::fs::read_to_string(self.directory.join(QUOTA_STAMP)).ok()?;
+        stamp.trim().parse().ok()
+    }
+
+    pub(crate) fn set_quota_reset(&self, reset: u64) -> Result<()> {
+        publish(
+            &self.directory,
+            &self.directory.join(QUOTA_STAMP),
+            reset.to_string().as_bytes(),
+        )
+    }
+
+    fn path(&self, sha: &str) -> Option<PathBuf> {
+        entry_path(&self.directory, sha)
+    }
+
+    /// The stored verdict on exactly the bytes `sha` names.
     pub(crate) fn get(&self, sha: &str) -> Option<Assessment> {
-        let assessment = self.read(sha);
+        let assessment = self
+            .read(sha)
+            .filter(|assessment| assessment.classification(sha).is_some());
         if assessment.is_none() {
-            self.cleanup.call_once(|| self.prune());
+            self.cleanup.call_once(|| prune(&self.directory));
         }
         assessment
     }
 
-    fn read(&self, sha: &str) -> Option<Assessment> {
-        let path = self.path(sha)?;
-        let mut bytes = Vec::new();
-        std::fs::File::open(&path)
-            .ok()?
-            .take(MAX_ENTRY_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 > MAX_ENTRY_BYTES {
-            return None;
+    /// The stored analysis of the package `purl` names: a verdict on the
+    /// bytes it says it judged, which may not be the bytes a download brings.
+    pub(crate) fn coordinate(&self, purl: &str) -> Option<Assessment> {
+        self.read(&Self::coordinate_key(purl))
+            .filter(Assessment::is_verdict)
+    }
+
+    pub(crate) fn put_coordinate(&self, purl: &str, assessment: Assessment) -> Result<()> {
+        if !assessment.is_verdict() {
+            return Ok(());
         }
-        let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-        if !Self::fresh(&entry, SystemTime::now()) || entry.assessment.classification(sha).is_none()
-        {
+        self.write(&Self::coordinate_key(purl), assessment)
+    }
+
+    fn read(&self, sha: &str) -> Option<Assessment> {
+        let entry: Entry = serde_json::from_slice(&load(&self.path(sha)?)?).ok()?;
+        if !Self::fresh(&entry, SystemTime::now()) {
             // Leave removal to pruning: another process may have replaced this entry.
             return None;
         }
@@ -103,7 +129,11 @@ impl Cache {
         if assessment.classification(sha).is_none() {
             return Ok(());
         }
-        let Some(path) = self.path(sha) else {
+        self.write(sha, assessment)
+    }
+
+    fn write(&self, key: &str, assessment: Assessment) -> Result<()> {
+        let Some(path) = self.path(key) else {
             return Ok(());
         };
         let entry = Entry {
@@ -114,48 +144,70 @@ impl Cache {
         if bytes.len() as u64 > MAX_ENTRY_BYTES {
             return Ok(());
         }
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&self.directory)
-            .context("create Beamline cache directory")?;
-        // A reader sees the old entry or the complete replacement, never a partial write.
-        // NamedTempFile also creates private (0600) files on Unix.
-        let mut staged = tempfile::NamedTempFile::new_in(&self.directory)?;
-        staged.write_all(&bytes)?;
-        staged
-            .persist(path)
-            .context("publish Beamline cache entry")?;
-        Ok(())
+        publish(&self.directory, &path, &bytes)
     }
+}
 
-    /// Reclaim expired files on the first miss; cache hits never walk the directory.
-    fn prune(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if entry
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "json")
-            {
-                continue;
-            }
-            if entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age >= TTL)
-            {
-                drop(std::fs::remove_file(entry.path()));
-            }
+/// Where the entry for the SHA-256 `sha` lives in `directory`; `None` for
+/// anything else, so that no key can name a path outside it.
+pub(crate) fn entry_path(directory: &Path, sha: &str) -> Option<PathBuf> {
+    (sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| directory.join(format!("{}.json", sha.to_ascii_lowercase())))
+}
+
+/// The contents of the entry at `path`, if it is there and of a sane size.
+pub(crate) fn load(path: &Path) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_ENTRY_BYTES).then_some(bytes)
+}
+
+/// Write `bytes` to `path` in the cache `directory`, creating it private.
+pub(crate) fn publish(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(directory)
+        .context("create cache directory")?;
+    // A reader sees the old entry or the complete replacement, never a partial write.
+    // NamedTempFile also creates private (0600) files on Unix.
+    let mut staged = tempfile::NamedTempFile::new_in(directory)?;
+    staged.write_all(bytes)?;
+    staged.persist(path).context("publish cache entry")?;
+    Ok(())
+}
+
+/// Reclaim the expired entries of `directory`. Callers do this on their first
+/// miss; cache hits never walk the directory.
+pub(crate) fn prune(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .path()
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            continue;
+        }
+        if entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= TTL)
+        {
+            drop(std::fs::remove_file(entry.path()));
         }
     }
 }

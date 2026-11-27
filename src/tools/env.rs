@@ -125,6 +125,13 @@ impl ChildEnv {
             out.insert(k, OsString::new());
         }
 
+        // Any of these tools may run git: npm and pip for git dependencies,
+        // go for a module its proxy lacks, makepkg for sources. git takes its
+        // CA from no variable the profiles below set, so without this every
+        // such fetch fails on hood's certificate. (brew scrubs this one too;
+        // see `Config::with_brew_clients`.)
+        out.insert("GIT_SSL_CAINFO", ca.clone());
+
         match profile {
             TrustProfile::Curl => {
                 out.insert("CURL_CA_BUNDLE", ca.clone());
@@ -556,6 +563,20 @@ mod tests {
         );
         let exec = fake_env().vars_for_program(&Program::command("/tmp/example").unwrap());
         assert!(exec.contains_key("CARGO_HTTP_PROXY") && exec.contains_key("npm_config_noproxy"));
+    }
+
+    /// Every tool can end up running git, which reads no other CA variable.
+    #[test]
+    fn every_child_is_told_where_git_finds_hoods_ca() {
+        let env = fake_env();
+        let exec = env.vars_for_program(&Program::command("/tmp/example").unwrap());
+        let tools = Tool::SHIMMABLE.iter().map(|&tool| env.vars_for(tool));
+        for vars in tools.chain([exec]) {
+            assert_eq!(
+                vars.get("GIT_SSL_CAINFO"),
+                Some(&OsString::from("/tmp/hood.pem"))
+            );
+        }
     }
 
     #[test]

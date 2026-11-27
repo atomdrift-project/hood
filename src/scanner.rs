@@ -1,5 +1,11 @@
 //! Local Bloom gate, minimal-disclosure Beamline assessment, and lazy local analysis.
 //! Every available identity participates in the Bloom decision before any API call.
+//!
+//! A download is decided by the first of these that can: the Bloom filters,
+//! a pass an earlier local analysis reached, Beamline, local analysis. The
+//! last two overlap. Beamline is asked about a public package as soon as it
+//! is requested, and local analysis starts beside a lookup that has not
+//! answered within [`HEDGE`] of the download finishing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +21,8 @@ use scan::model::Classification;
 use tokio::sync::OnceCell;
 
 use crate::beamline;
-use crate::output::Disposition;
+use crate::output::{Disposition, ShownUrl};
+use crate::verdict_cache::VerdictCache;
 
 // `Analyzer::load` classifies at scan's default severity; hood's verdicts,
 // panels and Beamline budget are all calibrated for L25.
@@ -26,6 +33,11 @@ const _: () = assert!(
 
 /// How long a Bloom known-bad block waits for Beamline's explanation.
 const KNOWN_BAD_DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a finished download waits on Beamline alone before local analysis
+/// starts beside it. Beamline usually answers well inside this, and then no
+/// analyzer is loaded; past it, waiting costs more than the work.
+const HEDGE: Duration = Duration::from_millis(250);
 
 /// Outcome of scanning a single payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,14 +86,34 @@ impl BlockReason {
     }
 }
 
+/// What may be told to Beamline about a response, given how it was requested.
+/// Ordered from least to most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Disclosure {
+    /// Nothing. The request carried credentials, so what it fetched may be
+    /// private, and even its digest says that this machine holds it.
+    Nothing,
+    /// The SHA-256 of the body.
+    Digest,
+    /// The SHA-256, and the public package coordinate the URL names.
+    Coordinate,
+}
+
+/// What a scanner began when a request arrived, handed back to it with the
+/// response; see [`Scanner::anticipate`]. The default is nothing begun.
+#[derive(Debug, Default)]
+pub struct Anticipated(Option<tokio::task::JoinHandle<Option<Result<beamline::Assessment>>>>);
+
 /// Context the scanner gets alongside the payload bytes.
 #[derive(Debug)]
 pub struct ScanRequest {
     /// The URL the tool originally requested. Used as the filename hint to
     /// cleave (which keys off extension) and as a log field.
     pub url: String,
-    /// Whether request provenance permits disclosing a public package coordinate.
-    pub allow_purl: bool,
+    /// What request provenance permits telling Beamline.
+    pub disclosure: Disclosure,
+    /// What [`Scanner::anticipate`] began for this request.
+    pub early: Anticipated,
     /// Full payload body. Shared with the response hood forwards, so only a
     /// local analysis, which needs bytes of its own, ever copies it.
     pub body: Bytes,
@@ -98,8 +130,10 @@ pub struct ScanRequest {
 pub struct DiskScanRequest {
     /// The URL the tool requested — cleave filename hint and log/panel field.
     pub url: String,
-    /// Whether request provenance permits disclosing a public package coordinate.
-    pub allow_purl: bool,
+    /// What request provenance permits telling Beamline.
+    pub disclosure: Disclosure,
+    /// What [`Scanner::anticipate`] began for this request.
+    pub early: Anticipated,
     /// On-disk file holding the full payload. Named with the payload's real
     /// extension so cleave's type detection matches an in-memory scan.
     pub path: PathBuf,
@@ -109,12 +143,20 @@ pub struct DiskScanRequest {
 
 /// A scanner backend.
 ///
-/// Every method decides; none can fail. A backend that cannot inspect a
-/// payload says what its policy does with that, so no caller has to guess
-/// whether an error forwards or blocks. No method has a default, so a new
-/// backend cannot inherit a decision it did not make.
+/// Every required method decides; none can fail. A backend that cannot
+/// inspect a payload says what its policy does with that, so no caller has to
+/// guess whether an error forwards or blocks. No deciding method has a
+/// default, so a new backend cannot inherit a decision it did not make.
 #[async_trait::async_trait]
 pub trait Scanner: Send + Sync + std::fmt::Debug {
+    /// Begin, as a request for `url` goes out, whatever needs none of the
+    /// response: the download and this work then overlap. The caller puts the
+    /// result in the [`ScanRequest`] for the response, or drops it if there
+    /// is nothing to scan. Must be called within a Tokio runtime.
+    fn anticipate(self: Arc<Self>, _url: &str, _disclosure: Disclosure) -> Anticipated {
+        Anticipated::default()
+    }
+
     /// Decide an in-memory payload.
     async fn scan(&self, req: ScanRequest) -> Verdict;
 
@@ -189,6 +231,11 @@ pub struct AtomScanner {
     invocation: String,
     status: Option<Arc<ScanStats>>,
     bloom: OnceCell<Option<Lookup>>,
+    /// Passes of earlier local analyses; holds `None` when none may be kept.
+    verdicts: OnceCell<Option<Arc<VerdictCache>>>,
+    /// See [`HEDGE`]. A field so that tests choose which of Beamline and
+    /// local analysis is asked, rather than leave it to timing.
+    hedge: Duration,
 }
 
 /// Thread-safe counters used to summarize a verbose Hood run.
@@ -318,7 +365,37 @@ impl AtomScanner {
             invocation,
             status,
             bloom: OnceCell::new(),
+            verdicts: OnceCell::new(),
+            hedge: HEDGE,
         }
+    }
+
+    async fn bloom(&self) -> Option<&Lookup> {
+        self.bloom
+            .get_or_init(|| async {
+                tokio::task::spawn_blocking(load_bloom)
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "Bloom load failed; continuing to assessment");
+                        None
+                    })
+            })
+            .await
+            .as_ref()
+    }
+
+    async fn verdicts(&self) -> Option<Arc<VerdictCache>> {
+        self.verdicts
+            .get_or_init(|| async {
+                tokio::task::spawn_blocking(open_verdicts)
+                    .await
+                    .inspect_err(|error| tracing::debug!(%error, "verdict cache task failed"))
+                    .ok()
+                    .flatten()
+                    .map(Arc::new)
+            })
+            .await
+            .clone()
     }
 
     async fn analyzer(&self) -> Result<Arc<Analyzer>> {
@@ -353,72 +430,207 @@ impl AtomScanner {
             .map_err(|error| anyhow::anyhow!("{error}"))
     }
 
-    /// Run `job` on the local analyzer, off the async runtime, and decide its
-    /// result under policy.
-    async fn analyze<F>(&self, url: &str, job: F) -> Verdict
+    /// What can start before a download's bytes arrive: Beamline's analysis
+    /// of a public package, or else the analyzer that will have to judge it.
+    async fn begin(
+        &self,
+        url: &str,
+        disclosure: Disclosure,
+    ) -> Option<Result<beamline::Assessment>> {
+        // A package the filters know by name is settled by its digest.
+        let purl = fletch::purl::url_to_purl(url);
+        if let Some(lookup) = self.bloom().await
+            && matches!(
+                lookup.decide_any(purl.as_deref(), None),
+                Decision::Skip | Decision::KnownBad
+            )
+        {
+            return None;
+        }
+        if disclosure == Disclosure::Coordinate
+            && let Some(client) = &self.remote
+            && let Some(purl) = beamline::public_purl(url)
+        {
+            return Some(client.analyze(&purl).await);
+        }
+        // Nothing public to ask about, so local analysis is the likely judge.
+        // A failure to load is reported by the download that needs it.
+        drop(tokio::join!(self.verdicts(), self.analyzer()));
+        None
+    }
+
+    /// Decide a finished download, whose local analysis would be `job`.
+    async fn decide<F>(
+        &self,
+        url: &str,
+        disclosure: Disclosure,
+        early: Anticipated,
+        sha: &[u8; 32],
+        job: F,
+    ) -> Verdict
     where
         F: FnOnce(&Analyzer) -> Result<ScanResult> + Send + 'static,
     {
-        let result = match self.analyzer().await {
-            Ok(analyzer) => tokio::task::spawn_blocking(move || job(&analyzer))
-                .await
-                .context("scan task join")
-                .flatten(),
-            Err(error) => Err(error),
+        // Bloom revocations must take precedence over even a fresh benign cache entry.
+        if let Some(lookup) = self.bloom().await {
+            // Local identity checks may use private coordinates; disclosure is
+            // decided separately, only if the bundle cannot resolve the artifact.
+            let purl = fletch::purl::url_to_purl(url);
+            let decision = lookup.decide_any(purl.as_deref(), Some(sha));
+            if let Some(verdict) = bloom_verdict(decision, self.policy, url, sha) {
+                return self
+                    .report_bloom(decision, verdict, url, sha, disclosure)
+                    .await;
+            }
+        }
+        let digest = hex(sha);
+        let verdicts = self.verdicts().await;
+        if let Some(verdicts) = verdicts.clone() {
+            let digest = digest.clone();
+            if let Ok(Some(probability)) =
+                tokio::task::spawn_blocking(move || verdicts.get(&digest)).await
+            {
+                tracing::debug!(url = %ShownUrl(url), probability, "scan clean (remembered)");
+                return self.pass(url, probability);
+            }
+        }
+
+        // Beamline alone first: it has usually seen the bytes already.
+        let result = {
+            let remote = self.remote_verdict(url, disclosure, early, &digest);
+            tokio::pin!(remote);
+            match tokio::time::timeout(self.hedge, &mut remote).await {
+                Ok(Some(verdict)) => return verdict,
+                Ok(None) => self.analyze(job).await,
+                Err(_) => {
+                    tracing::debug!("Beamline has yet to answer; scanning locally beside it");
+                    let local = self.analyze(job);
+                    tokio::pin!(local);
+                    tokio::select! {
+                        verdict = &mut remote => match verdict {
+                            Some(verdict) => return verdict,
+                            None => local.await,
+                        },
+                        result = &mut local => {
+                            // A pass needs no second opinion. A block or a failure
+                            // waits for the one already asked for, which may clear it.
+                            if !matches!(&result, Ok(r) if r.classification == Classification::Benign)
+                                && let Some(verdict) = remote.await
+                            {
+                                return verdict;
+                            }
+                            result
+                        }
+                    }
+                }
+            }
         };
+        // scan keeps only a finished analysis, so one it has replayed is one
+        // that no deadline cut short: a pass that will be the same next time.
+        if let (Some(verdicts), Ok(result)) = (verdicts, &result)
+            && result.classification == Classification::Benign
+            && result.analysis_cached
+        {
+            let probability = result.probability;
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || verdicts.put(&digest, probability))
+                    .await
+                    .context("verdict cache write task")
+                    .flatten()
+            {
+                tracing::debug!(error = %format!("{error:#}"), "could not remember local verdict");
+            }
+        }
         self.classify_result(url, result)
     }
 
-    async fn gate(&self, url: &str, allow_purl: bool, sha: &[u8; 32]) -> Option<Verdict> {
-        // Local identity checks may use private coordinates; disclosure is decided
-        // separately, only if the local bundle cannot resolve the artifact.
-        let purl = fletch::purl::url_to_purl(url);
-        let bloom = self
-            .bloom
-            .get_or_init(|| async {
-                tokio::task::spawn_blocking(load_bloom)
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "Bloom load failed; continuing to assessment");
-                        None
-                    })
-            })
-            .await;
-        // Bloom revocations must take precedence over even a fresh benign cache entry.
-        if let Some(lookup) = bloom {
-            let decision = lookup.decide_any(purl.as_deref(), Some(sha));
-            if let Some(verdict) = bloom_verdict(decision, self.policy, url, sha) {
-                return Some(self.report_bloom(decision, verdict, url, sha).await);
-            }
-        }
+    /// The verdict Beamline settles, counted and shown: it must be allowed to
+    /// know of the download, and hold an assessment of exactly the bytes
+    /// `digest` names. Anything less is logged and left to local analysis.
+    async fn remote_verdict(
+        &self,
+        url: &str,
+        disclosure: Disclosure,
+        early: Anticipated,
+        digest: &str,
+    ) -> Option<Verdict> {
         let client = self.remote.as_ref()?;
-        let purl = allow_purl.then(|| beamline::public_purl(url)).flatten();
-        let sha = hex(sha);
-        match client.assess(purl.as_deref(), &sha).await {
-            Ok(assessment) => {
-                let Some(classification) = assessment.classification(&sha) else {
-                    tracing::debug!("Beamline has no matching assessment; scanning locally");
-                    return None;
-                };
-                let verdict = verdict_from(classification, self.policy);
-                if let Some(status) = &self.status {
-                    status.record(classification, verdict.disposition());
-                }
-                if classification != Classification::Benign || self.status.is_some() {
-                    crate::output::emit_remote(
-                        classification,
-                        verdict.disposition(),
-                        self.policy,
-                        &assessment,
-                    );
-                }
-                Some(verdict)
+        let result = match (disclosure, early.0) {
+            (Disclosure::Nothing, _) => return None,
+            (Disclosure::Coordinate, Some(begun)) => {
+                let early = begun
+                    .await
+                    .unwrap_or_else(|error| Some(Err(error).context("Beamline analysis task")));
+                client.settle(early, digest).await
+            }
+            (Disclosure::Coordinate, None) => {
+                let purl = beamline::public_purl(url);
+                client.assess(purl.as_deref(), digest).await
+            }
+            (Disclosure::Digest, _) => client.settle(None, digest).await,
+        };
+        let assessment = match result {
+            Ok(assessment) => assessment,
+            // Said once, by the client.
+            Err(error) if error.is::<beamline::QuotaSpent>() => {
+                tracing::debug!("Beamline quota is spent; scanning locally");
+                return None;
             }
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "Beamline unavailable; scanning locally");
-                None
+                return None;
             }
+        };
+        let Some(classification) = assessment.classification(digest) else {
+            tracing::debug!("Beamline has no matching assessment; scanning locally");
+            return None;
+        };
+        let verdict = verdict_from(classification, self.policy);
+        if let Some(status) = &self.status {
+            status.record(classification, verdict.disposition());
         }
+        if classification != Classification::Benign || self.status.is_some() {
+            crate::output::emit_remote(
+                classification,
+                verdict.disposition(),
+                self.policy,
+                &assessment,
+            );
+        }
+        Some(verdict)
+    }
+
+    /// Run `job` on the local analyzer, off the async runtime.
+    async fn analyze<F>(&self, job: F) -> Result<ScanResult>
+    where
+        F: FnOnce(&Analyzer) -> Result<ScanResult> + Send + 'static,
+    {
+        let analyzer = self.analyzer().await?;
+        let result = tokio::task::spawn_blocking(move || job(&analyzer))
+            .await
+            .context("scan task join")
+            .flatten()?;
+        if !result.probability.is_finite()
+            || !(0.0..=1.0).contains(&result.probability)
+            || !result.threshold.is_finite()
+            || !(0.0..=1.0).contains(&result.threshold)
+        {
+            anyhow::bail!(
+                "scanner returned invalid probability/threshold ({:?}/{:?})",
+                result.probability,
+                result.threshold,
+            );
+        }
+        Ok(result)
+    }
+
+    /// Count and show a pass by local analysis, now or remembered.
+    fn pass(&self, url: &str, probability: f32) -> Verdict {
+        if let Some(status) = &self.status {
+            status.record(Classification::Benign, Disposition::Forwarded);
+            crate::output::emit_pass(url, probability);
+        }
+        Verdict::Allow
     }
 
     /// Show and count a decision the Bloom filter made on its own.
@@ -428,10 +640,15 @@ impl AtomScanner {
         verdict: Verdict,
         url: &str,
         sha: &[u8; 32],
+        disclosure: Disclosure,
     ) -> Verdict {
         let known_bad = decision == Decision::KnownBad;
         if known_bad {
-            let explanation = self.known_bad_explanation(sha).await;
+            let explanation = if disclosure == Disclosure::Nothing {
+                Vec::new()
+            } else {
+                self.known_bad_explanation(sha).await
+            };
             crate::output::emit_known_bad(&crate::output::KnownBadPanel {
                 url,
                 sha256: &hex(sha),
@@ -455,8 +672,9 @@ impl AtomScanner {
     /// Beamline's explanation of a payload the Bloom filter has already
     /// condemned, as display lines: its reason, then its leading findings.
     ///
-    /// The verdict never depends on this. It is a hash-only lookup, bounded
-    /// by [`KNOWN_BAD_DETAILS_TIMEOUT`], and an answer that does not agree the
+    /// The verdict never depends on this. It is a hash-only lookup, made only
+    /// when the digest may be disclosed and bounded by
+    /// [`KNOWN_BAD_DETAILS_TIMEOUT`], and an answer that does not agree the
     /// payload is bad is dropped rather than shown beside the block.
     async fn known_bad_explanation(&self, sha: &[u8; 32]) -> Vec<String> {
         let Some(client) = &self.remote else {
@@ -504,49 +722,37 @@ impl AtomScanner {
     /// active policy. Shared by the in-memory ([`Scanner::scan`]) and
     /// streamed-to-disk ([`Scanner::scan_disk`]) paths so both render identically.
     fn classify_result(&self, url: &str, result: Result<ScanResult>) -> Verdict {
-        let result = result.and_then(|result| {
-            if !result.probability.is_finite()
-                || !(0.0..=1.0).contains(&result.probability)
-                || !result.threshold.is_finite()
-                || !(0.0..=1.0).contains(&result.threshold)
-            {
-                anyhow::bail!(
-                    "scanner returned invalid probability/threshold ({:?}/{:?})",
-                    result.probability,
-                    result.threshold,
-                );
-            }
-            Ok(result)
-        });
         match result {
+            Ok(r) if r.classification == Classification::Benign => {
+                tracing::debug!(
+                    url = %ShownUrl(url),
+                    probability = r.probability,
+                    replayed = r.analysis_cached,
+                    "scan clean"
+                );
+                self.pass(url, r.probability)
+            }
             Ok(r) => {
                 let verdict = verdict_from(r.classification, self.policy);
                 let disposition = verdict.disposition();
                 if let Some(status) = &self.status {
                     status.record(r.classification, disposition);
                 }
-                if matches!(r.classification, Classification::Benign) {
-                    tracing::debug!(url = %crate::output::ShownUrl(url), probability = r.probability, "scan clean");
-                    if self.status.is_some() {
-                        crate::output::emit_pass(url, r.probability);
-                    }
-                } else {
-                    // `top_findings` is already deduped, ranked strongest-first,
-                    // and capped at 5 by the engine; take the leading three to
-                    // keep the panel tight.
-                    let traits = r.top_findings.get(..3).unwrap_or(&r.top_findings);
-                    let reasons = r.reasons.get(..3).unwrap_or(&r.reasons);
-                    crate::output::emit(&crate::output::Panel {
-                        classification: r.classification,
-                        disposition,
-                        policy: self.policy,
-                        probability: r.probability,
-                        url,
-                        traits,
-                        reasons,
-                        invocation: &self.invocation,
-                    });
-                }
+                // `top_findings` is already deduped, ranked strongest-first,
+                // and capped at 5 by the engine; take the leading three to
+                // keep the panel tight.
+                let traits = r.top_findings.get(..3).unwrap_or(&r.top_findings);
+                let reasons = r.reasons.get(..3).unwrap_or(&r.reasons);
+                crate::output::emit(&crate::output::Panel {
+                    classification: r.classification,
+                    disposition,
+                    policy: self.policy,
+                    probability: r.probability,
+                    url,
+                    traits,
+                    reasons,
+                    invocation: &self.invocation,
+                });
                 verdict
             }
             Err(e) => {
@@ -621,6 +827,24 @@ fn load_bloom() -> Option<Lookup> {
     refresh_bloom();
     let lookup = Lookup::load();
     lookup.is_active().then_some(lookup)
+}
+
+/// Open the cache of local passes for the rules, models and build in use;
+/// `None` when a pass cannot be tied to them. Blocking: reads the rules.
+fn open_verdicts() -> Option<VerdictCache> {
+    // Models named by `SCAN_MODELS_DIR` are used as they are: nothing says
+    // which they are, or that they are the same ones next time.
+    if std::env::var_os("SCAN_MODELS_DIR").is_some() {
+        return None;
+    }
+    let directory = dirs::cache_dir()?.join("atomdrift/hood/verdicts/v1");
+    // The rules in use are this host's feed, never the working directory's.
+    activate_feed();
+    scan::traits_repo::prepare_runtime_env();
+    let models = scan::models_repo::version()?;
+    // cleave's fingerprint covers every rule file and the running build.
+    let rules = cleave::cache::traits_revision_fingerprint();
+    Some(VerdictCache::new(directory, format!("{rules:x}-{models}")))
 }
 
 /// Reuse scan's verified atomic updater, at most once per day, including failures.
@@ -793,18 +1017,23 @@ const fn policy_allows_error(policy: ScanPolicy) -> bool {
 
 #[async_trait::async_trait]
 impl Scanner for AtomScanner {
+    fn anticipate(self: Arc<Self>, url: &str, disclosure: Disclosure) -> Anticipated {
+        let url = url.to_owned();
+        Anticipated(Some(tokio::spawn(async move {
+            self.begin(&url, disclosure).await
+        })))
+    }
+
     async fn scan(&self, req: ScanRequest) -> Verdict {
         let ScanRequest {
             url,
-            allow_purl,
+            disclosure,
+            early,
             body,
             sha256,
         } = req;
-        if let Some(verdict) = self.gate(&url, allow_purl, &sha256).await {
-            return verdict;
-        }
         let name = url.clone();
-        self.analyze(&url, move |analyzer| {
+        self.decide(&url, disclosure, early, &sha256, move |analyzer| {
             analyzer.scan_bytes(body.into(), &name)
         })
         .await
@@ -813,16 +1042,16 @@ impl Scanner for AtomScanner {
     async fn scan_disk(&self, req: DiskScanRequest) -> Verdict {
         let DiskScanRequest {
             url,
-            allow_purl,
+            disclosure,
+            early,
             path,
             sha256,
         } = req;
-        if let Some(verdict) = self.gate(&url, allow_purl, &sha256).await {
-            return verdict;
-        }
         let name = url.clone();
-        self.analyze(&url, move |analyzer| analyzer.scan_file(&path, &name))
-            .await
+        self.decide(&url, disclosure, early, &sha256, move |analyzer| {
+            analyzer.scan_file(&path, &name)
+        })
+        .await
     }
 
     /// A download past the inspection limit is forwarded, never failed: the
@@ -852,7 +1081,8 @@ mod tests {
         let v = s
             .scan(ScanRequest {
                 url: "http://x".into(),
-                allow_purl: false,
+                disclosure: Disclosure::Digest,
+                early: Anticipated::default(),
                 body: Bytes::from_static(b"hi"),
                 sha256: [0; 32],
             })
@@ -1090,6 +1320,10 @@ mod tests {
             invocation: String::new(),
             status: Some(Arc::new(ScanStats::default())),
             bloom: OnceCell::new_with(Some(bloom)),
+            verdicts: OnceCell::new_with(Some(None)),
+            // Beamline is given all the time it needs, so that whether local
+            // analysis runs depends on its answer, not on the machine.
+            hedge: Duration::from_hours(1),
         }
     }
 
@@ -1111,7 +1345,8 @@ mod tests {
         let verdict = scanner
             .scan(ScanRequest {
                 url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
-                allow_purl: true,
+                disclosure: Disclosure::Coordinate,
+                early: Anticipated::default(),
                 sha256: sha_of(&body),
                 body: body.into(),
             })
@@ -1171,7 +1406,8 @@ mod tests {
                 scanner
                     .scan(ScanRequest {
                         url: url.into(),
-                        allow_purl: true,
+                        disclosure: Disclosure::Coordinate,
+                        early: Anticipated::default(),
                         sha256: sha_of(&body),
                         body: body.clone().into(),
                     })
@@ -1184,7 +1420,8 @@ mod tests {
                 scanner
                     .scan_disk(DiskScanRequest {
                         url: url.into(),
-                        allow_purl: true,
+                        disclosure: Disclosure::Coordinate,
+                        early: Anticipated::default(),
                         path,
                         sha256: sha,
                     })
@@ -1230,7 +1467,8 @@ mod tests {
             let verdict = scanner
                 .scan(ScanRequest {
                     url: "https://private.example/private.tar.gz?token=secret".into(),
-                    allow_purl: false,
+                    disclosure: Disclosure::Digest,
+                    early: Anticipated::default(),
                     sha256: sha_of(&body),
                     body: body.clone().into(),
                 })
@@ -1317,7 +1555,8 @@ mod tests {
                 let verdict = scanner
                     .scan(ScanRequest {
                         url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
-                        allow_purl: true,
+                        disclosure: Disclosure::Coordinate,
+                        early: Anticipated::default(),
                         body: Bytes::from_static(b"unknown"),
                         sha256: sha_of(b"unknown"),
                     })
@@ -1337,7 +1576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disk_assessment_uses_streamed_digest_and_authentication_forces_hash_only() {
+    async fn disk_assessment_uses_streamed_digest_and_a_digest_names_no_package() {
         use beamline::test_support::{assessment, server};
         let tmp = tempfile::tempdir().unwrap();
         let body = b"disk artifact";
@@ -1354,7 +1593,8 @@ mod tests {
         let verdict = scanner
             .scan_disk(DiskScanRequest {
                 url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
-                allow_purl: false,
+                disclosure: Disclosure::Digest,
+                early: Anticipated::default(),
                 path,
                 sha256: sha,
             })
@@ -1364,6 +1604,273 @@ mod tests {
         let requests = mock.requests.lock().unwrap().clone();
         assert!(requests[0].starts_with(&format!("GET /v1/lookup?sha256={}", hex(&sha))));
         assert!(!requests[0].contains("purl="));
+    }
+
+    const PUBLIC_URL: &str = "https://registry.npmjs.org/demo/-/demo-1.tgz";
+
+    fn request(url: &str, disclosure: Disclosure, early: Anticipated, body: &[u8]) -> ScanRequest {
+        ScanRequest {
+            url: url.into(),
+            disclosure,
+            early,
+            body: Bytes::copy_from_slice(body),
+            sha256: sha_of(body),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credentialed_download_tells_beamline_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"private artifact";
+        let mock = beamline::test_support::server(vec![]).await;
+        let client = || Some(beamline::Client::new(&mock.url, None).unwrap());
+
+        // Unknown to the filters: decided locally, here by failing to.
+        let scanner = Arc::new(test_scanner(
+            client(),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        ));
+        let early = Arc::clone(&scanner).anticipate(PUBLIC_URL, Disclosure::Nothing);
+        let verdict = scanner
+            .scan(request(PUBLIC_URL, Disclosure::Nothing, early, body))
+            .await;
+        assert!(matches!(verdict, Verdict::Block(BlockReason::ScanError(_))));
+
+        // Known bad: blocked without asking Beamline to explain.
+        publish_filters(tmp.path(), &[(Tier::Bad, rec(None, Some(sha_of(body))))]);
+        let scanner = test_scanner(
+            client(),
+            Some(scan::bloom_repo::test_support::load_from(tmp.path())),
+            tmp.path().join("missing-model"),
+            ScanPolicy::Strict,
+        );
+        let verdict = scanner
+            .scan(request(
+                PUBLIC_URL,
+                Disclosure::Nothing,
+                Anticipated::default(),
+                body,
+            ))
+            .await;
+        assert_eq!(
+            verdict,
+            Verdict::Block(BlockReason::KnownBad(hex(&sha_of(body))))
+        );
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_public_package_is_analyzed_while_it_downloads() {
+        use beamline::test_support::{assessment, server};
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"public package";
+        let sha = hex(&sha_of(body));
+        let mock = server(vec![(200, vec![assessment(&sha, "hostile")])]).await;
+        let scanner = Arc::new(test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        ));
+        let mut early = Arc::clone(&scanner).anticipate(PUBLIC_URL, Disclosure::Coordinate);
+        // The analysis is over before there is a body to hash.
+        let analysis = early.0.take().unwrap().await.unwrap();
+        assert!(analysis.unwrap().is_ok());
+        let requests = mock.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /v1/analyze?"));
+        assert!(requests[0].contains("purl=pkg%3Anpm%2Fdemo%401"));
+
+        // Begun again, as the proxy would, the download asks nothing more.
+        let mock = server(vec![(200, vec![assessment(&sha, "hostile")])]).await;
+        let scanner = Arc::new(test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        ));
+        let early = Arc::clone(&scanner).anticipate(PUBLIC_URL, Disclosure::Coordinate);
+        let verdict = scanner
+            .scan(request(PUBLIC_URL, Disclosure::Coordinate, early, body))
+            .await;
+        assert_eq!(verdict, Verdict::Block(BlockReason::Hostile));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        assert!(scanner.analyzer.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_error_page_is_not_judged_by_its_packages_analysis() {
+        use beamline::test_support::{assessment, server};
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"404 page";
+        let sha = hex(&sha_of(body));
+        // The package the URL names is benign; these bytes are not it.
+        let mock = server(vec![
+            (200, vec![assessment(&"b".repeat(64), "benign")]),
+            (200, vec![assessment(&sha, "hostile")]),
+        ])
+        .await;
+        let scanner = Arc::new(test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        ));
+        let mut early = Arc::clone(&scanner).anticipate(PUBLIC_URL, Disclosure::Coordinate);
+        let analysis = early.0.take().unwrap().await.unwrap();
+        early.0 = Some(tokio::spawn(async move { analysis }));
+        // The proxy lowers the disclosure of a response that did not succeed.
+        let verdict = scanner
+            .scan(request(PUBLIC_URL, Disclosure::Digest, early, body))
+            .await;
+        assert_eq!(verdict, Verdict::Block(BlockReason::Hostile));
+        let requests = mock.requests.lock().unwrap().clone();
+        assert!(requests[1].starts_with(&format!("GET /v1/lookup?sha256={sha}")));
+    }
+
+    #[tokio::test]
+    async fn a_download_beamline_cannot_know_warms_the_analyzer_instead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = beamline::test_support::server(vec![]).await;
+        for (url, disclosure) in [
+            (
+                "https://private.example/tool.tar.gz",
+                Disclosure::Coordinate,
+            ),
+            (PUBLIC_URL, Disclosure::Digest),
+            (PUBLIC_URL, Disclosure::Nothing),
+        ] {
+            let scanner = Arc::new(test_scanner(
+                Some(beamline::Client::new(&mock.url, None).unwrap()),
+                None,
+                tmp.path().into(),
+                ScanPolicy::Strict,
+            ));
+            let mut early = Arc::clone(&scanner).anticipate(url, disclosure);
+            assert!(early.0.take().unwrap().await.unwrap().is_none());
+            // The model directory is empty, so the load was tried and failed.
+            assert!(matches!(scanner.analyzer.get(), Some(Err(_))), "{url}");
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_package_the_filters_know_by_name_starts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"known package";
+        publish_filters(
+            tmp.path(),
+            &[(Tier::Good, rec(Some("pkg:npm/demo@1"), Some(sha_of(body))))],
+        );
+        let mock = beamline::test_support::server(vec![]).await;
+        let scanner = Arc::new(test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            Some(scan::bloom_repo::test_support::load_from(tmp.path())),
+            tmp.path().join("missing-model"),
+            ScanPolicy::Strict,
+        ));
+        let mut early = Arc::clone(&scanner).anticipate(PUBLIC_URL, Disclosure::Coordinate);
+        assert!(early.0.take().unwrap().await.unwrap().is_none());
+        assert!(scanner.analyzer.get().is_none());
+        assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remembered_pass_needs_neither_beamline_nor_an_analyzer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"scanned before";
+        let remember = || {
+            let verdicts = VerdictCache::new(tmp.path().join("verdicts"), "r1".into());
+            verdicts.put(&hex(&sha_of(body)), 0.01).unwrap();
+            OnceCell::new_with(Some(Some(Arc::new(verdicts))))
+        };
+        let mock = beamline::test_support::server(vec![]).await;
+        let mut scanner = test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().join("missing-model"),
+            ScanPolicy::Strict,
+        );
+        scanner.verdicts = remember();
+        let url = "https://private.example/tool.tar.gz";
+        let scan = |scanner: AtomScanner| async move {
+            scanner
+                .scan(request(
+                    url,
+                    Disclosure::Coordinate,
+                    Anticipated::default(),
+                    body,
+                ))
+                .await
+        };
+        assert_eq!(scan(scanner).await, Verdict::Allow);
+        assert!(mock.requests.lock().unwrap().is_empty());
+
+        // The filters are newer than any pass: a revocation still blocks.
+        publish_filters(tmp.path(), &[(Tier::Bad, rec(None, Some(sha_of(body))))]);
+        let mut scanner = test_scanner(
+            None,
+            Some(scan::bloom_repo::test_support::load_from(tmp.path())),
+            tmp.path().join("missing-model"),
+            ScanPolicy::Strict,
+        );
+        scanner.verdicts = remember();
+        assert!(matches!(
+            scan(scanner).await,
+            Verdict::Block(BlockReason::KnownBad(_))
+        ));
+    }
+
+    /// Local analysis starts beside a Beamline that is slow to answer; here
+    /// it fails, and the answer already asked for decides.
+    #[tokio::test]
+    async fn a_local_failure_waits_for_the_answer_beamline_owes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let body = b"slowly assessed";
+        let reply = beamline::test_support::assessment(&hex(&sha_of(body)), "benign");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut scanner = test_scanner(
+            Some(beamline::Client::new(&endpoint, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        );
+        scanner.hedge = Duration::ZERO;
+        let scanner = Arc::new(scanner);
+        let scan = tokio::spawn({
+            let scanner = Arc::clone(&scanner);
+            async move {
+                scanner
+                    .scan(request(
+                        "https://private.example/tool.tar.gz",
+                        Disclosure::Digest,
+                        Anticipated::default(),
+                        body,
+                    ))
+                    .await
+            }
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+            request.push(byte[0]);
+        }
+        // Beamline answers only once local analysis has started and failed.
+        while scanner.analyzer.get().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        assert_eq!(scan.await.unwrap(), Verdict::Allow);
     }
 
     #[test]

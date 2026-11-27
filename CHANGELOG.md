@@ -11,6 +11,7 @@ All notable changes to hood. Versions follow [semantic versioning](https://semve
 - Pin rules to the installed tree, so a checkout's own traits directory cannot supply detection rules.
 - Strip credentials, queries and fragments from URLs in panels and logs, keeping presigned tokens out of CI.
 - Replace Unicode bidi overrides in panels, blocking Trojan Source-style display spoofing.
+- Breaking: tell Beamline nothing about downloads requested with credentials or cookies; they were looked up by SHA-256.
 
 ### Features
 
@@ -31,6 +32,18 @@ All notable changes to hood. Versions follow [semantic versioning](https://semve
 - Make Homebrew's curl trust hood through `HOMEBREW_CURLRC`, since brew discards the CA environment variables.
 - Keep Homebrew downloads alive while they are assessed, so brew no longer abandons one held over five seconds.
 - Let Homebrew's git through uninspected, with a notice: brew leaves no way to make it trust hood, so `brew update` and `brew tap` failed.
+- Give git hood's CA through `GIT_SSL_CAINFO`, so git dependencies and `hood exec -- git` no longer fail.
+
+### Optimizations
+
+- Ask Beamline about a public package when it is requested, so its analysis overlaps the download.
+- Start local analysis beside a Beamline lookup still unanswered after 250 ms, instead of after it times out.
+- Load the analyzer during a download Beamline cannot know, instead of after it.
+- Remember local passes by SHA-256 until the rules, models or build change, so repeat downloads skip the analyzer.
+- Cache Beamline's package analyses for 30 days, as its verdicts by SHA-256 already were.
+- Stop asking Beamline once its quota is spent, until the reset time it gave, across runs.
+- Queue Beamline requests past eight in flight; the fifth parallel download used to fall to local analysis.
+- Exit without waiting for an analyzer still loading in the background.
 
 ## 0.2.0 (2026-10-23)
 

@@ -118,13 +118,17 @@ fn hood_main() -> u8 {
         }
     };
 
-    match rt.block_on(run(cli.command, verbose)) {
+    let code = match rt.block_on(run(cli.command, verbose)) {
         Ok(code) => u8::try_from(code).unwrap_or(1),
         Err(e) => {
             eprintln!("hood: {e:#}");
             EX_SOFTWARE
         }
-    }
+    };
+    // The command is done. An analyzer still loading for a download that
+    // turned out not to need it must not hold up the exit.
+    rt.shutdown_background();
+    code
 }
 
 /// If `argv[0]` is a known tool shim, prepend `hood` and the canonical tool

@@ -21,3 +21,4 @@ pub mod output;
 pub mod proxy;
 pub mod scanner;
 pub mod tools;
+pub(crate) mod verdict_cache;

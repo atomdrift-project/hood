@@ -75,17 +75,37 @@ enum Severity {
 }
 
 impl Assessment {
-    /// The verdict, only if it is a finished analysis of exactly `sha256`.
+    /// The verdict, only if it is a finished analysis of exactly `sha256`, and
+    /// more than an outside citation; see [`Self::cited_only`].
     pub(crate) fn classification(&self, sha256: &str) -> Option<Classification> {
         if self.status != Status::Analyzed || !self.sha256.as_ref()?.eq_ignore_ascii_case(sha256) {
             return None;
         }
         match self.severity {
             Severity::Benign => Some(Classification::Benign),
+            Severity::Suspicious if self.cited_only() => None,
             Severity::Suspicious => Some(Classification::Suspicious),
             Severity::Hostile => Some(Classification::Hostile),
             Severity::Unknown => None,
         }
+    }
+
+    /// Whether a suspicion rests on outside citations alone: every finding
+    /// says where a claim about the bytes came from (`intel/feed/…`), and none
+    /// says what the bytes do.
+    ///
+    /// One feed citing a digest is a reason to look, not a verdict; hood's
+    /// Bloom gate treats the same sighting the same way. Common bytes collect
+    /// such citations for what some other URL once served: the two bytes `OK`
+    /// have one, and blocking on it fails every server that answers so.
+    /// Citations that agree with each other grade hostile, and still stand.
+    pub(crate) fn cited_only(&self) -> bool {
+        self.severity == Severity::Suspicious
+            && !self.findings.is_empty()
+            && self
+                .findings
+                .iter()
+                .all(|finding| finding.id.starts_with("intel/feed/"))
     }
 
     /// Whether this is a finished analysis with a verdict, on whichever
@@ -1095,6 +1115,69 @@ mod tests {
         let client = cached_client(&mock.url, tmp.path());
         let result = client.assess(None, SHA).await.unwrap();
         assert_eq!(result.classification(SHA), Some(Classification::Benign));
+    }
+
+    /// What Beamline answered for the two bytes `OK`, which a telemetry
+    /// endpoint returned: its engine found nothing, and one feed cites the hash.
+    fn lone_citation(sha: &str) -> String {
+        serde_json::json!({
+            "status": "analyzed", "severity": "suspicious", "sha256": sha,
+            "fires_at": 100, "engine_version": "3.0.0-beta.0",
+            "findings": [{
+                "id": "intel/feed/malicious", "crit": 4,
+                "desc": "Cited as malicious by one threat intelligence feed.",
+            }],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_lone_feed_citation_is_not_a_verdict() {
+        let cited = parse_line(lone_citation(SHA).as_bytes()).unwrap().unwrap();
+        assert!(cited.cited_only());
+        assert_eq!(cited.classification(SHA), None);
+        assert!(!cited.is_verdict());
+
+        // Anything the engine saw the bytes do keeps the suspicion standing,
+        // as does a suspicion that names no finding at all.
+        let mut measured = cited.clone();
+        measured.findings.push(Finding {
+            id: "objectives/execution/shell/bash".into(),
+            desc: None,
+        });
+        let mut unexplained = cited;
+        unexplained.findings.clear();
+        for assessment in [measured, unexplained] {
+            assert_eq!(
+                assessment.classification(SHA),
+                Some(Classification::Suspicious)
+            );
+        }
+
+        // Feeds that corroborate each other convict, and still do.
+        let corroborated = lone_citation(SHA).replace("suspicious", "hostile");
+        let corroborated = parse_line(corroborated.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            corroborated.classification(SHA),
+            Some(Classification::Hostile)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lone_feed_citation_is_never_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = server(vec![
+            (200, vec![lone_citation(SHA)]),
+            (200, vec![assessment(SHA, "benign")]),
+        ])
+        .await;
+        let client = cached_client(&mock.url, tmp.path());
+        let cited = client.assess(None, SHA).await.unwrap();
+        assert_eq!(cited.classification(SHA), None);
+        // Asked again rather than answered from disk.
+        let second = client.assess(None, SHA).await.unwrap();
+        assert_eq!(second.classification(SHA), Some(Classification::Benign));
+        assert_eq!(mock.requests.lock().unwrap().len(), 2);
     }
 
     #[test]

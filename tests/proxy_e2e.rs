@@ -86,6 +86,15 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
             .body(Full::new(Bytes::from_static(b"no such package\n")))
             .unwrap());
     }
+    // The shortest bodies: what a telemetry endpoint answers, and the
+    // shortest command that does harm.
+    for (path, body) in [("/ok", "OK"), ("/empty-json", "{}\n"), ("/rm", "rm *")] {
+        if req.uri().path() == path {
+            return Ok(Response::new(Full::new(Bytes::from_static(
+                body.as_bytes(),
+            ))));
+        }
+    }
     let body = if req.uri().path() == "/big" {
         Bytes::from(big_payload())
     } else {
@@ -506,6 +515,37 @@ async fn head_request_is_forwarded_without_scanning() -> Result<()> {
         200,
         "HEAD must be forwarded, not scan-blocked"
     );
+
+    handle.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_too_short_to_hold_a_payload_is_forwarded_unassessed() -> Result<()> {
+    drop(rustls::crypto::ring::default_provider().install_default());
+
+    // BlockAll blocks whatever it is shown, so a 200 proves it was not asked.
+    let origin_addr = start_http_origin().await?;
+    let scanner: Arc<dyn Scanner> = Arc::new(BlockAll);
+    let proxy = Proxy::new(scanner, Config::default())?;
+    let hood_ca = proxy.ca_pem().to_owned();
+    let handle = proxy.spawn().await?;
+    let client = client_with_proxy(handle.addr, &hood_ca);
+
+    for (path, body) in [("/ok", "OK"), ("/empty-json", "{}\n")] {
+        let resp = client
+            .post(format!("http://{origin_addr}{path}"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert_eq!(resp.text().await?, body);
+    }
+    // Four bytes are enough to do harm, and are assessed.
+    let resp = client
+        .get(format!("http://{origin_addr}/rm"))
+        .send()
+        .await?;
+    assert_eq!(resp.status().as_u16(), 451);
 
     handle.stop().await;
     Ok(())

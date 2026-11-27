@@ -12,6 +12,7 @@ All notable changes to hood. Versions follow [semantic versioning](https://semve
 - Strip credentials, queries and fragments from URLs in panels and logs, keeping presigned tokens out of CI.
 - Replace Unicode bidi overrides in panels, blocking Trojan Source-style display spoofing.
 - Breaking: tell Beamline nothing about downloads requested with credentials or cookies; they were looked up by SHA-256.
+- Never ask Beamline about a body under 20 bytes: it can be guessed from its hash, which unrelated servers share. It is analyzed locally.
 
 ### Features
 
@@ -33,13 +34,15 @@ All notable changes to hood. Versions follow [semantic versioning](https://semve
 - Keep Homebrew downloads alive while they are assessed, so brew no longer abandons one held over five seconds.
 - Let Homebrew's git through uninspected, with a notice: brew leaves no way to make it trust hood, so `brew update` and `brew tap` failed.
 - Give git hood's CA through `GIT_SSL_CAINFO`, so git dependencies and `hood exec -- git` no longer fail.
+- Scan locally when Beamline's only ground for suspicion is one threat feed's citation, instead of blocking; any server answering `OK` was blocked.
+- Forward bodies under 4 bytes, such as `OK` and `{}`, without assessing them; nothing that short can do harm.
 
 ### Optimizations
 
 - Ask Beamline about a public package when it is requested, so its analysis overlaps the download.
 - Start local analysis beside a Beamline lookup still unanswered after 250 ms, instead of after it times out.
 - Load the analyzer during a download Beamline cannot know, instead of after it.
-- Remember local passes by SHA-256 until the rules, models or build change, so repeat downloads skip the analyzer.
+- Remember local passes by SHA-256 and URL until the rules, models or build change, so repeat downloads skip the analyzer.
 - Cache Beamline's package analyses for 30 days, as its verdicts by SHA-256 already were.
 - Stop asking Beamline once its quota is spent, until the reset time it gave, across runs.
 - Queue Beamline requests past eight in flight; the fifth parallel download used to fall to local analysis.

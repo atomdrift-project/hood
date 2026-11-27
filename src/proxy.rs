@@ -125,6 +125,12 @@ const KEEPALIVE_BYTES: usize = 256;
 /// a hold of over four minutes.
 const KEEPALIVE_HEAD: usize = 64 * 1024;
 
+/// The shortest body worth assessing. `rm *` is four bytes; nothing shorter
+/// does harm even handed straight to a shell, and what servers do send that
+/// short is `OK`, `{}` and `1`. Such bytes are shared by unrelated servers, so
+/// a verdict on them is a verdict on some other download.
+const MIN_PAYLOAD_BYTES: usize = 4;
+
 /// Hop-by-hop headers per RFC 7230 §6.1. These never propagate end-to-end.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -961,9 +967,14 @@ impl Proxy {
         status: StatusCode,
     ) -> Result<Assessed> {
         Ok(match buffered {
-            Buffered::Memory { bytes, .. } if bytes.is_empty() => {
-                tracing::debug!(url = %ShownUrl(scan_url), "forward (empty body)");
-                Assessed::Forward(full_body(bytes), Some(0))
+            Buffered::Memory { bytes, .. } if bytes.len() < MIN_PAYLOAD_BYTES => {
+                let len = bytes.len() as u64;
+                tracing::debug!(
+                    url = %ShownUrl(scan_url),
+                    bytes = len,
+                    "forward (too short to hold a payload)"
+                );
+                Assessed::Forward(full_body(bytes), Some(len))
             }
             Buffered::Memory { bytes, sha256 } => {
                 let verdict = self

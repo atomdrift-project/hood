@@ -85,6 +85,8 @@ same-file = "1"
 rustls-native-certs = "0.8"
 sha2 = "0.11"
 tempfile = "3"
+# stderr's width, for panel rules. Already in the graph via cleave.
+terminal_size = "0.4"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

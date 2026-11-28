@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal, StderrLock, Write};
 
 use scan::engine::{Reason, TopFinding};
-use scan::model::Classification;
+use scan::model::{Classification, Level};
 use scan::output::Theme;
 
 use crate::scanner::ScanPolicy;
@@ -93,85 +93,129 @@ impl Disposition {
     }
 }
 
-/// Write to stderr: `pretty` on a terminal, `plain` (one line, no escapes)
-/// otherwise, so log aggregators are not smeared with ANSI. Write errors are
-/// dropped: stderr is the diagnostics channel, with nowhere else to complain.
+/// Write to stderr: on a terminal, `pretty` renders a panel's body and
+/// names its heading, and the panel is framed to fit; otherwise `plain`
+/// writes one line without escapes, so log aggregators are not smeared with
+/// ANSI. Write errors are dropped: stderr is the diagnostics channel, with
+/// nowhere else to complain.
 fn to_stderr(
-    pretty: impl FnOnce(&mut StderrLock<'static>, Palette) -> io::Result<()>,
+    pretty: impl FnOnce(&mut Vec<u8>, Palette) -> io::Result<Heading>,
     plain: impl FnOnce(&mut StderrLock<'static>) -> io::Result<()>,
 ) {
     let mut stderr = io::stderr().lock();
     let written = if stderr.is_terminal() {
-        pretty(&mut stderr, Palette::from(scan::output::detect_theme()))
+        let c = Palette::from(scan::output::detect_theme());
+        let mut body = Vec::new();
+        pretty(&mut body, c)
+            .and_then(|heading| write_framed(&mut stderr, c, heading, &body, columns()))
     } else {
         plain(&mut stderr)
     };
     drop(written);
 }
 
-/// Panel width in columns; every rule, top and bottom, ends here.
-const PANEL_WIDTH: usize = 72;
+/// The width of the terminal stderr writes to. Not stdout's: under
+/// `curl … | sh` that is a pipe.
+fn columns() -> usize {
+    terminal_size::terminal_size_of(io::stderr()).map_or(100, |(width, _)| usize::from(width.0))
+}
 
-/// The blank line and `── WORD ───` rule that open a panel.
-fn write_header<W: Write>(w: &mut W, c: Palette, color: Rgb, word: &str) -> io::Result<()> {
-    // "── " before the word and " " after it, then rule to the panel's edge.
-    let fill = PANEL_WIDTH.saturating_sub(word.chars().count() + 4);
+/// The narrowest a panel's rules are drawn, in columns after the indent.
+const MIN_PANEL_WIDTH: usize = 72;
+
+/// The widest they are drawn: room for every line hood writes itself, such
+/// as a report link. Past it, one long command would stretch the frame far
+/// beyond the text it holds; the command runs past the rule instead.
+const MAX_PANEL_WIDTH: usize = 100;
+
+/// Every panel line's left indent.
+const INDENT: usize = 2;
+
+/// Who is speaking, named in every panel's opening rule: the panel lands in
+/// the middle of another tool's output.
+const BRAND: &str = "Atomdrift Hood";
+
+/// The state word of a panel's opening rule, and its color.
+#[derive(Debug, Clone, Copy)]
+struct Heading {
+    word: &'static str,
+    color: Rgb,
+}
+
+/// `body` between rules sized to it: as wide as its longest line, within
+/// [`MIN_PANEL_WIDTH`] and [`MAX_PANEL_WIDTH`], and never past the terminal's
+/// last column but one. A URL or command longer than that runs on; it is
+/// never broken, so it still copies whole.
+fn write_framed<W: Write>(
+    w: &mut W,
+    c: Palette,
+    heading: Heading,
+    body: &[u8],
+    columns: usize,
+) -> io::Result<()> {
+    let longest = String::from_utf8_lossy(body)
+        .lines()
+        .map(|line| visible_width(line).saturating_sub(INDENT))
+        .max()
+        .unwrap_or(0);
+    let width = longest
+        .clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH)
+        .min(columns.saturating_sub(INDENT + 1));
+    // "── " + brand + " · " + word + " ", then rule to the panel's edge.
+    let used = 3 + BRAND.chars().count() + 3 + heading.word.chars().count() + 1;
     writeln!(w)?;
     writeln!(
         w,
-        "  {} {} {}",
-        fg(c.dim, "──"),
-        fg_bold(color, word),
-        fg(c.chrome, &"─".repeat(fill)),
-    )
-}
-
-/// The rule and blank line that close a panel.
-fn write_footer<W: Write>(w: &mut W, c: Palette) -> io::Result<()> {
-    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(PANEL_WIDTH)))?;
+        "  {} {} {} {} {}",
+        fg(c.chrome, "──"),
+        fg(c.dim, BRAND),
+        fg(c.chrome, "·"),
+        fg_bold(heading.color, heading.word),
+        fg(c.chrome, &"─".repeat(width.saturating_sub(used))),
+    )?;
+    w.write_all(body)?;
+    writeln!(w, "  {}", fg(c.chrome, &"─".repeat(width)))?;
     writeln!(w)
 }
 
-/// Emit the compact successful-scan record requested by verbose mode.
+/// Terminal cells a rendered line takes: its characters once escape
+/// sequences are dropped, with the one emoji panels use, `⚡`, two cells.
+fn visible_width(line: &str) -> usize {
+    let mut width = 0;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => {
+                // A color sequence, `ESC [ … m`: skip through its final byte.
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            '⚡' => width += 2,
+            _ => width += 1,
+        }
+    }
+    width
+}
+
+/// Emit the compact successful-scan record requested by verbose mode: with
+/// the local model's risk score, or `None` for a pass Beamline vouched for.
 ///
 /// The score is the model's raw malice probability, not a calibrated posterior;
 /// call it a model risk score to avoid overstating what it means.
-pub fn emit_pass(url: &str, probability: f32) {
-    let risk = probability.clamp(0.0, 1.0) * 100.0;
+pub fn emit_pass(url: &str, probability: Option<f32>) {
     let artifact = artifact_label(url);
+    let basis = probability.map_or_else(
+        || "Beamline".to_owned(),
+        |p| format!("{:.1}% risk score", p.clamp(0.0, 1.0) * 100.0),
+    );
     let mut stderr = std::io::stderr().lock();
     drop(writeln!(
         stderr,
-        "✅ Atomdrift Hood scan passed — {risk:.1}% risk score — {artifact}",
+        "✅ Atomdrift Hood scan passed — {basis} — {artifact}",
     ));
-}
-
-/// Report a remote assessment without inventing a model probability or logging locators.
-pub(crate) fn emit_remote(
-    classification: Classification,
-    disposition: Disposition,
-    policy: ScanPolicy,
-    assessment: &crate::beamline::Assessment,
-) {
-    let mut stderr = std::io::stderr().lock();
-    drop(writeln!(
-        stderr,
-        "hood Beamline verdict={} disposition={} policy={}",
-        classification_label(classification),
-        disposition.verb(),
-        policy_tag(policy),
-    ));
-    if let Some(reason) = &assessment.reason {
-        drop(writeln!(stderr, "  {}", sanitize(reason)));
-    }
-    for finding in assessment.findings.iter().take(3) {
-        drop(writeln!(
-            stderr,
-            "  {} {}",
-            sanitize(&finding.id),
-            sanitize(finding.desc.as_deref().unwrap_or(""))
-        ));
-    }
 }
 
 /// Emit one aggregate line when a verbose invocation scanned multiple downloads.
@@ -211,158 +255,429 @@ fn format_scan_summary(summary: crate::scanner::ScanSummary) -> Option<String> {
     Some(line)
 }
 
-/// Bundle of everything the panel needs to render. Pulled out of the scan
-/// result so the renderer doesn't have to know scan internals beyond the
-/// already-public `TopFinding` / `Reason` types.
+/// Public report page for a payload, keyed by its lower-hex SHA-256.
+const REPORT_URL: &str = "https://sha256.is/";
+
+/// Most evidence lines a panel shows.
+const MAX_EVIDENCE: usize = 3;
+
+/// What reached a verdict panel's classification.
 #[derive(Debug)]
-pub struct Panel<'a> {
+pub(crate) enum Basis<'a> {
+    /// Local static analysis and ML.
+    Local {
+        /// Raw model probability in `[0, 1]`, shown as the risk score.
+        probability: f32,
+        /// The strictest false-positive level the bytes are flagged hostile
+        /// at; hostile at or below hood's L25, suspicious above it.
+        level: Level,
+        /// Top traits, strongest first.
+        traits: &'a [TopFinding],
+        /// Top SHAP-ranked model features.
+        reasons: &'a [Reason],
+    },
+    /// Beamline's verdict on these exact bytes.
+    Beamline,
+    /// A match in the known-bad Bloom filter.
+    KnownBad,
+}
+
+/// What the local Bloom filters' outside claims say of a payload they did
+/// not settle: threat feeds report it, but nothing of Atomdrift's measured it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sighting {
+    /// A lone, unconfirmed report.
+    Lone,
+    /// Reports that agree with each other.
+    Corroborated,
+}
+
+/// Where a verdict's evidence came from, as a panel names it. The words are
+/// the README's: local filters and local analysis on this machine, cloud
+/// analysis from Beamline, and outside threat feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    LocalFilters,
+    LocalAnalysis,
+    CloudAnalysis,
+    OneThreatFeed,
+    ThreatFeeds,
+}
+
+impl Origin {
+    /// How the panel's headline names it.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LocalFilters => "local filters",
+            Self::LocalAnalysis => "local analysis",
+            Self::CloudAnalysis => "cloud analysis",
+            Self::OneThreatFeed => "1 threat feed",
+            Self::ThreatFeeds => "threat feeds",
+        }
+    }
+
+    /// How a single-line record names it.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::LocalFilters => "local-filters",
+            Self::LocalAnalysis => "local-analysis",
+            Self::CloudAnalysis => "cloud-analysis",
+            Self::OneThreatFeed | Self::ThreatFeeds => "threat-feeds",
+        }
+    }
+}
+
+/// One line of evidence: a trait or finding, and how bad it is.
+#[derive(Debug)]
+struct Evidence<'a> {
+    crit: cleave::Criticality,
+    id: &'a str,
+    desc: &'a str,
+}
+
+impl<'a> Evidence<'a> {
+    /// What a person reads, as a dim lead and the text after it: the
+    /// description alone, else the id split before its last component, so
+    /// `anti-static/packer/upx/decompression-failed` leads with what failed.
+    fn parts(&self) -> (&'a str, &'a str) {
+        if !self.desc.trim().is_empty() {
+            return ("", self.desc);
+        }
+        let split = self
+            .id
+            .rfind("::")
+            .map(|i| i + 2)
+            .or_else(|| self.id.rfind('/').map(|i| i + 1))
+            .unwrap_or(0);
+        self.id.split_at(split)
+    }
+}
+
+/// Everything a verdict panel shows: what was decided, on what basis, what
+/// Beamline knows of the bytes, and how to proceed.
+#[derive(Debug)]
+pub(crate) struct Panel<'a> {
     /// The classification driving this panel. Benign is never rendered.
-    pub classification: Classification,
+    pub(crate) classification: Classification,
     /// Whether the body was withheld or forwarded under bypass.
-    pub disposition: Disposition,
+    pub(crate) disposition: Disposition,
     /// Effective policy in force, used to choose the bypass hint.
-    pub policy: ScanPolicy,
-    /// Raw model probability in `[0, 1]`. Displayed as the risk score.
-    pub probability: f32,
+    pub(crate) policy: ScanPolicy,
     /// URL the tool was about to fetch.
-    pub url: &'a str,
-    /// Top traits ranked by `crit × conf`.
-    pub traits: &'a [TopFinding],
-    /// Top SHAP-ranked reasons.
-    pub reasons: &'a [Reason],
+    pub(crate) url: &'a str,
+    /// Lower-hex SHA-256 of the payload.
+    pub(crate) sha256: &'a str,
+    /// What reached the classification.
+    pub(crate) basis: Basis<'a>,
+    /// Beamline's finished analysis of exactly these bytes, when it has one:
+    /// its reason is shown, and its report page linked.
+    pub(crate) beamline: Option<&'a crate::beamline::Assessment>,
+    /// What the local filters' threat-feed claims say of the payload, when
+    /// they make some without settling it.
+    pub(crate) sighting: Option<Sighting>,
     /// Shell-quoted reproducer for the bypass hint, e.g.
-    /// `"curl -fsSL https://example.com/install.sh"`. When empty, the
-    /// hint falls back to a descriptive form (used in unit tests).
-    pub invocation: &'a str,
+    /// `"curl -fsSL https://example.com/install.sh"`. When empty, the hint
+    /// names only the variable.
+    pub(crate) invocation: &'a str,
+}
+
+impl Panel<'_> {
+    /// The report page for these bytes, when Atomdrift holds a record of
+    /// them: cloud analysis, the known-bad filter, or a threat-feed sighting.
+    fn report(&self) -> Option<String> {
+        (self.beamline.is_some()
+            || self.sighting.is_some()
+            || matches!(self.basis, Basis::KnownBad))
+        .then(|| format!("{REPORT_URL}{}", self.sha256))
+    }
+
+    /// Beamline's one-sentence explanation, when it measured the bytes itself.
+    /// A reason that only counts feeds says what the headline already does.
+    fn reason(&self) -> Option<&str> {
+        let record = self.beamline.filter(|r| r.measured())?;
+        record.reason.as_deref().filter(|r| !r.trim().is_empty())
+    }
+
+    /// Every source of the verdict's evidence, in a fixed order.
+    fn origins(&self) -> Vec<Origin> {
+        let mut origins = Vec::with_capacity(3);
+        match self.basis {
+            Basis::KnownBad => origins.push(Origin::LocalFilters),
+            Basis::Local { .. } => origins.push(Origin::LocalAnalysis),
+            Basis::Beamline => {}
+        }
+        if self
+            .beamline
+            .is_some_and(crate::beamline::Assessment::measured)
+        {
+            origins.push(Origin::CloudAnalysis);
+        }
+        // Beamline does not count the feeds behind a citation; only the
+        // filters' lone claim is known to be one.
+        if self
+            .beamline
+            .is_some_and(crate::beamline::Assessment::cited)
+            || self.sighting == Some(Sighting::Corroborated)
+        {
+            origins.push(Origin::ThreatFeeds);
+        } else if self.sighting == Some(Sighting::Lone) {
+            origins.push(Origin::OneThreatFeed);
+        }
+        origins
+    }
+
+    /// What the bytes were seen to do, strongest first: local traits when
+    /// local analysis decided, else Beamline's findings.
+    fn evidence(&self) -> Vec<Evidence<'_>> {
+        match (&self.basis, self.beamline) {
+            (Basis::Local { traits, .. }, _) => traits
+                .iter()
+                .take(MAX_EVIDENCE)
+                .map(|t| Evidence {
+                    crit: t.crit,
+                    id: &t.id,
+                    desc: &t.desc,
+                })
+                .collect(),
+            (_, Some(assessment)) => assessment
+                .findings
+                .iter()
+                .filter(|f| !f.is_citation())
+                .take(MAX_EVIDENCE)
+                .map(|f| Evidence {
+                    crit: f.criticality(),
+                    id: &f.id,
+                    desc: f.desc.as_deref().unwrap_or(""),
+                })
+                .collect(),
+            (_, None) => Vec::new(),
+        }
+    }
+
+    /// The verdict in plain words, as sure as its basis is: known when
+    /// Atomdrift's record holds these bytes as malware, likely when local
+    /// analysis finds them hostile, possible when anything finds them only
+    /// suspicious.
+    const fn verdict(&self) -> &'static str {
+        match (self.classification, &self.basis) {
+            (Classification::Hostile, Basis::Local { .. }) => "Likely malware",
+            (Classification::Hostile, _) => "Known malware",
+            (Classification::Suspicious, _) => "Possible malware",
+            _ => "Unrecognized verdict",
+        }
+    }
+
+    /// Whether the panel names the URL: only when the command shown in the
+    /// bypass hint does not. `curl https://…` says what it fetched; `npm
+    /// install` does not say which of its downloads was blocked.
+    fn shows_url(&self) -> bool {
+        !self.invocation.contains("://")
+    }
+
+    /// How sure the headline is, `60% confident [L25]`: the level local
+    /// analysis placed the bytes at, read as the confidence prism and atomscan
+    /// show for it. 60% and up is hostile at hood's L25, 30% to 60%
+    /// suspicious. The raw model score is left to the log line: it means
+    /// different things on different routes, the level does not.
+    fn confidence(&self) -> Option<String> {
+        let Basis::Local {
+            level: level @ Level::At(_),
+            ..
+        } = self.basis
+        else {
+            return None;
+        };
+        let percent = scan::engine::level_confidence(level)?;
+        Some(format!("{percent}% confident [{level}]"))
+    }
 }
 
 /// Render a verdict panel to stderr.
-pub fn emit(panel: &Panel<'_>) {
+pub(crate) fn emit(panel: &Panel<'_>) {
     to_stderr(|w, c| write_pretty(w, panel, c), |w| write_plain(w, panel));
 }
 
-fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> io::Result<()> {
-    let verdict_color = match p.classification {
+fn write_pretty<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> io::Result<Heading> {
+    let color = match p.classification {
         Classification::Hostile => c.hostile,
         Classification::Suspicious => c.suspicious,
         _ => c.text,
     };
-
-    write_header(w, c, verdict_color, p.disposition.header())?;
-    writeln!(w, "  {}", fg_bold(verdict_color, &friendly_status(p)))?;
-    writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
-
-    if !p.traits.is_empty() {
-        writeln!(w)?;
-        writeln!(w, "  {}", fg(c.dim, "evidence"))?;
-        // The list is already sorted strongest-first; the position carries the
-        // ranking signal, so the per-trait score/criticality numbers would
-        // just be noise.
-        for t in p.traits {
-            writeln!(w, "    {}", fg(c.text, &t.id))?;
-        }
+    let origins: Vec<&str> = p.origins().into_iter().map(Origin::name).collect();
+    write!(
+        w,
+        "  {} {} {}",
+        fg_bold(color, p.verdict()),
+        fg(c.chrome, "·"),
+        fg(c.dim, &origins.join(", ")),
+    )?;
+    if let Some(confidence) = p.confidence() {
+        write!(w, " {} {}", fg(c.chrome, "·"), fg(color, &confidence))?;
+    }
+    writeln!(w)?;
+    if p.shows_url() {
+        writeln!(w, "  {}", fg(c.text, &ShownUrl(p.url).to_string()))?;
     }
 
-    if !p.reasons.is_empty() {
+    // The detail rows lead with atomscan's markers: ⚡ for cloud analysis's
+    // word, severity dots for each piece of evidence.
+    let reason = p.reason();
+    let evidence = p.evidence();
+    if reason.is_some() || !evidence.is_empty() {
         writeln!(w)?;
-        let names: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
+    }
+    if let Some(reason) = reason {
+        let mut lead = rail("⚡", 2);
+        for line in wrap(&sanitize(reason), MIN_PANEL_WIDTH - RAIL_WIDTH) {
+            writeln!(w, "  {lead}{}", fg_bold(c.text, &line))?;
+            lead = rail("", 0);
+        }
+    }
+    for e in evidence {
+        let (dots, color) = match e.crit {
+            cleave::Criticality::Hostile => ("●●●", c.hostile),
+            cleave::Criticality::Suspicious => ("●●", c.suspicious),
+            cleave::Criticality::Notable => ("●", c.accent),
+            _ => ("·", c.dim),
+        };
+        let lead = rail(&fg(color, dots), dots.chars().count());
+        let (namespace, name) = e.parts();
         writeln!(
             w,
-            "  {}  {}",
-            fg(c.dim, "model"),
-            fg(c.text, &names.join(", ")),
+            "  {lead}{}{}",
+            fg(c.dim, &sanitize(namespace)),
+            fg(c.text, &sanitize(name))
         )?;
     }
 
     writeln!(w)?;
-    write_bypass_hint(w, p, c)?;
-    write_footer(w, c)
-}
-
-fn write_bypass_hint<W: Write>(w: &mut W, p: &Panel<'_>, c: Palette) -> io::Result<()> {
-    let inv = p.invocation;
-    match (p.disposition, p.classification, p.policy) {
-        // Already forwarded — show what's active.
-        (Disposition::Forwarded, _, policy) => writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "active:"),
-            fg(c.accent, policy_tag(policy)),
-        ),
-        // Blocked suspicious: minimum knob is =2; =3 also works.
-        (Disposition::Blocked, Classification::Suspicious, _) => {
-            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=2", inv)
-        }
-        // Blocked hostile: only HOOD_BYPASS=3 would let it through.
-        (Disposition::Blocked, Classification::Hostile, _) => {
-            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=3", inv)
-        }
-        _ => Ok(()),
+    match p.report() {
+        Some(report) => writeln!(w, "  {} {}", fg(c.dim, "Details:"), fg(c.accent, &report))?,
+        None => writeln!(w, "  {} {}", fg(c.dim, "SHA-256:"), fg(c.text, p.sha256))?,
     }
+    match (p.disposition, p.classification) {
+        (Disposition::Forwarded, _) => write_allowed(w, c, p.policy)?,
+        // The lowest level that lets this through: =2 for suspicious, and
+        // only =3 for hostile.
+        (Disposition::Blocked, Classification::Suspicious) => {
+            write_command_hint(w, c, "To download anyway:", "HOOD_BYPASS=2", p.invocation)?;
+        }
+        (Disposition::Blocked, Classification::Hostile) => write_command_hint(
+            w,
+            c,
+            "To download anyway (not recommended):",
+            "HOOD_BYPASS=3",
+            p.invocation,
+        )?,
+        _ => {}
+    }
+    Ok(Heading {
+        word: p.disposition.header(),
+        color,
+    })
 }
 
-/// Render one "label: `HOOD_BYPASS=N` <command>" line. If no command was
-/// supplied (e.g. unit tests), fall back to a descriptive parenthetical.
+/// Columns a row's marker rail takes: a 3-cell marker and a 1-cell gutter.
+const RAIL_WIDTH: usize = 4;
+
+/// `marker`, `width` cells wide, padded to the rail so the text after every
+/// marker starts in one column. Emoji are two cells; dots are one each.
+fn rail(marker: &str, width: usize) -> String {
+    format!("{marker}{}", " ".repeat(RAIL_WIDTH.saturating_sub(width)))
+}
+
+/// `text` broken at spaces into lines of at most `width` columns; a word
+/// longer than that gets a line of its own.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// The closing line of a panel whose download went through anyway.
+fn write_allowed<W: Write>(w: &mut W, c: Palette, policy: ScanPolicy) -> io::Result<()> {
+    writeln!(
+        w,
+        "  {} {}",
+        fg(c.dim, "Allowed by"),
+        fg(c.accent, policy_tag(policy))
+    )
+}
+
+/// The `instruction` line, then the command that follows it on its own line,
+/// ready to copy. Without a command (unit tests), only the variable.
 fn write_command_hint<W: Write>(
     w: &mut W,
-    c: &Palette,
-    label: &str,
+    c: Palette,
+    instruction: &str,
     env: &str,
     invocation: &str,
 ) -> io::Result<()> {
+    writeln!(w, "  {}", fg(c.dim, instruction))?;
     if invocation.is_empty() {
-        writeln!(w, "  {}  {}", fg(c.dim, label), fg(c.accent, env))
+        writeln!(w, "  {}", fg(c.accent, env))
     } else {
         writeln!(
             w,
-            "  {}  {} {}",
-            fg(c.dim, label),
+            "  {} {}",
             fg(c.accent, env),
             fg(c.text, sanitize(invocation).as_ref()),
         )
     }
 }
 
-/// Plain-text fallback for non-TTY stderr (CI logs, file redirection).
-/// Single line, structured-ish, no escape codes.
+/// Plain-text fallback for non-TTY stderr (CI logs, file redirection): one
+/// line of `key=value` fields, the free-text reason last, no escape codes.
 fn write_plain<W: Write>(w: &mut W, p: &Panel<'_>) -> io::Result<()> {
-    let traits = p
-        .traits
-        .iter()
-        .map(|finding| finding.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let reasons: Vec<&str> = p.reasons.iter().map(|r| r.feature.as_str()).collect();
-    writeln!(
+    write!(
         w,
-        "{}; hood {} url={} verdict={} probability={:.3} traits=[{}] reasons=[{}]",
-        friendly_status(p),
+        "hood {} verdict={} origin={} url={} sha256={}",
         p.disposition.verb(),
-        ShownUrl(p.url),
         classification_label(p.classification),
-        p.probability,
-        traits,
-        reasons.join(", "),
-    )
-}
-
-fn friendly_status(p: &Panel<'_>) -> String {
-    let risk = p.probability.clamp(0.0, 1.0) * 100.0;
-    match (p.classification, p.disposition) {
-        (Classification::Suspicious, Disposition::Blocked) => format!(
-            "⚠️ Atomdrift Hood flagged this download as suspicious — {risk:.1}% risk score — BLOCKED"
-        ),
-        (Classification::Suspicious, Disposition::Forwarded) => format!(
-            "⚠️ Atomdrift Hood flagged this download as suspicious — {risk:.1}% risk score — allowed by policy"
-        ),
-        (Classification::Hostile, Disposition::Blocked) => {
-            format!("🛑 Atomdrift Hood blocked a high-risk download — {risk:.1}% risk score")
-        }
-        (Classification::Hostile, Disposition::Forwarded) => format!(
-            "🛑 Atomdrift Hood flagged a high-risk download — {risk:.1}% risk score — allowed by policy"
-        ),
-        _ => format!("Atomdrift Hood scan result — {risk:.1}% risk score"),
+        p.origins()
+            .into_iter()
+            .map(Origin::tag)
+            .collect::<Vec<_>>()
+            .join(","),
+        ShownUrl(p.url),
+        p.sha256,
+    )?;
+    if let Basis::Local {
+        probability, level, ..
+    } = p.basis
+    {
+        write!(w, " risk={:.3} level={level}", probability.clamp(0.0, 1.0))?;
     }
+    if let Some(report) = p.report() {
+        write!(w, " report={report}")?;
+    }
+    write!(w, " policy={}", policy_tag(p.policy))?;
+    let evidence: Vec<&str> = p.evidence().iter().map(|e| e.id).collect();
+    if !evidence.is_empty() {
+        write!(w, " evidence=[{}]", sanitize(&evidence.join(", ")))?;
+    }
+    if let Basis::Local { reasons, .. } = p.basis
+        && !reasons.is_empty()
+    {
+        let names: Vec<&str> = reasons.iter().map(|r| r.feature.as_str()).collect();
+        write!(w, " model=[{}]", names.join(", "))?;
+    }
+    if let Some(reason) = p.reason() {
+        write!(w, " reason={}", sanitize(reason))?;
+    }
+    writeln!(w)
 }
 
 fn artifact_label(raw_url: &str) -> String {
@@ -427,131 +742,30 @@ fn write_scan_error_pretty<W: Write>(
     w: &mut W,
     p: &ScanErrorPanel<'_>,
     c: Palette,
-) -> io::Result<()> {
-    write_header(w, c, c.suspicious, p.disposition.header())?;
-    writeln!(
-        w,
-        "  {}  {}",
-        fg(c.dim, "scan-error"),
-        fg_bold(c.text, &ShownUrl(p.url).to_string())
-    )?;
+) -> io::Result<Heading> {
+    writeln!(w, "  {}", fg_bold(c.suspicious, "Scan failed"))?;
+    if !p.invocation.contains("://") {
+        writeln!(w, "  {}", fg(c.text, &ShownUrl(p.url).to_string()))?;
+    }
     writeln!(w)?;
     writeln!(
         w,
-        "  {}  {}",
-        fg(c.dim, "reason:"),
+        "  {} {}",
+        fg(c.dim, "Error:"),
         fg(c.text, sanitize(p.error).as_ref())
     )?;
     writeln!(w)?;
     match p.disposition {
-        Disposition::Forwarded => writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "active:"),
-            fg(c.accent, policy_tag(p.policy)),
-        )?,
+        Disposition::Forwarded => write_allowed(w, c, p.policy)?,
+        // The lowest level that lets this through.
         Disposition::Blocked => {
-            // Suggest the minimum tier that would have allowed this — =1.
-            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=1", p.invocation)?;
+            write_command_hint(w, c, "To download anyway:", "HOOD_BYPASS=1", p.invocation)?;
         }
     }
-    write_footer(w, c)
-}
-
-/// Base of the atomdrift lab file view. The payload's SHA-256 is appended to
-/// form a permalink to its full report — the actionable next step on a
-/// known-bad block.
-const LAB_FILE_URL: &str = "https://lab.atomdrift.org/file/";
-
-/// Context for a known-bad panel.
-///
-/// The payload matched the known-bad bloom
-/// filter (by content hash or PURL) and was blocked without an ML scan. Distinct
-/// from [`Panel`] because there is no classification, probability, or trait
-/// evidence — the verdict is the match itself.
-#[derive(Debug)]
-pub struct KnownBadPanel<'a> {
-    /// URL the tool was about to fetch.
-    pub url: &'a str,
-    /// Lower-hex SHA-256 of the payload; forms the lab permalink.
-    pub sha256: &'a str,
-    /// Effective policy, for the bypass hint / active tag.
-    pub policy: ScanPolicy,
-    /// Whether the body was withheld or forwarded (under `HOOD_BYPASS=3`).
-    pub disposition: Disposition,
-    /// Shell-quoted reproducer for the bypass hint.
-    pub invocation: &'a str,
-    /// Beamline's explanation of the match, one line each (its reason, then
-    /// its leading findings), when it confirms the payload is bad. Empty when
-    /// Beamline is disabled, unreachable, or disagrees.
-    pub beamline: &'a [String],
-}
-
-/// Render a known-bad panel to stderr.
-pub fn emit_known_bad(p: &KnownBadPanel<'_>) {
-    to_stderr(
-        |w, c| write_known_bad_pretty(w, p, c),
-        |w| write_known_bad_plain(w, p),
-    );
-}
-
-fn write_known_bad_plain<W: Write>(w: &mut W, p: &KnownBadPanel<'_>) -> io::Result<()> {
-    writeln!(
-        w,
-        "hood known-bad url={url} sha256={sha} lab={LAB_FILE_URL}{sha} policy={policy} disposition={verb}",
-        url = ShownUrl(p.url),
-        sha = p.sha256,
-        policy = policy_tag(p.policy),
-        verb = p.disposition.verb(),
-    )?;
-    for line in p.beamline {
-        writeln!(w, "  {}", sanitize(line))?;
-    }
-    Ok(())
-}
-
-fn write_known_bad_pretty<W: Write>(
-    w: &mut W,
-    p: &KnownBadPanel<'_>,
-    c: Palette,
-) -> io::Result<()> {
-    write_header(w, c, c.hostile, p.disposition.header())?;
-    writeln!(
-        w,
-        "  {}  {}",
-        fg_bold(c.hostile, "known bad package"),
-        fg_bold(c.text, &ShownUrl(p.url).to_string()),
-    )?;
-    writeln!(w)?;
-    writeln!(
-        w,
-        "  {}  {}",
-        fg(c.dim, "lab:"),
-        fg(c.accent, &format!("{LAB_FILE_URL}{}", p.sha256)),
-    )?;
-    for (i, line) in p.beamline.iter().enumerate() {
-        let label = if i == 0 { "beamline:" } else { "         " };
-        writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, label),
-            fg(c.text, sanitize(line).as_ref()),
-        )?;
-    }
-    writeln!(w)?;
-    match p.disposition {
-        Disposition::Forwarded => writeln!(
-            w,
-            "  {}  {}",
-            fg(c.dim, "active:"),
-            fg(c.accent, policy_tag(p.policy)),
-        )?,
-        // Only HOOD_BYPASS=3 would forward a known-bad match.
-        Disposition::Blocked => {
-            write_command_hint(w, &c, "to allow:", "HOOD_BYPASS=3", p.invocation)?;
-        }
-    }
-    write_footer(w, c)
+    Ok(Heading {
+        word: p.disposition.header(),
+        color: c.suspicious,
+    })
 }
 
 /// Context for an unscanned-download panel.
@@ -582,17 +796,26 @@ fn write_unscanned_pretty<W: Write>(
     w: &mut W,
     p: &UnscannedPanel<'_>,
     c: Palette,
-) -> io::Result<()> {
-    write_header(w, c, c.suspicious, "UNSCANNED")?;
-    writeln!(w, "  {}", fg_bold(c.suspicious, &unscanned_status(p)))?;
-    writeln!(w, "  {}", fg_bold(c.text, &ShownUrl(p.url).to_string()))?;
-    write_footer(w, c)
+) -> io::Result<Heading> {
+    writeln!(
+        w,
+        "  {}",
+        fg_bold(
+            c.suspicious,
+            &format!("Forwarded unscanned — {}", unscanned_status(p))
+        )
+    )?;
+    writeln!(w, "  {}", fg(c.text, &ShownUrl(p.url).to_string()))?;
+    Ok(Heading {
+        word: "UNSCANNED",
+        color: c.suspicious,
+    })
 }
 
 fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> io::Result<()> {
     writeln!(
         w,
-        "{}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={}",
+        "Not scanned: {}; hood forward url={} verdict=unscanned size_bytes={} limit_bytes={}",
         unscanned_status(p),
         ShownUrl(p.url),
         p.size
@@ -603,10 +826,8 @@ fn write_unscanned_plain<W: Write>(w: &mut W, p: &UnscannedPanel<'_>) -> io::Res
 
 fn unscanned_status(p: &UnscannedPanel<'_>) -> String {
     let limit = human_size(p.limit);
-    let size = p.size.map_or_else(|| "it".to_owned(), human_size);
-    format!(
-        "⚠️ Atomdrift Hood forwarded this download unscanned — {size} is over the {limit} inspection limit"
-    )
+    let size = p.size.map_or_else(|| "Size".to_owned(), human_size);
+    format!("{size} exceeds the {limit} scan limit")
 }
 
 /// A byte count in binary megabytes or gigabytes, rounded to one decimal.
@@ -628,7 +849,7 @@ fn human_size(bytes: u64) -> String {
 /// failure aborts the run before this is ever called.
 pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
     to_stderr(
-        |w, c| write_failsafe_pretty(w, invocation, policy, reason, c),
+        |w, c| write_failsafe_pretty(w, policy, reason, c),
         |w| {
             writeln!(
                 w,
@@ -643,33 +864,24 @@ pub fn emit_failsafe(invocation: &str, policy: ScanPolicy, reason: &str) {
 
 fn write_failsafe_pretty<W: Write>(
     w: &mut W,
-    invocation: &str,
     policy: ScanPolicy,
     reason: &str,
     c: Palette,
-) -> io::Result<()> {
-    write_header(w, c, c.suspicious, "UNSCANNED")?;
+) -> io::Result<Heading> {
+    writeln!(w, "  {}", fg_bold(c.suspicious, "Scanner unavailable"))?;
+    writeln!(w)?;
     writeln!(
         w,
         "  {} {}",
-        fg(c.dim, "proxy unavailable:"),
-        fg(c.text, sanitize(reason).as_ref()),
+        fg(c.dim, "Error:"),
+        fg(c.text, sanitize(reason).as_ref())
     )?;
-    if !invocation.is_empty() {
-        writeln!(
-            w,
-            "  {} {}",
-            fg(c.dim, "running:"),
-            fg(c.text, sanitize(invocation).as_ref()),
-        )?;
-    }
-    writeln!(
-        w,
-        "  {} {}",
-        fg(c.accent, policy_tag(policy)),
-        fg(c.dim, "active — passing through without inspection"),
-    )?;
-    write_footer(w, c)
+    writeln!(w)?;
+    write_allowed(w, c, policy)?;
+    Ok(Heading {
+        word: "UNSCANNED",
+        color: c.suspicious,
+    })
 }
 
 const fn policy_tag(p: ScanPolicy) -> &'static str {
@@ -681,7 +893,7 @@ const fn policy_tag(p: ScanPolicy) -> &'static str {
     }
 }
 
-const fn classification_label(c: Classification) -> &'static str {
+pub(crate) const fn classification_label(c: Classification) -> &'static str {
     match c {
         Classification::Hostile => "hostile",
         Classification::Suspicious => "suspicious",
@@ -796,12 +1008,14 @@ mod tests {
         assert_eq!(sanitize("a\tb"), "a\tb");
     }
 
-    fn trait_(id: &str, crit: cleave::Criticality, conf: f32) -> TopFinding {
+    const SHA: &str = "b5cf68c7cb5bb2d21d60bf6654926f61566d95bfd7c9f9e182d032f1da5b4605";
+
+    fn trait_(id: &str, crit: cleave::Criticality, desc: &str) -> TopFinding {
         TopFinding {
             id: id.into(),
             crit,
-            conf,
-            desc: String::new(),
+            conf: 0.9,
+            desc: desc.into(),
         }
     }
 
@@ -814,73 +1028,410 @@ mod tests {
         }
     }
 
-    fn panel<'a>(
-        traits: &'a [TopFinding],
-        reasons: &'a [Reason],
+    fn assessment(json: serde_json::Value) -> crate::beamline::Assessment {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn local(
+        traits: &[TopFinding],
         classification: Classification,
         disposition: Disposition,
         policy: ScanPolicy,
-    ) -> Panel<'a> {
+    ) -> Panel<'_> {
         Panel {
             classification,
             disposition,
             policy,
-            probability: 0.7,
             url: "https://example.com/foo.sh",
-            traits,
-            reasons,
+            sha256: SHA,
+            basis: Basis::Local {
+                probability: 0.7,
+                level: Level::At(10),
+                traits,
+                reasons: &[],
+            },
+            beamline: None,
+            sighting: None,
             invocation: "",
         }
     }
 
-    #[test]
-    fn plain_output_includes_url_and_verdict() {
-        let traits = vec![trait_(
-            "exec/shell::bash",
-            cleave::Criticality::Hostile,
-            0.95,
-        )];
-        let reasons = vec![reason_("crit_count:suspicious")];
-        let p = panel(
-            &traits,
-            &reasons,
-            Classification::Hostile,
-            Disposition::Blocked,
-            ScanPolicy::Strict,
-        );
+    /// A panel as a terminal `columns` wide shows it, escapes stripped.
+    fn framed(
+        columns: usize,
+        pretty: impl FnOnce(&mut Vec<u8>, Palette) -> io::Result<Heading>,
+    ) -> String {
+        let c = Palette::dark();
+        let mut body = Vec::new();
+        let heading = pretty(&mut body, c).unwrap();
+        let mut out = Vec::new();
+        write_framed(&mut out, c, heading, &body, columns).unwrap();
+        strip_ansi(&String::from_utf8(out).unwrap())
+    }
+
+    fn pretty(p: &Panel<'_>) -> String {
+        framed(200, |w, c| write_pretty(w, p, c))
+    }
+
+    fn plain(p: &Panel<'_>) -> String {
         let mut buf = Vec::new();
-        write_plain(&mut buf, &p).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("hood block"));
-        assert!(s.contains("verdict=hostile"));
-        assert!(s.contains("https://example.com/foo.sh"));
-        assert!(s.contains("exec/shell::bash"));
-        assert!(s.contains("crit_count:suspicious"));
-        assert!(s.contains("Atomdrift Hood blocked a high-risk download"));
+        write_plain(&mut buf, p).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The GitHub release download that prompted this layout: a local
+    /// hostile verdict Beamline had not analyzed.
+    #[test]
+    fn local_block_reads_like_atomscan() {
+        let traits = [
+            trait_(
+                "objectives/collection/monitor/capture::go-websocket-ffmpeg-audio-video-capture",
+                cleave::Criticality::Hostile,
+                "Captures audio and video with ffmpeg and streams it over a WebSocket",
+            ),
+            trait_(
+                "objectives/credential-access/browser/firefox::go-multi-browser-credential-collection",
+                cleave::Criticality::Suspicious,
+                "",
+            ),
+        ];
+        let p = Panel {
+            url: "https://release-assets.githubusercontent.com/asset/1474925739/99707390?sp=r&sig=secret",
+            invocation: "curl -LO https://github.com/x/y/releases/download/z/a.exe",
+            ..local(
+                &traits,
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let s = pretty(&p);
+        assert!(s.contains("── Atomdrift Hood · BLOCKED ──"), "{s}");
+        assert!(
+            s.contains("  Likely malware · local analysis · 70% confident [L10]\n"),
+            "{s}"
+        );
+        // The command names what was fetched; the redirect target is noise.
+        assert!(!s.contains("release-assets"), "{s}");
+        assert!(!s.contains("secret"), "{s}");
+        // Descriptions read first; an id without one leads with its leaf.
+        assert!(
+            s.contains("  ●●● Captures audio and video with ffmpeg"),
+            "{s}"
+        );
+        assert!(
+            s.contains("  ●●  objectives/credential-access/browser/firefox::go-multi-browser"),
+            "{s}"
+        );
+        // Nothing Beamline knows: the bare hash, no report link, no ⚡.
+        assert!(s.contains(&format!("  SHA-256: {SHA}\n")), "{s}");
+        assert!(!s.contains("sha256.is") && !s.contains('⚡'), "{s}");
+        assert!(
+            s.contains("To download anyway (not recommended):\n  HOOD_BYPASS=3 curl -LO https://github.com/"),
+            "{s}"
+        );
+        assert!(!s.contains('🛑'), "{s}");
+    }
+
+    /// The known-bad MIPS loader: Beamline confirms it, with findings that
+    /// carry no description.
+    #[test]
+    fn known_bad_block_links_report_and_shows_beamline_reason() {
+        let record = assessment(serde_json::json!({
+            "status": "analyzed", "severity": "hostile", "sha256": SHA,
+            "reason": "Packed MIPS binary with high entropy",
+            "findings": [
+                {"id": "anti-static/packer/upx/decompression-failed", "crit": 5},
+                {"id": "objectives/anti-static/pack/detect::upx-marked-sectionless-loader", "crit": 4},
+                {"id": "anti-static/packer/upx", "crit": 3},
+            ],
+        }));
+        let p = Panel {
+            classification: Classification::Hostile,
+            disposition: Disposition::Blocked,
+            policy: ScanPolicy::Strict,
+            url: "http://125.41.227.76:47512/i",
+            sha256: SHA,
+            basis: Basis::KnownBad,
+            beamline: Some(&record),
+            sighting: None,
+            invocation: "curl http://125.41.227.76:47512/i",
+        };
+        let s = pretty(&p);
+        assert!(
+            s.contains("  Known malware · local filters, cloud analysis\n"),
+            "{s}"
+        );
+        assert_eq!(s.matches("125.41.227.76").count(), 1, "{s}");
+        assert!(
+            s.contains("  ⚡  Packed MIPS binary with high entropy\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+            "{s}"
+        );
+        assert!(
+            s.contains("  ●●● anti-static/packer/upx/decompression-failed\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("  ●●  objectives/anti-static/pack/detect::upx-marked"),
+            "{s}"
+        );
+        assert!(s.contains("  ●   anti-static/packer/upx\n"), "{s}");
+        assert!(
+            s.contains("\n  HOOD_BYPASS=3 curl http://125.41.227.76:47512/i\n"),
+            "{s}"
+        );
+        assert!(!s.contains("lab.atomdrift.org"), "{s}");
+
+        let line = plain(&p);
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.starts_with(&format!(
+            "hood block verdict=hostile origin=local-filters,cloud-analysis url=http://125.41.227.76:47512/i sha256={SHA} report=https://sha256.is/{SHA} policy=HOOD_BYPASS=0 evidence=["
+        )), "{line}");
+        assert!(
+            line.ends_with(" reason=Packed MIPS binary with high entropy\n"),
+            "{line}"
+        );
     }
 
     #[test]
-    fn friendly_status_distinguishes_suspicious_policy_action() {
-        let blocked = panel(
-            &[],
-            &[],
-            Classification::Suspicious,
-            Disposition::Blocked,
-            ScanPolicy::Strict,
+    fn known_bad_without_beamline_still_links_report() {
+        let p = Panel {
+            basis: Basis::KnownBad,
+            invocation: "npm install evil",
+            ..local(
+                &[],
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let s = pretty(&p);
+        assert!(
+            s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+            "{s}"
         );
-        assert_eq!(
-            friendly_status(&blocked),
-            "⚠️ Atomdrift Hood flagged this download as suspicious — 70.0% risk score — BLOCKED"
-        );
+        assert!(s.contains("  Known malware · local filters\n"), "{s}");
+        assert!(s.contains("HOOD_BYPASS=3 npm install evil"), "{s}");
+        assert!(s.contains("  https://example.com/foo.sh\n"), "{s}");
+        assert!(!s.contains('⚡'), "{s}");
+    }
 
-        let forwarded = panel(
-            &[],
-            &[],
-            Classification::Suspicious,
-            Disposition::Forwarded,
-            ScanPolicy::AllowSuspicious,
+    #[test]
+    fn beamline_verdict_shows_reason_report_and_findings() {
+        let record = assessment(serde_json::json!({
+            "status": "analyzed", "severity": "hostile", "sha256": SHA,
+            "reason": "steals credentials", "analyzed_at": "2026-11-20T08:00:00Z",
+            "findings": [{"id": "exfil/ssh-key", "crit": 5, "desc": "reads ~/.ssh"}],
+        }));
+        let p = Panel {
+            basis: Basis::Beamline,
+            beamline: Some(&record),
+            ..local(
+                &[],
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let s = pretty(&p);
+        assert!(s.contains("  Known malware · cloud analysis\n"), "{s}");
+        assert!(!s.contains("% confident"), "{s}");
+        assert!(s.contains("  ⚡  steals credentials\n"), "{s}");
+        assert!(
+            s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+            "{s}"
         );
-        assert!(friendly_status(&forwarded).contains("allowed by policy"));
+        assert!(s.contains("  ●●● reads ~/.ssh\n"), "{s}");
+        assert!(plain(&p).contains(" origin=cloud-analysis "));
+    }
+
+    /// A feed's citation does not settle the bytes, but it explains a local
+    /// block: its reason and report ride along, marked as a sighting.
+    #[test]
+    fn local_block_carries_beamline_sighting() {
+        let record = assessment(serde_json::json!({
+            "status": "analyzed", "severity": "suspicious", "sha256": SHA,
+            "reason": "Cited as malicious by 1 threat intelligence feed.",
+            "findings": [{"id": "intel/feed/malicious", "crit": 4}],
+        }));
+        let traits = [trait_(
+            "exec/shell::bash",
+            cleave::Criticality::Hostile,
+            "Runs bash",
+        )];
+        let p = Panel {
+            beamline: Some(&record),
+            ..local(
+                &traits,
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let s = pretty(&p);
+        assert!(
+            s.contains("  Likely malware · local analysis, threat feeds · 70% confident [L10]\n"),
+            "{s}"
+        );
+        // A reason that only counts feeds repeats the headline.
+        assert!(
+            !s.contains('⚡') && !s.contains("Cited as malicious"),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+            "{s}"
+        );
+        // Local analysis decided, so its traits are the evidence.
+        assert!(s.contains("●●● Runs bash"), "{s}");
+        assert!(!s.contains("intel/feed"), "{s}");
+        assert!(
+            plain(&p).contains(" origin=local-analysis,threat-feeds "),
+            "{}",
+            plain(&p)
+        );
+    }
+
+    /// Agreeing feeds settle a verdict in the cloud with nothing measured:
+    /// the headline names them, and no citation is listed as evidence.
+    #[test]
+    fn feeds_only_cloud_verdict_names_threat_feeds() {
+        let record = assessment(serde_json::json!({
+            "status": "analyzed", "severity": "hostile", "sha256": SHA,
+            "reason": "Cited as malicious by 3 independent threat intelligence feeds.",
+            "findings": [{"id": "intel/feed/malicious", "crit": 5}],
+        }));
+        let p = Panel {
+            basis: Basis::Beamline,
+            beamline: Some(&record),
+            ..local(
+                &[],
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let s = pretty(&p);
+        assert!(s.contains("  Known malware · threat feeds\n"), "{s}");
+        assert!(!s.contains('⚡') && !s.contains('●'), "{s}");
+        assert!(
+            s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+            "{s}"
+        );
+    }
+
+    /// The filters know of a lone feed report, with no cloud asked: it still
+    /// shows, and links Atomdrift's record.
+    #[test]
+    fn filter_sighting_shows_without_the_cloud() {
+        let traits = [trait_(
+            "exec/shell::bash",
+            cleave::Criticality::Hostile,
+            "Runs bash",
+        )];
+        for (sighting, origin) in [
+            (Sighting::Lone, "1 threat feed"),
+            (Sighting::Corroborated, "threat feeds"),
+        ] {
+            let p = Panel {
+                sighting: Some(sighting),
+                ..local(
+                    &traits,
+                    Classification::Hostile,
+                    Disposition::Blocked,
+                    ScanPolicy::Strict,
+                )
+            };
+            let s = pretty(&p);
+            assert!(
+                s.contains(&format!(
+                    "  Likely malware · local analysis, {origin} · 70% confident [L10]\n"
+                )),
+                "{s}"
+            );
+            assert!(
+                s.contains(&format!("  Details: https://sha256.is/{SHA}\n")),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn beamline_text_is_sanitized_and_wrapped_under_the_rail() {
+        let reason = format!(
+            "credential theft\u{1b}[31m {}",
+            "exfiltrates data ".repeat(10)
+        );
+        let record = assessment(serde_json::json!({
+            "status": "analyzed", "severity": "hostile", "sha256": SHA,
+            "reason": reason,
+            "findings": [{"id": "exfil/x", "crit": 5, "desc": "evil\u{202e}txt"}],
+        }));
+        let p = Panel {
+            basis: Basis::Beamline,
+            beamline: Some(&record),
+            ..local(
+                &[],
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        let mut buf = Vec::new();
+        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(
+            !raw.contains("\u{1b}[31m") && !raw.contains('\u{202e}'),
+            "{raw:?}"
+        );
+        let s = strip_ansi(&raw);
+        let reason_lines: Vec<&str> = s
+            .lines()
+            .skip_while(|l| !l.contains('⚡'))
+            .take_while(|l| !l.contains('●'))
+            .collect();
+        assert!(reason_lines.len() > 1, "{s}");
+        for line in &reason_lines[1..] {
+            assert!(
+                line.starts_with("      ") && line.chars().count() <= INDENT + MIN_PANEL_WIDTH,
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_output_is_one_structured_line() {
+        let traits = [trait_(
+            "exec/shell::bash",
+            cleave::Criticality::Hostile,
+            "Runs bash",
+        )];
+        let reasons = [reason_("crit_count:suspicious")];
+        let p = Panel {
+            basis: Basis::Local {
+                probability: 0.7,
+                level: Level::At(10),
+                traits: &traits,
+                reasons: &reasons,
+            },
+            ..local(
+                &[],
+                Classification::Hostile,
+                Disposition::Blocked,
+                ScanPolicy::Strict,
+            )
+        };
+        assert_eq!(
+            plain(&p),
+            format!(
+                "hood block verdict=hostile origin=local-analysis url=https://example.com/foo.sh sha256={SHA} \
+                 risk=0.700 level=L10 policy=HOOD_BYPASS=0 evidence=[exec/shell::bash] model=[crit_count:suspicious]\n"
+            )
+        );
     }
 
     #[test]
@@ -916,57 +1467,102 @@ mod tests {
     }
 
     #[test]
-    fn pretty_hint_uses_command_when_provided_for_hostile() {
-        let p = Panel {
-            classification: Classification::Hostile,
-            disposition: Disposition::Blocked,
-            policy: ScanPolicy::Strict,
-            probability: 0.9,
-            url: "https://x/install.sh",
-            traits: &[],
-            reasons: &[],
-            invocation: "curl -fsSL https://x/install.sh",
-        };
-        let mut buf = Vec::new();
-        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=3 curl -fsSL https://x/install.sh"));
+    fn hints_name_the_lowest_level_that_would_allow() {
+        for (classification, level, absent) in [
+            (
+                Classification::Suspicious,
+                "HOOD_BYPASS=2",
+                ["HOOD_BYPASS=1", "HOOD_BYPASS=3"],
+            ),
+            (
+                Classification::Hostile,
+                "HOOD_BYPASS=3",
+                ["HOOD_BYPASS=1", "HOOD_BYPASS=2"],
+            ),
+        ] {
+            let p = Panel {
+                invocation: "curl -fsSL https://x/install.sh",
+                ..local(
+                    &[],
+                    classification,
+                    Disposition::Blocked,
+                    ScanPolicy::Strict,
+                )
+            };
+            let s = pretty(&p);
+            assert!(
+                s.contains(&format!("  {level} curl -fsSL https://x/install.sh\n")),
+                "{s}"
+            );
+            for other in absent {
+                assert!(!s.contains(other), "{s}");
+            }
+        }
+    }
+
+    /// The level is what hood's L25 was compared against, so its confidence
+    /// is what tells a suspicious verdict from a hostile one; with no level
+    /// there is nothing to show, and the raw score stays out of the panel.
+    #[test]
+    fn headline_names_the_confidence_and_level() {
+        for (classification, level, expected) in [
+            (
+                Classification::Suspicious,
+                Level::At(500),
+                "  Possible malware · local analysis · 40% confident [L500]\n",
+            ),
+            (
+                Classification::Hostile,
+                Level::At(0),
+                "  Likely malware · local analysis · 99% confident [L0]\n",
+            ),
+            (
+                Classification::Hostile,
+                Level::Manual,
+                "  Likely malware · local analysis\n",
+            ),
+        ] {
+            let p = Panel {
+                basis: Basis::Local {
+                    probability: 0.41,
+                    level,
+                    traits: &[],
+                    reasons: &[],
+                },
+                ..local(
+                    &[],
+                    classification,
+                    Disposition::Blocked,
+                    ScanPolicy::Strict,
+                )
+            };
+            let s = pretty(&p);
+            assert!(s.contains(expected), "{s}");
+        }
     }
 
     #[test]
-    fn pretty_hint_for_suspicious_uses_command_with_level_2() {
-        let p = Panel {
-            classification: Classification::Suspicious,
-            disposition: Disposition::Blocked,
-            policy: ScanPolicy::Strict,
-            probability: 0.6,
-            url: "https://x/install.sh",
-            traits: &[],
-            reasons: &[],
-            invocation: "curl -fsSL https://x/install.sh",
-        };
-        let mut buf = Vec::new();
-        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=2 curl -fsSL https://x/install.sh"));
+    fn forwarded_panel_shows_active_level() {
+        let s = pretty(&local(
+            &[],
+            Classification::Hostile,
+            Disposition::Forwarded,
+            ScanPolicy::Bypass,
+        ));
+        assert!(s.contains("FORWARDED"), "{s}");
+        assert!(s.contains("  Allowed by HOOD_BYPASS=3\n"), "{s}");
+        assert!(!s.contains("To download anyway"), "{s}");
     }
 
     #[test]
     fn failsafe_pretty_mentions_policy_and_reason() {
-        let mut buf = Vec::new();
-        write_failsafe_pretty(
-            &mut buf,
-            "curl -O https://example.com",
-            ScanPolicy::Bypass,
-            "load scan model: not found",
-            Palette::dark(),
-        )
-        .unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        let s = framed(200, |w, c| {
+            write_failsafe_pretty(w, ScanPolicy::Bypass, "load scan model: not found", c)
+        });
         assert!(s.contains("UNSCANNED"));
         assert!(s.contains("HOOD_BYPASS=3"));
         assert!(s.contains("load scan model: not found"));
-        assert!(s.contains("curl -O https://example.com"));
+        assert!(s.contains("Scanner unavailable"));
     }
 
     #[test]
@@ -978,92 +1574,72 @@ mod tests {
             disposition: Disposition::Blocked,
             invocation: "curl -fsSL https://x/install.sh",
         };
-        let mut buf = Vec::new();
-        write_scan_error_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("BLOCKED"));
-        assert!(s.contains("scan-error"));
-        assert!(s.contains("HOOD_BYPASS=1 curl -fsSL https://x/install.sh"));
-    }
-
-    #[test]
-    fn known_bad_pretty_shows_lab_link_and_block_hint() {
-        let p = KnownBadPanel {
-            url: "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
-            sha256: "7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b",
-            policy: ScanPolicy::Strict,
-            disposition: Disposition::Blocked,
-            invocation: "npm install evil",
-            beamline: &[],
-        };
-        let mut buf = Vec::new();
-        write_known_bad_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("BLOCKED"));
-        assert!(s.contains("known bad package"));
-        assert!(s.contains(
-            "https://lab.atomdrift.org/file/7774c79b81cae4ab45576d443b174261d7602a8d912e563997edf6c0f36ddc7b"
-        ));
-        assert!(s.contains("HOOD_BYPASS=3 npm install evil"));
-        assert!(!s.contains("beamline:"));
-    }
-
-    #[test]
-    fn known_bad_pretty_shows_beamline_explanation_sanitized() {
-        let explanation = [
-            "credential theft".to_owned(),
-            "exfil/ssh-key reads ~/.ssh\u{1b}[31m".to_owned(),
-        ];
-        let p = KnownBadPanel {
-            url: "https://x/evil.tgz",
-            sha256: "abc123",
-            policy: ScanPolicy::Strict,
-            disposition: Disposition::Blocked,
-            invocation: "",
-            beamline: &explanation,
-        };
-        let mut buf = Vec::new();
-        write_known_bad_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("beamline:  credential theft"), "{s}");
-        assert!(s.contains("exfil/ssh-key reads ~/.ssh"), "{s}");
-        assert!(!s.contains('\u{1b}'), "unsanitized escape in {s:?}");
-    }
-
-    #[test]
-    fn known_bad_plain_is_grep_friendly() {
-        let p = KnownBadPanel {
-            url: "https://x/evil.tgz",
-            sha256: "abc123",
-            policy: ScanPolicy::Strict,
-            disposition: Disposition::Blocked,
-            invocation: "",
-            beamline: &[],
-        };
-        let mut buf = Vec::new();
-        write_known_bad_plain(&mut buf, &p).unwrap();
-        let line = String::from_utf8(buf).unwrap();
-        assert_eq!(
-            line,
-            "hood known-bad url=https://x/evil.tgz sha256=abc123 \
-             lab=https://lab.atomdrift.org/file/abc123 policy=HOOD_BYPASS=0 disposition=block\n"
+        let s = framed(200, |w, c| write_scan_error_pretty(w, &p, c));
+        assert!(s.contains("BLOCKED"), "{s}");
+        assert!(s.contains("  Scan failed\n"), "{s}");
+        assert!(s.contains("  Error: trait load failed"), "{s}");
+        assert!(
+            s.contains("To download anyway:\n  HOOD_BYPASS=1 curl -fsSL https://x/install.sh\n"),
+            "{s}"
         );
     }
 
+    /// Widths of a framed panel's two rules, and of its widest body line.
+    fn rule_widths(s: &str) -> (usize, usize, usize) {
+        let lines: Vec<&str> = s.lines().filter(|l| !l.is_empty()).collect();
+        let width = |l: &str| visible_width(l) - INDENT;
+        let body = lines[1..lines.len() - 1].iter().map(|l| width(l));
+        (
+            width(lines[0]),
+            width(lines[lines.len() - 1]),
+            body.max().unwrap(),
+        )
+    }
+
     #[test]
-    fn every_panel_rule_ends_at_the_panel_edge() {
-        for word in ["BLOCKED", "FORWARDED", "UNSCANNED"] {
-            let mut buf = Vec::new();
-            write_header(&mut buf, Palette::dark(), Rgb(0, 0, 0), word).unwrap();
-            write_footer(&mut buf, Palette::dark()).unwrap();
-            let s = strip_ansi(&String::from_utf8(buf).unwrap());
-            let widths: Vec<usize> = s
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(|line| line.trim_start().chars().count())
-                .collect();
-            assert_eq!(widths, [PANEL_WIDTH, PANEL_WIDTH], "{word}");
-        }
+    fn rules_close_around_the_panel() {
+        let short = |w: &mut Vec<u8>, c: Palette| {
+            writeln!(w, "  {}", fg(c.text, "Likely malware"))?;
+            Ok(Heading {
+                word: "BLOCKED",
+                color: c.hostile,
+            })
+        };
+        let link = format!("  Details: {REPORT_URL}{}", "a".repeat(64));
+        let long = |w: &mut Vec<u8>, c: Palette| {
+            writeln!(w, "  {}", fg(c.accent, &link[2..]))?;
+            Ok(Heading {
+                word: "FORWARDED",
+                color: c.suspicious,
+            })
+        };
+        // A short panel keeps the minimum; both rules end together.
+        assert_eq!(rule_widths(&framed(200, short)).0, MIN_PANEL_WIDTH);
+        assert_eq!(rule_widths(&framed(200, short)).1, MIN_PANEL_WIDTH);
+        // A long line widens both rules to it.
+        let (top, bottom, body) = rule_widths(&framed(200, long));
+        assert_eq!((top, bottom), (body, body));
+        assert_eq!(body, link.len() - INDENT);
+        // A command longer than any line hood writes runs past the rules.
+        let command = format!("  HOOD_BYPASS=3 curl -LO https://x/{}", "a".repeat(150));
+        let (top, bottom, _) = rule_widths(&framed(200, |w, c| {
+            writeln!(w, "{command}")?;
+            Ok(Heading {
+                word: "BLOCKED",
+                color: c.hostile,
+            })
+        }));
+        assert_eq!((top, bottom), (MAX_PANEL_WIDTH, MAX_PANEL_WIDTH));
+        // A narrow terminal caps them a column short of its edge.
+        let (top, bottom, _) = rule_widths(&framed(60, long));
+        assert_eq!((top, bottom), (60 - INDENT - 1, 60 - INDENT - 1));
+    }
+
+    #[test]
+    fn visible_width_skips_escapes_and_counts_emoji_wide() {
+        assert_eq!(visible_width(&fg(Rgb(1, 2, 3), "abc")), 3);
+        assert_eq!(visible_width("  ⚡  reason"), 2 + 2 + 2 + 6);
+        assert_eq!(visible_width("●●● x"), 5);
     }
 
     #[test]
@@ -1074,14 +1650,9 @@ mod tests {
             size: Some(3 * GIB + GIB / 10),
             limit: 2 * GIB,
         };
-        let mut buf = Vec::new();
-        write_unscanned_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        let s = framed(200, |w, c| write_unscanned_pretty(w, &p, c));
         assert!(s.contains("UNSCANNED"), "{s}");
-        assert!(
-            s.contains("3.1 GB is over the 2.0 GB inspection limit"),
-            "{s}"
-        );
+        assert!(s.contains("3.1 GB exceeds the 2.0 GB scan limit"), "{s}");
         assert!(s.contains("https://cdn.example/big.iso?…"), "{s}");
         assert!(!s.contains("secret"), "{s}");
 
@@ -1090,7 +1661,7 @@ mod tests {
         write_unscanned_plain(&mut buf, &undeclared).unwrap();
         let line = String::from_utf8(buf).unwrap();
         assert!(
-            line.contains("it is over the 2.0 GB inspection limit"),
+            line.contains("Not scanned: Size exceeds the 2.0 GB scan limit"),
             "{line}"
         );
         assert!(
@@ -1116,63 +1687,9 @@ mod tests {
             disposition: Disposition::Forwarded,
             invocation: "curl -fsSL https://x/install.sh",
         };
-        let mut buf = Vec::new();
-        write_scan_error_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
+        let s = framed(200, |w, c| write_scan_error_pretty(w, &p, c));
         assert!(s.contains("FORWARDED"));
-        assert!(s.contains("active:"));
-        assert!(s.contains("HOOD_BYPASS=1"));
-    }
-
-    #[test]
-    fn pretty_output_suggests_bypass_2_for_suspicious_block() {
-        let p = panel(
-            &[],
-            &[],
-            Classification::Suspicious,
-            Disposition::Blocked,
-            ScanPolicy::Strict,
-        );
-        let mut buf = Vec::new();
-        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=2"));
-        // Suspicious blocks don't suggest =1 (wouldn't help; that's for errors).
-        assert!(!s.contains("HOOD_BYPASS=1"));
-    }
-
-    #[test]
-    fn pretty_output_suggests_bypass_3_for_hostile_block() {
-        let p = panel(
-            &[],
-            &[],
-            Classification::Hostile,
-            Disposition::Blocked,
-            ScanPolicy::Strict,
-        );
-        let mut buf = Vec::new();
-        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("HOOD_BYPASS=3"));
-        assert!(!s.contains("HOOD_BYPASS=1"));
-        assert!(!s.contains("HOOD_BYPASS=2"));
-    }
-
-    #[test]
-    fn pretty_output_under_bypass_shows_active_level() {
-        let p = panel(
-            &[],
-            &[],
-            Classification::Hostile,
-            Disposition::Forwarded,
-            ScanPolicy::Bypass,
-        );
-        let mut buf = Vec::new();
-        write_pretty(&mut buf, &p, Palette::dark()).unwrap();
-        let s = strip_ansi(&String::from_utf8(buf).unwrap());
-        assert!(s.contains("active:"));
-        assert!(s.contains("HOOD_BYPASS=3"));
-        assert!(s.contains("FORWARDED"));
+        assert!(s.contains("  Allowed by HOOD_BYPASS=1\n"), "{s}");
     }
 
     fn strip_ansi(s: &str) -> String {
@@ -1192,5 +1709,22 @@ mod tests {
             out.push(c);
         }
         out
+    }
+
+    #[test]
+    fn zz_preview_classes() {
+        let traits = [trait_(
+            "objectives/supply-chain/impersonation/npm-clone::events-shim-republished-under-new-name",
+            cleave::Criticality::Hostile,
+            "",
+        )];
+        for class in [Classification::Hostile, Classification::Suspicious] {
+            let p = Panel {
+                url: "https://proxy.golang.org/github.com/atomdrift-project/hopper/@v/v0.0.0-20261128011454-c270bfa7de0c.zip",
+                invocation: "go get -u ./...",
+                ..local(&traits, class, Disposition::Blocked, ScanPolicy::Strict)
+            };
+            eprintln!("{}", pretty(&p));
+        }
     }
 }

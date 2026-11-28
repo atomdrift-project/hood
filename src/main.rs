@@ -20,12 +20,29 @@ use hood::tools::{
 #[command(version)]
 #[command(about = "Scan HTTP(S) payloads before they reach package managers and installers")]
 struct Cli {
+    /// Rule feed: auto (the best your plan opens), zero-day, supporter, or
+    /// oss. A shimmed tool takes it from `HOOD_FEED`. A named paid feed asks
+    /// you to sign in on a terminal when this computer is not signed in; a
+    /// refused one is a warning, never a failed install.
+    #[arg(
+        long,
+        value_enum,
+        env = "HOOD_FEED",
+        default_value_t,
+        value_name = "FEED"
+    )]
+    feed: cleave::feed::Choice,
+    /// Keep analysis on this machine: never ask Beamline, the cloud tier.
+    /// Rules and filters still update. A shimmed tool takes it from
+    /// `HOOD_LOCAL`.
+    #[arg(long, env = "HOOD_LOCAL", value_parser = clap::builder::BoolishValueParser::new())]
+    local: bool,
     #[command(subcommand)]
     command: Command,
 }
 
-/// hood takes no options of its own before a tool's name, and passes every
-/// argument after it to the tool verbatim, so a shimmed `npm -v` or
+/// hood's options, `--feed` and `--local`, go before a tool's name; every
+/// argument after the name goes to the tool verbatim, so a shimmed `npm -v` or
 /// `curl --help` reaches npm or curl, not hood.
 #[derive(Subcommand, Debug)]
 enum Command {
@@ -47,19 +64,10 @@ enum Command {
     },
     /// Remove hood shims and shell-rc entries.
     Uninstall,
-    /// Connect this computer to your isotope¹³ plan: approve the code shown
-    /// at `dash.isotope13.io/device`. Afterwards hood checks downloads with
-    /// the plan's rule feed and sends the token to Beamline. To disconnect,
-    /// delete the saved token file.
-    #[command(alias = "enrich")]
-    Uplink,
-    /// Show the rule feeds, or switch to one (zero-day, supporter,
-    /// oss-delayed). The choice is shared with cleave and atomscan.
-    Feed {
-        /// Feed to switch to; omit to list them
-        #[arg(value_enum)]
-        name: Option<cleave::feed::Feed>,
-    },
+    /// Sign in to Atomdrift: approve this computer at the link shown.
+    /// Afterwards hood checks downloads with the best feed your plan opens,
+    /// and asks Beamline as a subscriber. Shared with cleave and atomscan.
+    Login,
     /// Show hood's version and which rules it checks downloads with.
     Version,
 }
@@ -90,6 +98,8 @@ fn main() {
 /// Run hood and return its exit status. The runtime, proxy and temporary
 /// files all drop before this returns.
 fn hood_main() -> u8 {
+    // CI supplies a sign-in as `HOOD_TOKEN`, hood's own variable.
+    cleave::feed::set_token_env("HOOD_TOKEN");
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::command()
         .after_help(format!("Tools: {}", tool_names()))
@@ -97,6 +107,11 @@ fn hood_main() -> u8 {
     let cli = Cli::from_arg_matches(&cli).unwrap_or_else(|e| e.exit());
     let verbose = verbose_from_env();
     init_logging(verbose);
+    // Read when a check first needs them, never for a pass-through.
+    hood::scanner::configure(hood::scanner::Options {
+        feed: cli.feed,
+        local: cli.local,
+    });
 
     // Install Ring before rustls needs default crypto. An existing process-wide
     // provider is already usable.
@@ -156,22 +171,12 @@ async fn run(command: Command, verbose: bool) -> Result<i32> {
         Action::Run { program, argv } => (program, argv),
         Action::Install { force } => return hood::install::install(force).map(|()| 0),
         Action::Uninstall => return hood::install::uninstall().map(|()| 0),
-        Action::Uplink => {
-            // Blocking HTTP and a terminal read: off the async runtime.
-            tokio::task::spawn_blocking(cleave::rule_update::connect).await??;
-            return Ok(0);
-        }
-        Action::Feed(name) => {
-            // Blocking HTTP and a terminal read: off the async runtime.
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                match name {
-                    None => {
-                        cleave::feed::resolve(None)?;
-                        print!("{}", cleave::feed::list());
-                    }
-                    Some(feed) => cleave::rule_update::switch(feed)?,
-                }
-                Ok(())
+        Action::Login => {
+            // Blocking HTTP and a terminal read: off the async runtime. The
+            // feed is decided first: it picks the console the sign-in uses.
+            tokio::task::spawn_blocking(|| {
+                hood::scanner::resolve_feed();
+                cleave::rule_update::login()
             })
             .await??;
             return Ok(0);
@@ -482,8 +487,7 @@ enum Action {
         force: bool,
     },
     Uninstall,
-    Uplink,
-    Feed(Option<cleave::feed::Feed>),
+    Login,
     Version,
 }
 
@@ -517,8 +521,7 @@ impl TryFrom<Command> for Action {
             }
             Command::Install { force } => Ok(Self::Install { force }),
             Command::Uninstall => Ok(Self::Uninstall),
-            Command::Uplink => Ok(Self::Uplink),
-            Command::Feed { name } => Ok(Self::Feed(name)),
+            Command::Login => Ok(Self::Login),
             Command::Version => Ok(Self::Version),
         }
     }
@@ -614,25 +617,44 @@ mod tests {
     }
 
     #[test]
-    fn uplink_and_legacy_enrich_alias_parse() {
-        for sub in ["uplink", "enrich"] {
-            let cli = Cli::try_parse_from(["hood", sub]).unwrap();
-            assert!(matches!(cli.command, Command::Uplink));
+    fn login_parses() {
+        let cli = Cli::try_parse_from(["hood", "login"]).unwrap();
+        assert!(matches!(cli.command, Command::Login));
+    }
+
+    #[test]
+    fn feed_goes_before_the_tool_and_defaults_to_auto() {
+        use cleave::feed::Choice;
+        // A developer's own HOOD_FEED would be the default here.
+        let unset = std::env::var_os("HOOD_FEED").is_none();
+        let cli = Cli::try_parse_from(["hood", "npm", "install"]).unwrap();
+        assert!(!unset || cli.feed == Choice::Auto, "{:?}", cli.feed);
+        let cli = Cli::try_parse_from(["hood", "--feed", "supporter", "npm", "install"]).unwrap();
+        assert_eq!(cli.feed, Choice::Supporter);
+        assert!(matches!(cli.command, Command::Tool(_)));
+        // After the tool's name it is the tool's argument, untouched.
+        let cli = Cli::try_parse_from(["hood", "npm", "--feed", "oss"]).unwrap();
+        assert!(!unset || cli.feed == Choice::Auto, "{:?}", cli.feed);
+        let Command::Tool(argv) = cli.command else {
+            panic!("a tool")
+        };
+        assert_eq!(argv, ["npm", "--feed", "oss"]);
+        for gone in ["oss-delayed", "nightly"] {
+            assert!(Cli::try_parse_from(["hood", "--feed", gone, "npm"]).is_err());
         }
     }
 
     #[test]
-    fn feed_lists_or_names_a_feed() {
-        let cli = Cli::try_parse_from(["hood", "feed"]).unwrap();
-        assert!(matches!(cli.command, Command::Feed { name: None }));
-        let cli = Cli::try_parse_from(["hood", "feed", "supporter"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Feed {
-                name: Some(cleave::feed::Feed::Supporter)
-            }
-        ));
-        assert!(Cli::try_parse_from(["hood", "feed", "nightly"]).is_err());
+    fn local_goes_before_the_tool() {
+        let cli = Cli::try_parse_from(["hood", "--local", "npm", "install"]).unwrap();
+        assert!(cli.local);
+        // After the tool's name it is the tool's argument, untouched.
+        let cli = Cli::try_parse_from(["hood", "curl", "--local"]).unwrap();
+        assert!(!cli.local || std::env::var_os("HOOD_LOCAL").is_some());
+        let Command::Tool(argv) = cli.command else {
+            panic!("a tool")
+        };
+        assert_eq!(argv, ["curl", "--local"]);
     }
 
     #[test]

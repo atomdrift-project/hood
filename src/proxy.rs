@@ -878,7 +878,7 @@ impl Proxy {
             return uninspected(verdict, &scan_url, parts.status, || {
                 Ok(passthrough_body(body))
             })?
-            .into_response(&scan_url, parts.status, parts.headers);
+            .into_response(parts.status, parts.headers);
         }
 
         // A declared oversized download is never buffered.
@@ -890,7 +890,7 @@ impl Proxy {
             return uninspected(verdict, &scan_url, parts.status, || {
                 Ok(passthrough_body(body))
             })?
-            .into_response(&scan_url, parts.status, parts.headers);
+            .into_response(parts.status, parts.headers);
         }
 
         // An error page is not the package its URL names.
@@ -934,16 +934,14 @@ impl Proxy {
             }
         };
         let Some(head) = head else {
-            return assess
-                .await?
-                .into_response(&scan_url, status, parts.headers);
+            return assess.await?.into_response(status, parts.headers);
         };
         // A prompt assessment is answered like any other. Past that, the
         // client is one that gives up on silence: commit to the upstream
         // headers and keep the transfer alive while the body is held.
         let mut assess = Box::pin(assess);
         if let Ok(assessed) = tokio::time::timeout(KEEPALIVE_INTERVAL, &mut assess).await {
-            return assessed?.into_response(&scan_url, status, parts.headers);
+            return assessed?.into_response(status, parts.headers);
         }
         tracing::debug!(url = %ShownUrl(&scan_url), "holding download; keeping client alive");
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -1000,7 +998,8 @@ impl Proxy {
                         Assessed::Forward(full_body(bytes), Some(len))
                     }
                     Verdict::Block(reason) => {
-                        tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
+                        // The scanner's panel already told the user; this is for -v.
+                        tracing::debug!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
                         Assessed::Withhold(reason)
                     }
                 }
@@ -1029,7 +1028,7 @@ impl Proxy {
                         Assessed::Forward(body, Some(len))
                     }
                     Verdict::Block(reason) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             url = %ShownUrl(scan_url),
                             bytes = len,
                             verdict = reason.label(),
@@ -1073,15 +1072,10 @@ enum Assessed {
 impl Assessed {
     /// The answer for a client that has been sent nothing yet: the upstream
     /// response with the cleared body, or hood's own 451.
-    fn into_response(
-        self,
-        scan_url: &str,
-        status: StatusCode,
-        headers: HeaderMap,
-    ) -> Result<Response<ProxyBody>> {
+    fn into_response(self, status: StatusCode, headers: HeaderMap) -> Result<Response<ProxyBody>> {
         match self {
             Self::Forward(body, len) => build_response(status, headers, body, len),
-            Self::Withhold(reason) => Ok(blocked_response(scan_url, &reason)),
+            Self::Withhold(reason) => Ok(blocked_response(&reason)),
         }
     }
 }
@@ -1096,7 +1090,7 @@ fn uninspected(
 ) -> Result<Assessed> {
     match verdict {
         Verdict::Block(reason) => {
-            tracing::warn!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
+            tracing::debug!(url = %ShownUrl(scan_url), verdict = reason.label(), "block");
             Ok(Assessed::Withhold(reason))
         }
         Verdict::Allow => {
@@ -1587,18 +1581,18 @@ fn error_response(status: StatusCode, msg: &str) -> Response<ProxyBody> {
     text_response(status, format!("{msg}\n"))
 }
 
-fn blocked_response(url: &str, reason: &BlockReason) -> Response<ProxyBody> {
+/// hood's answer in place of a withheld body: a 451 with no body at all.
+/// The panel on stderr explains the block; anything here would land in the
+/// tool's output — a `curl -O` file, or a shell the download was piped to.
+fn blocked_response(reason: &BlockReason) -> Response<ProxyBody> {
     // RFC 7725: 451 Unavailable for Legal Reasons. We bend the semantics — it's
     // closer to "withheld by middleware policy" — but no closer code exists,
     // and it's distinctive enough that tools and humans can spot it.
-    let label = reason.label();
-    let mut response = text_response(
-        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-        format!("hood blocked this response.\nurl: {url}\nverdict: {label}\n"),
-    );
+    let mut response = Response::new(full_body(Bytes::new()));
+    *response.status_mut() = StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS;
     response.headers_mut().insert(
         HeaderName::from_static("x-hood-block-reason"),
-        HeaderValue::from_static(label),
+        HeaderValue::from_static(reason.label()),
     );
     response
 }

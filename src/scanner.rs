@@ -8,6 +8,7 @@
 //! is requested, and local analysis starts beside a lookup that has not
 //! answered within [`HEDGE`] of the download finishing.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -360,11 +361,16 @@ impl AtomScanner {
     /// `status`, when present, collects counters for verbose status reporting.
     #[must_use]
     pub fn new(policy: ScanPolicy, invocation: String, status: Option<Arc<ScanStats>>) -> Self {
-        let remote = match beamline::Client::from_env() {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "Beamline configuration unavailable; using local analysis");
-                None
+        let remote = if options().local {
+            tracing::info!("--local: not asking Beamline");
+            None
+        } else {
+            match beamline::Client::from_env() {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "Beamline configuration unavailable; using local analysis");
+                    None
+                }
             }
         };
         Self {
@@ -482,6 +488,7 @@ impl AtomScanner {
         F: FnOnce(&Analyzer) -> Result<ScanResult> + Send + 'static,
     {
         // Bloom revocations must take precedence over even a fresh benign cache entry.
+        let mut sighting = None;
         if let Some(lookup) = self.bloom().await {
             // Local identity checks may use private coordinates; disclosure is
             // decided separately, only if the bundle cannot resolve the artifact.
@@ -491,6 +498,11 @@ impl AtomScanner {
                 return self
                     .report_bloom(decision, verdict, url, sha, disclosure)
                     .await;
+            }
+            // A threat feed's claim decides nothing, but explains a block.
+            sighting = sighting_of(decision);
+            if let Some(sighting) = sighting {
+                tracing::debug!(url = %ShownUrl(url), ?sighting, "threat feeds report these bytes; analyzing");
             }
         }
         let digest = hex(sha);
@@ -506,34 +518,51 @@ impl AtomScanner {
         }
 
         // Beamline alone first: it has usually seen the bytes already.
-        let result = {
-            let remote = self.remote_verdict(url, disclosure, early, &digest);
-            tokio::pin!(remote);
-            match tokio::time::timeout(self.hedge, &mut remote).await {
-                Ok(Some(verdict)) => return verdict,
-                Ok(None) => self.analyze(job).await,
-                Err(_) => {
-                    tracing::debug!("Beamline has yet to answer; scanning locally beside it");
-                    let local = self.analyze(job);
-                    tokio::pin!(local);
-                    tokio::select! {
-                        verdict = &mut remote => match verdict {
-                            Some(verdict) => return verdict,
-                            None => local.await,
-                        },
-                        result = &mut local => {
-                            // A pass needs no second opinion. A block or a failure
-                            // waits for the one already asked for, which may clear it.
-                            if !matches!(&result, Ok(r) if r.classification == Classification::Benign)
-                                && let Some(verdict) = remote.await
-                            {
-                                return verdict;
-                            }
-                            result
-                        }
+        // Beamline's verdict ends the decision; anything less it knows of the
+        // bytes is carried on to explain a local one.
+        let remote = async {
+            let assessment = self
+                .remote_assessment(url, disclosure, early, &digest)
+                .await;
+            self.remote_verdict(url, &digest, assessment.as_ref(), sighting)
+                .map_or(ControlFlow::Continue(assessment), ControlFlow::Break)
+        };
+        tokio::pin!(remote);
+        let (answer, result) = if let Ok(answer) =
+            tokio::time::timeout(self.hedge, &mut remote).await
+        {
+            if let ControlFlow::Break(verdict) = answer {
+                return verdict;
+            }
+            (answer, self.analyze(job).await)
+        } else {
+            tracing::debug!("Beamline has yet to answer; scanning locally beside it");
+            let local = self.analyze(job);
+            tokio::pin!(local);
+            tokio::select! {
+                answer = &mut remote => {
+                    if let ControlFlow::Break(verdict) = answer {
+                        return verdict;
                     }
+                    (answer, local.await)
+                }
+                result = &mut local => {
+                    // A pass needs no second opinion. A block or a failure
+                    // waits for the one already asked for, which may clear
+                    // it, and otherwise explains it.
+                    let passed = matches!(&result, Ok(r) if r.classification == Classification::Benign);
+                    let answer = if passed {
+                        ControlFlow::Continue(None)
+                    } else {
+                        remote.await
+                    };
+                    (answer, result)
                 }
             }
+        };
+        let assessment = match answer {
+            ControlFlow::Break(verdict) => return verdict,
+            ControlFlow::Continue(assessment) => assessment,
         };
         // scan keeps only a finished analysis, so one it has replayed is one
         // that no deadline cut short: a pass that will be the same next time.
@@ -541,9 +570,9 @@ impl AtomScanner {
             && result.classification == Classification::Benign
             && result.analysis_cached
         {
-            let (name, probability) = (url.to_owned(), result.probability);
+            let (key, name, probability) = (digest.clone(), url.to_owned(), result.probability);
             if let Err(error) =
-                tokio::task::spawn_blocking(move || verdicts.put(&digest, &name, probability))
+                tokio::task::spawn_blocking(move || verdicts.put(&key, &name, probability))
                     .await
                     .context("verdict cache write task")
                     .flatten()
@@ -551,19 +580,71 @@ impl AtomScanner {
                 tracing::debug!(error = %format!("{error:#}"), "could not remember local verdict");
             }
         }
-        self.classify_result(url, result)
+        // What Beamline knows of these bytes without settling them — a feed's
+        // citation, say — still explains a local block.
+        let record = assessment.as_ref().filter(|a| a.describes(&digest));
+        match result {
+            Ok(result) => self.classify_result(url, &digest, &result, record, sighting),
+            Err(error) => self.scan_error(url, &format!("{error:#}")),
+        }
     }
 
-    /// The verdict Beamline settles, counted and shown: it must be allowed to
-    /// know of the download, and hold an assessment of exactly the bytes
-    /// `digest` names. Anything less is logged and left to local analysis.
-    async fn remote_verdict(
+    /// The verdict `assessment` settles, counted and shown: it must be a
+    /// verdict on exactly the bytes `digest` names. Anything less is left to
+    /// local analysis.
+    fn remote_verdict(
+        &self,
+        url: &str,
+        digest: &str,
+        assessment: Option<&beamline::Assessment>,
+        sighting: Option<crate::output::Sighting>,
+    ) -> Option<Verdict> {
+        let assessment = assessment?;
+        let Some(classification) = assessment.classification(digest) else {
+            if assessment.cited_only() {
+                tracing::debug!("Beamline holds only a feed's citation; scanning locally");
+            } else {
+                tracing::debug!("Beamline has no matching assessment; scanning locally");
+            }
+            return None;
+        };
+        let verdict = verdict_from(classification, self.policy);
+        let disposition = verdict.disposition();
+        tracing::debug!(
+            url = %ShownUrl(url),
+            verdict = crate::output::classification_label(classification),
+            "Beamline verdict"
+        );
+        if let Some(status) = &self.status {
+            status.record(classification, disposition);
+        }
+        if classification != Classification::Benign {
+            crate::output::emit(&crate::output::Panel {
+                classification,
+                disposition,
+                policy: self.policy,
+                url,
+                sha256: digest,
+                basis: crate::output::Basis::Beamline,
+                beamline: Some(assessment),
+                sighting,
+                invocation: &self.invocation,
+            });
+        } else if self.status.is_some() {
+            crate::output::emit_pass(url, None);
+        }
+        Some(verdict)
+    }
+
+    /// Beamline's assessment of the download, if it may be told of it and
+    /// answers. A failure is logged and left to local analysis.
+    async fn remote_assessment(
         &self,
         url: &str,
         disclosure: Disclosure,
         early: Anticipated,
         digest: &str,
-    ) -> Option<Verdict> {
+    ) -> Option<beamline::Assessment> {
         let client = self.remote.as_ref()?;
         let result = match (disclosure, early.0) {
             (Disclosure::Nothing, _) => return None,
@@ -579,39 +660,18 @@ impl AtomScanner {
             }
             (Disclosure::Digest, _) => client.settle(None, digest).await,
         };
-        let assessment = match result {
-            Ok(assessment) => assessment,
+        match result {
+            Ok(assessment) => Some(assessment),
             // Said once, by the client.
             Err(error) if error.is::<beamline::QuotaSpent>() => {
                 tracing::debug!("Beamline quota is spent; scanning locally");
-                return None;
+                None
             }
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "Beamline unavailable; scanning locally");
-                return None;
+                None
             }
-        };
-        let Some(classification) = assessment.classification(digest) else {
-            if assessment.cited_only() {
-                tracing::debug!("Beamline holds only a feed's citation; scanning locally");
-            } else {
-                tracing::debug!("Beamline has no matching assessment; scanning locally");
-            }
-            return None;
-        };
-        let verdict = verdict_from(classification, self.policy);
-        if let Some(status) = &self.status {
-            status.record(classification, verdict.disposition());
         }
-        if classification != Classification::Benign || self.status.is_some() {
-            crate::output::emit_remote(
-                classification,
-                verdict.disposition(),
-                self.policy,
-                &assessment,
-            );
-        }
-        Some(verdict)
     }
 
     /// Run `job` on the local analyzer, off the async runtime.
@@ -642,7 +702,7 @@ impl AtomScanner {
     fn pass(&self, url: &str, probability: f32) -> Verdict {
         if let Some(status) = &self.status {
             status.record(Classification::Benign, Disposition::Forwarded);
-            crate::output::emit_pass(url, probability);
+            crate::output::emit_pass(url, Some(probability));
         }
         Verdict::Allow
     }
@@ -658,18 +718,21 @@ impl AtomScanner {
     ) -> Verdict {
         let known_bad = decision == Decision::KnownBad;
         if known_bad {
-            let explanation = if disclosure == Disclosure::Nothing {
-                Vec::new()
+            let record = if disclosure == Disclosure::Nothing {
+                None
             } else {
-                self.known_bad_explanation(sha).await
+                self.known_bad_record(sha).await
             };
-            crate::output::emit_known_bad(&crate::output::KnownBadPanel {
+            crate::output::emit(&crate::output::Panel {
+                classification: Classification::Hostile,
+                disposition: verdict.disposition(),
+                policy: self.policy,
                 url,
                 sha256: &hex(sha),
-                policy: self.policy,
-                disposition: verdict.disposition(),
+                basis: crate::output::Basis::KnownBad,
+                beamline: record.as_ref(),
+                sighting: None,
                 invocation: &self.invocation,
-                beamline: &explanation,
             });
         }
         if let Some(status) = &self.status {
@@ -683,17 +746,15 @@ impl AtomScanner {
         verdict
     }
 
-    /// Beamline's explanation of a payload the Bloom filter has already
-    /// condemned, as display lines: its reason, then its leading findings.
+    /// Beamline's analysis of a payload the Bloom filter has already
+    /// condemned, to explain the block.
     ///
     /// The verdict never depends on this. It is a hash-only lookup, made only
     /// when the digest may be disclosed and bounded by
     /// [`KNOWN_BAD_DETAILS_TIMEOUT`], and an answer that does not agree the
     /// payload is bad is dropped rather than shown beside the block.
-    async fn known_bad_explanation(&self, sha: &[u8; 32]) -> Vec<String> {
-        let Some(client) = &self.remote else {
-            return Vec::new();
-        };
+    async fn known_bad_record(&self, sha: &[u8; 32]) -> Option<beamline::Assessment> {
+        let client = self.remote.as_ref()?;
         let sha = hex(sha);
         let assessment = match tokio::time::timeout(
             KNOWN_BAD_DETAILS_TIMEOUT,
@@ -704,11 +765,11 @@ impl AtomScanner {
             Ok(Ok(assessment)) => assessment,
             Ok(Err(error)) => {
                 tracing::debug!(error = %format!("{error:#}"), "no Beamline details for known-bad payload");
-                return Vec::new();
+                return None;
             }
             Err(_) => {
                 tracing::debug!("Beamline details for known-bad payload timed out");
-                return Vec::new();
+                return None;
             }
         };
         if !matches!(
@@ -716,80 +777,86 @@ impl AtomScanner {
             Some(Classification::Hostile | Classification::Suspicious)
         ) {
             tracing::debug!("Beamline does not confirm the known-bad payload; no details shown");
-            return Vec::new();
+            return None;
         }
-        assessment
-            .reason
-            .iter()
-            .cloned()
-            .chain(assessment.findings.iter().take(3).map(|finding| {
-                finding.desc.as_ref().map_or_else(
-                    || finding.id.clone(),
-                    |desc| format!("{} {desc}", finding.id),
-                )
-            }))
-            .collect()
+        Some(assessment)
     }
 
-    /// Turn a raw analyzer result into a [`Verdict`], emitting the appropriate
-    /// panel — a non-benign classification, or a scan error handled under the
-    /// active policy. Shared by the in-memory ([`Scanner::scan`]) and
-    /// streamed-to-disk ([`Scanner::scan_disk`]) paths so both render identically.
-    fn classify_result(&self, url: &str, result: Result<ScanResult>) -> Verdict {
-        match result {
-            Ok(r) if r.classification == Classification::Benign => {
-                tracing::debug!(
-                    url = %ShownUrl(url),
-                    probability = r.probability,
-                    replayed = r.analysis_cached,
-                    "scan clean"
-                );
-                self.pass(url, r.probability)
-            }
-            Ok(r) => {
-                let verdict = verdict_from(r.classification, self.policy);
-                let disposition = verdict.disposition();
-                if let Some(status) = &self.status {
-                    status.record(r.classification, disposition);
-                }
-                // `top_findings` is already deduped, ranked strongest-first,
-                // and capped at 5 by the engine; take the leading three to
-                // keep the panel tight.
-                let traits = r.top_findings.get(..3).unwrap_or(&r.top_findings);
-                let reasons = r.reasons.get(..3).unwrap_or(&r.reasons);
-                crate::output::emit(&crate::output::Panel {
-                    classification: r.classification,
-                    disposition,
-                    policy: self.policy,
-                    probability: r.probability,
-                    url,
-                    traits,
-                    reasons,
-                    invocation: &self.invocation,
-                });
-                verdict
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                let verdict = if policy_allows_error(self.policy) {
-                    Verdict::Allow
-                } else {
-                    Verdict::Block(BlockReason::ScanError(msg.clone()))
-                };
-                let disposition = verdict.disposition();
-                if let Some(status) = &self.status {
-                    status.record_error(disposition);
-                }
-                crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
-                    url,
-                    error: &msg,
-                    policy: self.policy,
-                    disposition,
-                    invocation: &self.invocation,
-                });
-                verdict
-            }
+    /// Turn a local analysis of the bytes `digest` names into a [`Verdict`],
+    /// showing a panel for a non-benign one, with what Beamline's `record` of
+    /// the same bytes says.
+    fn classify_result(
+        &self,
+        url: &str,
+        digest: &str,
+        result: &ScanResult,
+        record: Option<&beamline::Assessment>,
+        sighting: Option<crate::output::Sighting>,
+    ) -> Verdict {
+        if result.classification == Classification::Benign {
+            tracing::debug!(
+                url = %ShownUrl(url),
+                probability = result.probability,
+                replayed = result.analysis_cached,
+                "scan clean"
+            );
+            return self.pass(url, result.probability);
         }
+        let verdict = verdict_from(result.classification, self.policy);
+        let disposition = verdict.disposition();
+        tracing::debug!(
+            url = %ShownUrl(url),
+            verdict = crate::output::classification_label(result.classification),
+            probability = result.probability,
+            beamline_record = record.is_some(),
+            ?sighting,
+            "local verdict"
+        );
+        if let Some(status) = &self.status {
+            status.record(result.classification, disposition);
+        }
+        // `top_findings` is already deduped, ranked strongest-first, and
+        // capped at 5 by the engine; the panel shows the leading few.
+        let reasons = result.reasons.get(..3).unwrap_or(&result.reasons);
+        crate::output::emit(&crate::output::Panel {
+            classification: result.classification,
+            disposition,
+            policy: self.policy,
+            url,
+            sha256: digest,
+            basis: crate::output::Basis::Local {
+                probability: result.probability,
+                level: result.level,
+                traits: &result.top_findings,
+                reasons,
+            },
+            beamline: record,
+            sighting,
+            invocation: &self.invocation,
+        });
+        verdict
+    }
+
+    /// Decide a payload hood could not judge, for the reason `error`, under
+    /// the active policy, and show why.
+    fn scan_error(&self, url: &str, error: &str) -> Verdict {
+        let verdict = if policy_allows_error(self.policy) {
+            Verdict::Allow
+        } else {
+            Verdict::Block(BlockReason::ScanError(error.to_owned()))
+        };
+        let disposition = verdict.disposition();
+        if let Some(status) = &self.status {
+            status.record_error(disposition);
+        }
+        crate::output::emit_scan_error(&crate::output::ScanErrorPanel {
+            url,
+            error,
+            policy: self.policy,
+            disposition,
+            invocation: &self.invocation,
+        });
+        verdict
     }
 }
 
@@ -809,6 +876,15 @@ fn bloom_verdict(
         }
         GateOutcome::Block => Some(Verdict::Block(BlockReason::KnownBad(hex(sha)))),
         GateOutcome::Forward => Some(Verdict::Allow),
+    }
+}
+
+/// What the filters' threat-feed claims say of a payload they did not settle.
+const fn sighting_of(decision: Decision) -> Option<crate::output::Sighting> {
+    match decision {
+        Decision::SightedHostile => Some(crate::output::Sighting::Corroborated),
+        Decision::SightedSuspicious => Some(crate::output::Sighting::Lone),
+        _ => None,
     }
 }
 
@@ -908,23 +984,50 @@ fn install_traits() {
     scan::traits_repo::prepare_runtime_env();
 }
 
-/// Check downloads with this host's rule feed — the one saved by `hood feed`
-/// (shared with cleave and atomscan), `ATOMDRIFT_FEED`, or the zero-day feed
-/// once `hood uplink` has saved a token — refreshing a paid feed at most once
-/// a day.
+/// What hood was started with, for a check to act on when it first runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// `--feed` (or `HOOD_FEED`).
+    pub feed: cleave::feed::Choice,
+    /// `--local` (or `HOOD_LOCAL`): never ask Beamline.
+    pub local: bool,
+}
+
+/// The [`Options`] hood was started with; the defaults until [`configure`].
+static OPTIONS: std::sync::OnceLock<Options> = std::sync::OnceLock::new();
+
+/// Record hood's options for a check to act on when it first runs: a
+/// pass-through never does, and reads nothing for them.
+pub fn configure(options: Options) {
+    if OPTIONS.set(options).is_err() {
+        tracing::debug!("hood's options were already set");
+    }
+}
+
+fn options() -> Options {
+    OPTIONS.get().copied().unwrap_or_default()
+}
+
+/// Check downloads with this run's rule feed — `--feed`, else the best the
+/// login (`hood login`, shared with cleave and atomscan) opens — refreshing
+/// a paid feed at most once a day.
 ///
-/// A refused token is a warning, never a failed install: a billing problem
-/// must not block a developer's `npm install`, and the check itself still runs
-/// — on the feed's rules already installed, or on the open-source ones when
-/// there are none yet.
+/// A named paid feed with no login asks for one on a terminal. A refused
+/// token is a warning, never a failed install: a billing problem must not
+/// block a developer's `npm install`, and the check itself still runs — on
+/// the feed's rules already installed, or on the open-source ones when there
+/// are none yet.
 fn activate_feed() {
     static ACTIVATE: std::sync::Once = std::sync::Once::new();
     ACTIVATE.call_once(|| {
         // The refresh is what first installs a paid feed's tree after `hood
-        // uplink`, so it runs before the installed tree is checked. A refused
+        // login`, so it runs before the installed tree is checked. A refused
         // token falls the run back inside the refresh, with its own warning;
         // what is left to say is a network failure.
         let feed = resolve_feed();
+        if let Err(error) = cleave::rule_update::sign_in() {
+            tracing::warn!(error = %error, "not logged in; checking with installed or open-source rules");
+        }
         if feed.needs_token()
             && due_today(&format!("traits-{}-checked", feed.slug()))
             && let Err(error) = scan::traits_repo::update(false, true)
@@ -942,11 +1045,11 @@ pub fn select_rules() {
     installed_or_open_source();
 }
 
-/// This host's feed, from what it has saved and holds.
-fn resolve_feed() -> cleave::feed::Feed {
-    if let Err(error) = cleave::feed::resolve(None) {
+/// This run's feed, from `--feed` and the sign-in.
+pub fn resolve_feed() -> cleave::feed::Feed {
+    if let Err(error) = cleave::feed::resolve(options().feed) {
         tracing::warn!(error = %format!("{error:#}"), "isotope13 token unusable; checking with open-source rules");
-        cleave::feed::select(cleave::feed::Feed::OssDelayed, false);
+        cleave::feed::select(cleave::feed::Feed::Oss, false);
     }
     cleave::feed::current()
 }
@@ -957,7 +1060,7 @@ fn installed_or_open_source() {
     let installed = cleave::traits_repo::installed_dir(feed);
     if feed.needs_token() && cleave::rule_update::installed(&installed).is_none() {
         tracing::warn!(dir = %installed.display(), "no {feed} rules installed; checking with open-source rules");
-        cleave::feed::select(cleave::feed::Feed::OssDelayed, false);
+        cleave::feed::select(cleave::feed::Feed::Oss, false);
     }
 }
 
@@ -1084,7 +1187,7 @@ impl Scanner for AtomScanner {
     }
 
     fn uninspectable(&self, url: &str, why: &str) -> Verdict {
-        self.classify_result(url, Err(anyhow::anyhow!("{why}")))
+        self.scan_error(url, why)
     }
 }
 
@@ -1602,7 +1705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_bad_explanation_shows_only_confirming_assessments() {
+    async fn known_bad_record_is_kept_only_when_it_confirms() {
         use beamline::test_support::server;
         let tmp = tempfile::tempdir().unwrap();
         let body = b"known bad payload";
@@ -1611,7 +1714,7 @@ mod tests {
         let confirming = serde_json::json!({
             "status": "analyzed", "severity": "hostile", "sha256": hex,
             "reason": "steals credentials",
-            "findings": [{"id": "exfil/ssh-key", "desc": "reads ~/.ssh"}, {"id": "exec/curl-sh"}],
+            "findings": [{"id": "exfil/ssh-key", "crit": 5, "desc": "reads ~/.ssh"}, {"id": "exec/curl-sh"}],
         })
         .to_string();
         let benign = serde_json::json!({
@@ -1619,18 +1722,10 @@ mod tests {
         })
         .to_string();
         for (status, response, expected) in [
-            (
-                200,
-                confirming,
-                vec![
-                    "steals credentials".to_owned(),
-                    "exfil/ssh-key reads ~/.ssh".to_owned(),
-                    "exec/curl-sh".to_owned(),
-                ],
-            ),
+            (200, confirming, Some("steals credentials")),
             // A disagreeing or failed lookup adds nothing; the block stands.
-            (200, benign, Vec::new()),
-            (429, "quota".to_owned(), Vec::new()),
+            (200, benign, None),
+            (429, "quota".to_owned(), None),
         ] {
             let mock = server(vec![(status, vec![response])]).await;
             let scanner = test_scanner(
@@ -1639,13 +1734,28 @@ mod tests {
                 tmp.path().into(),
                 ScanPolicy::Strict,
             );
-            assert_eq!(scanner.known_bad_explanation(&sha).await, expected);
+            let record = scanner.known_bad_record(&sha).await;
+            assert_eq!(record.as_ref().and_then(|r| r.reason.as_deref()), expected);
+            if let Some(record) = record {
+                let findings: Vec<_> = record
+                    .findings
+                    .iter()
+                    .map(|f| (f.id.as_str(), f.criticality()))
+                    .collect();
+                assert_eq!(
+                    findings,
+                    [
+                        ("exfil/ssh-key", cleave::Criticality::Hostile),
+                        ("exec/curl-sh", cleave::Criticality::Baseline),
+                    ]
+                );
+            }
             let requests = mock.requests.lock().unwrap().clone();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].starts_with("GET /v1/lookup?sha256="));
         }
         let offline = test_scanner(None, None, tmp.path().into(), ScanPolicy::Strict);
-        assert!(offline.known_bad_explanation(&sha).await.is_empty());
+        assert!(offline.known_bad_record(&sha).await.is_none());
     }
 
     #[tokio::test]

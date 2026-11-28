@@ -779,9 +779,8 @@ impl ToolHarness {
         for key in [
             "HOOD_LOCAL",
             "HOOD_BYPASS",
-            "ISOTOPE13_TOKEN",
-            "ATOMDRIFT_UPLINK",
-            "ATOMDRIFT_ENRICHED",
+            "HOOD_TOKEN",
+            "HOOD_FEED",
             "npm_config_ignore_scripts",
             "NPM_CONFIG_IGNORE_SCRIPTS",
             "YARN_ENABLE_SCRIPTS",

@@ -569,6 +569,8 @@ async fn block_returns_451() -> Result<()> {
         resp.headers().get("x-hood-block-reason").unwrap(),
         "hostile"
     );
+    // The explanation goes to stderr; nothing reaches the tool's output.
+    assert!(resp.bytes().await?.is_empty());
 
     handle.stop().await;
     Ok(())

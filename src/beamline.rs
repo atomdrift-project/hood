@@ -44,12 +44,35 @@ pub(crate) struct Assessment {
     pub(crate) findings: Vec<Finding>,
     pub(crate) reason: Option<String>,
     pub(crate) engine_version: Option<String>,
+    /// When Beamline analyzed the bytes, RFC 3339.
+    pub(crate) analyzed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Finding {
     pub(crate) id: String,
+    /// 3 notable, 4 suspicious, 5 hostile; 0 from caches older than the field.
+    #[serde(default)]
+    pub(crate) crit: u8,
     pub(crate) desc: Option<String>,
+}
+
+impl Finding {
+    /// Whether this finding says where a claim about the bytes came from — an
+    /// outside threat feed — rather than what the bytes do.
+    pub(crate) fn is_citation(&self) -> bool {
+        self.id.starts_with("intel/feed/")
+    }
+
+    /// The finding's criticality, as the local analyzer grades its traits.
+    pub(crate) const fn criticality(&self) -> cleave::Criticality {
+        match self.crit {
+            5 => cleave::Criticality::Hostile,
+            4 => cleave::Criticality::Suspicious,
+            3 => cleave::Criticality::Notable,
+            _ => cleave::Criticality::Baseline,
+        }
+    }
 }
 
 /// How far Beamline got. Only a finished analysis carries a verdict; every
@@ -78,7 +101,7 @@ impl Assessment {
     /// The verdict, only if it is a finished analysis of exactly `sha256`, and
     /// more than an outside citation; see [`Self::cited_only`].
     pub(crate) fn classification(&self, sha256: &str) -> Option<Classification> {
-        if self.status != Status::Analyzed || !self.sha256.as_ref()?.eq_ignore_ascii_case(sha256) {
+        if !self.describes(sha256) {
             return None;
         }
         match self.severity {
@@ -88,6 +111,27 @@ impl Assessment {
             Severity::Hostile => Some(Classification::Hostile),
             Severity::Unknown => None,
         }
+    }
+
+    /// Whether this is a finished analysis of exactly `sha256`, whether or
+    /// not it settles a verdict: what it says may still explain one.
+    pub(crate) fn describes(&self, sha256: &str) -> bool {
+        self.status == Status::Analyzed
+            && self
+                .sha256
+                .as_deref()
+                .is_some_and(|analyzed| analyzed.eq_ignore_ascii_case(sha256))
+    }
+
+    /// Whether Beamline measured the bytes itself: some finding says what
+    /// they do, or none says anything, rather than every one citing a feed.
+    pub(crate) fn measured(&self) -> bool {
+        self.findings.is_empty() || self.findings.iter().any(|f| !f.is_citation())
+    }
+
+    /// Whether an outside threat feed cites the bytes.
+    pub(crate) fn cited(&self) -> bool {
+        self.findings.iter().any(Finding::is_citation)
     }
 
     /// Whether a suspicion rests on outside citations alone: every finding
@@ -100,12 +144,7 @@ impl Assessment {
     /// have one, and blocking on it fails every server that answers so.
     /// Citations that agree with each other grade hostile, and still stand.
     pub(crate) fn cited_only(&self) -> bool {
-        self.severity == Severity::Suspicious
-            && !self.findings.is_empty()
-            && self
-                .findings
-                .iter()
-                .all(|finding| finding.id.starts_with("intel/feed/"))
+        self.severity == Severity::Suspicious && !self.measured()
     }
 
     /// Whether this is a finished analysis with a verdict, on whichever
@@ -129,8 +168,8 @@ enum Query<'a> {
 /// isotope13's API, and the only origin the subscription token is sent to.
 const API_URL: &str = "https://api.isotope13.ai";
 
-/// The isotope13 token for requests to `base`: `ISOTOPE13_TOKEN`, else the one
-/// `hood uplink` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
+/// The sign-in token for requests to `base`: `HOOD_TOKEN`, else the one
+/// `hood login` saved. Only ever for [`API_URL`] itself — `HOOD_BEAMLINE_URL`
 /// pointing anywhere else gets no token, so redirecting the endpoint can never
 /// carry a subscriber's credential with it.
 fn isotope13_token(base: &str) -> Option<String> {
@@ -192,10 +231,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub(crate) fn from_env() -> Result<Option<Self>> {
-        if std::env::var("HOOD_LOCAL").as_deref() == Ok("1") {
-            return Ok(None);
-        }
+    pub(crate) fn from_env() -> Result<Self> {
         let base = std::env::var("HOOD_BEAMLINE_URL").unwrap_or_else(|_| API_URL.to_owned());
         let mut client = Self::new(&base, isotope13_token(&base))?;
         // A loopback endpoint is a development or test server; its answers
@@ -205,7 +241,7 @@ impl Client {
         {
             client = client.caching_under(root.join("atomdrift/hood/beamline/v1"));
         }
-        Ok(Some(client))
+        Ok(client)
     }
 
     /// Keep verdicts, and word of a spent quota, under `root` between runs.
@@ -1143,6 +1179,7 @@ mod tests {
         let mut measured = cited.clone();
         measured.findings.push(Finding {
             id: "objectives/execution/shell/bash".into(),
+            crit: 4,
             desc: None,
         });
         let mut unexplained = cited;

@@ -309,7 +309,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "3.0.0-beta.4"
-source = "git+https://github.com/atomdrift-project/scan.git#6d3d8bf27d6d0c1d6219c0414bcf4624a33be7ef"
+source = "git+https://github.com/atomdrift-project/scan.git#9ae721f5ab76b00685d684bfa6911f1603d99225"
 dependencies = [
  "anyhow",
  "axum",
@@ -888,8 +888,8 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
 name = "cleave"
-version = "3.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#55d96e7a45a28a07ada8ac79223dfa759a65c1fe"
+version = "3.2.0"
+source = "git+https://github.com/atomdrift-project/cleave.git#0bc3a5b90711aaf780c077a0de282be7e2b8d1ad"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -970,7 +970,7 @@ dependencies = [
 [[package]]
 name = "cleave-macros"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#55d96e7a45a28a07ada8ac79223dfa759a65c1fe"
+source = "git+https://github.com/atomdrift-project/cleave.git#0bc3a5b90711aaf780c077a0de282be7e2b8d1ad"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3251,7 +3251,7 @@ dependencies = [
 [[package]]
 name = "lzx"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#55d96e7a45a28a07ada8ac79223dfa759a65c1fe"
+source = "git+https://github.com/atomdrift-project/cleave.git#0bc3a5b90711aaf780c077a0de282be7e2b8d1ad"
 
 [[package]]
 name = "lzxd"
@@ -5585,7 +5585,7 @@ dependencies = [
 [[package]]
 name = "sysmem"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#55d96e7a45a28a07ada8ac79223dfa759a65c1fe"
+source = "git+https://github.com/atomdrift-project/cleave.git#0bc3a5b90711aaf780c077a0de282be7e2b8d1ad"
 
 [[package]]
 name = "tap"
@@ -7426,7 +7426,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 [[package]]
 name = "yara-classify"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/cleave.git#55d96e7a45a28a07ada8ac79223dfa759a65c1fe"
+source = "git+https://github.com/atomdrift-project/cleave.git#0bc3a5b90711aaf780c077a0de282be7e2b8d1ad"
 
 [[package]]
 name = "yara-x"
